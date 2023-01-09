@@ -287,23 +287,26 @@ public class UHTTPD extends Thread implements Closeable {
 
 		@Override
 		public void get(Transaction req) throws Exception {
-			if (req.headerValueOr(HDR_CONNECTION).orElse(Named.EMPTY).expand(",").containsIgnoreCase("upgrade")
+			if (req.headerValueOr(HDR_CONNECTION).orElse(Named.EMPTY).expand(",").contains("Upgrade")
 			 && req.headerOr(HDR_UPGRADE).orElse("").equalsIgnoreCase("websocket")) {
 				// TODO https://en.wikipedia.org/wiki/WebSocket
+				
+				// TODO origin check
+				
 				var key = req.header("sec-websocket-Key");
 				var proto = req.headerValue("sec-websocket-protocol").expand(",");
 				var version = req.headerValue("sec-websocket-version").asInt();
 				var hasher = MessageDigest.getInstance("SHA-1");
 				var responseKeyData = WEBSOCKET_UUID + key;
-				var responseKey = Base64.getEncoder().encodeToString(hasher.digest(responseKeyData.getBytes("UTF-8")));
+				var responseKeyBytes = responseKeyData.getBytes("UTF-8");
+				var responseKey = Base64.getMimeEncoder().encodeToString(hasher.digest(responseKeyBytes));
 				var selectedProtocol = onHandshake.isPresent() ? onHandshake.get().handshake(req, proto.values().toArray(new String[0])) : proto.values.isEmpty() ? "" : proto.values().get(0);
 				var client = req.client();
 				
 				var ws = new WebSocketImpl(client, selectedProtocol, version);
 
-				req.responseCode(Status.CONTINUE);
-				req.responseText("Switching Protocols");
-				req.header(HDR_CONNECTION, "upgrade");
+				req.responseCode(Status.SWITCHING_PROTOCOLS);
+				req.header(HDR_CONNECTION, "Upgrade");
 				req.header(HDR_UPGRADE, "websocket");
 				req.header("sec-websocket-protocol", selectedProtocol);
 				req.header("sec-websocket-accept", responseKey);
@@ -882,6 +885,10 @@ public class UHTTPD extends Thread implements Closeable {
 			this.values = values;
 		}
 
+		public boolean contains(String value) {
+			return values.contains(value);
+		}
+
 		public boolean containsIgnoreCase(String value) {
 			for(var n : values) {
 				if(n.equalsIgnoreCase(value))
@@ -1163,7 +1170,7 @@ public class UHTTPD extends Thread implements Closeable {
 
 	public enum Status {
 
-		CONTINUE(100, "Continue"), BAD_REQUEST(400, "Bad Request"), FORBIDDEN(403, "Forbidden"), FOUND(302, "Found"),
+		CONTINUE(100, "Continue"), SWITCHING_PROTOCOLS(101, "Switching Protocols"), BAD_REQUEST(400, "Bad Request"), FORBIDDEN(403, "Forbidden"), FOUND(302, "Found"),
 		INTERNAL_SERVER_ERROR(500, "Not Found"), MOVED_PERMANENTLY(301, "Moved Permanently"),
 		NOT_FOUND(404, "Not Found"), NOT_IMPLEMENTED(501, "Not Implemented"), OK(200, "OK"),
 		SERVICE_UNAVAILABLE(503, "Service Unavailable"), UNAUTHORIZED(401, "Unauthorized");
@@ -1543,6 +1550,7 @@ public class UHTTPD extends Thread implements Closeable {
 				uri = firstToken;
 			}
 			var req = new Transaction(uri, method, proto, client);
+			System.out.println(line);
 			req.contentSupplier = new Supplier<>() {
 
 				private Optional<Content> content;
@@ -1649,6 +1657,7 @@ public class UHTTPD extends Thread implements Closeable {
 
 			/* Read headers up to content */
 			while ((line = reader.readLine()) != null && !line.equals("")) {
+				System.out.println(line);
 				if (LOG.isLoggable(Level.TRACE))
 					LOG.log(Level.TRACE, line);
 				var nvp = Named.parseHeader(line);
@@ -1747,9 +1756,11 @@ public class UHTTPD extends Thread implements Closeable {
 				}
 			}
 			
-			print(HDR_CONTENT_TYPE);
-			print(": ");
-			print(req.outgoingContentType.orElse("text/plain"));
+			if(req.outgoingContentType.isPresent()) {
+				print(HDR_CONTENT_TYPE);
+				print(": ");
+				print(req.outgoingContentType.get());
+			}
 			newline();
 			for (var nvp : req.outgoingHeaders.values()) {
 				print(nvp.name());
@@ -1788,9 +1799,11 @@ public class UHTTPD extends Thread implements Closeable {
 
 		private void newline() throws IOException {
 			client.writer.append("\r\n");
+			System.out.println();
 		}
 		
 		private void print(Object text) throws IOException {
+			System.out.print(text);
 			client.writer.append(text.toString());
 		}
 

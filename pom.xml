@@ -48,6 +48,16 @@
 			<distribution>repo</distribution>
 		</license>
 	</licenses>
+	<distributionManagement>
+		<snapshotRepository>
+			<id>ossrh-sshtools</id>
+			<url>https://oss.sonatype.org/content/repositories/snapshots</url>
+		</snapshotRepository>
+		<repository>
+			<id>ossrh-sshtools</id>
+			<url>https://oss.sonatype.org/service/local/staging/deploy/maven2/</url>
+		</repository>
+	</distributionManagement>
 	<scm>
 		<url>https://github.com/sshtools/uhttpd</url>
 		<connection>https://github.com/sshtools/uhttpd.git</connection>

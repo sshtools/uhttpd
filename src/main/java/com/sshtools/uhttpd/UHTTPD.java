@@ -31,6 +31,7 @@ import java.io.UncheckedIOException;
 import java.io.UnsupportedEncodingException;
 import java.lang.System.Logger;
 import java.lang.System.Logger.Level;
+import java.lang.ref.SoftReference;
 import java.math.BigDecimal;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -59,16 +60,24 @@ import java.security.Principal;
 import java.security.SecureRandom;
 import java.security.UnrecoverableKeyException;
 import java.security.cert.CertificateException;
+import java.text.ParsePosition;
+import java.text.SimpleDateFormat;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Calendar;
 import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.StringTokenizer;
+import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Supplier;
@@ -83,6 +92,17 @@ import javax.net.ssl.SSLContext;
  */
 public class UHTTPD extends Thread implements Closeable {
 
+	/**
+	 * Selector that just matches everything. All handlers will
+	 * be executed.
+	 */
+	public final static class AllSelector implements Selector {
+		@Override
+		public boolean matches(Transaction request) {
+			return true;
+		}
+	}
+	
 	/**
 	 * Something that provides a way to authenticate a given
 	 * {@link Credential} and provide a {@link Principal}.
@@ -200,7 +220,6 @@ public class UHTTPD extends Thread implements Closeable {
 				} catch (IOException e) {
 				}
 			}
-
 		}
 
 		public final WireProtocol wireProtocol() {
@@ -290,6 +309,264 @@ public class UHTTPD extends Thread implements Closeable {
 		Optional<Long> size();
 	}
 
+	public interface Cookie {
+		/**
+	     * Returns the name of this cookie.
+	     *
+	     * @return The name of this cookie
+	     */
+	    String name();
+	
+	    /**
+	     * Returns the value of "SameSite" for this cookie
+	     * 
+	     * @return same site of this cookie
+	     */
+	    Optional<SameSite> sameSite();
+
+		/**
+		 * Explicit date and time when this cookie expires.
+		 * 
+		 * @return cookie expires
+		 */
+		Optional<Date> expires();
+
+		/**
+	     * The value of this cookie.
+	     *
+	     * @return value of this cookie
+	     */
+	    String value();
+	
+	    /**
+	     * The version of cookie.
+	     */
+	    CookieVersion version();
+	
+	    /**
+	     * Domain of this cookie
+	     *
+	     * @return domain of this cookie
+	     */
+	    Optional<String> domain();
+	
+	    /**
+	     * Path of this cookie
+	     *
+	     * @return path of this cookie
+	     */
+	    Optional<String> path();
+	
+	    /**
+	     * The maximum age of this cook in seconds.
+	     *
+	     * @return the maximum age of this cookie
+	     */
+	    Optional<Long> maxAge();
+	
+	    /**
+	     * Get if this cookie is secure.
+	     *
+	     * @return secure cookie
+	     */
+	    boolean secure();
+	
+	    /**
+	     * HTTP usage only.
+	     */
+	    boolean httpOnly();
+	
+	}
+	
+	/**
+	 * Use to build {@link Cookie} instances for setting on responses.
+	 */
+
+	public final static class CookieBuilder {
+		
+		final String name;
+		CookieVersion version = CookieVersion.V1;
+		boolean secure;
+		boolean httpOnly;
+		final String value;
+		Optional<String> path = Optional.empty();
+		Optional<String> domain = Optional.empty();
+		Optional<Long> maxAge = Optional.empty();
+		Optional<Date> expires = Optional.empty();
+		Optional<SameSite> sameSite= Optional.empty();
+		
+		CookieBuilder(String name, String value) {
+			this.name = name;
+			this.value = value;
+		}
+		
+		public CookieBuilder withVersion(CookieVersion version) {
+			this.version = version;
+			return this;
+		}
+		
+		public CookieBuilder withSecure() {
+			this.secure = true;
+			return this;
+		}
+		
+		public CookieBuilder withMaxAge(long maxAge) {
+			this.maxAge =  Optional.of(maxAge);
+			return this;
+		}
+		
+		public CookieBuilder withSameSite(SameSite sameSite) {
+			this.sameSite =  Optional.of(sameSite);
+			return this;
+		}
+		
+		public CookieBuilder withExpires(Date expires) {
+			this.expires = Optional.of(expires);
+			return this;
+		}
+		
+		public CookieBuilder withExpires(Instant instant) {
+			this.expires = Optional.of(new Date(instant.toEpochMilli()));
+			return this;
+		}
+		
+		public CookieBuilder withHttpOnly() {
+			this.httpOnly = true;
+			return this;
+		}
+		
+		public CookieBuilder withPath(String path) {
+			this.path = Optional.of(path);
+			return this;
+		}
+		
+		public CookieBuilder withDomain(String domain) {
+			this.domain = Optional.of(domain);
+			return this;
+		}
+		
+		public Cookie build() {
+			return new Cookie() {
+				
+				@Override
+				public CookieVersion version() {
+					return version;
+				}
+				
+				@Override
+				public String value() {
+					return value;
+				}
+				
+				@Override
+				public boolean secure() {
+					return secure;
+				}
+				
+				@Override
+				public Optional<String> path() {
+					return path;
+				}
+				
+				@Override
+				public String name() {
+					return name;
+				}
+				
+				@Override
+				public Optional<Long> maxAge() {
+					return maxAge;
+				}
+				
+				@Override
+				public Optional<SameSite> sameSite() {
+					return sameSite;
+				}
+				
+				@Override
+				public Optional<Date> expires() {
+					return expires;
+				}
+				
+				@Override
+				public boolean httpOnly() {
+					return httpOnly;
+				}
+				
+				@Override
+				public Optional<String> domain() {
+					return domain;
+				}
+				
+				@Override
+				public String toString() {
+					var b = new StringBuilder();
+					b.append(name);
+					b.append('=');
+					b.append(value);
+					path.ifPresent(p -> { 
+						b.append("; Path=");
+						b.append(p);
+					});
+					domain.ifPresent(p -> { 
+						b.append("; Domain=");
+						b.append(p);
+					});
+					maxAge.ifPresent(p -> { 
+						b.append("; Max-Age=");
+						b.append(p);
+					});
+					expires.ifPresent(p -> { 
+						b.append("; Expires=");
+						b.append(DateFormatHolder.formatFor(PATTERN_RFC1123).format(p));
+					});
+					if(secure) { 
+						b.append("; Secure");
+					}
+					if(httpOnly) { 
+						b.append("; HttpOnly");
+					}
+					sameSite.ifPresent(p -> { 
+						b.append("; SameSite=");
+						b.append(Character.toUpperCase(p.name().charAt(0)) + p.name().substring(1).toLowerCase());
+					});
+					
+					return b.toString();
+				}
+			};
+		}
+	}
+	
+	/**
+	 * Version of @{link {@link Cookie}.
+	 */
+	public enum CookieVersion {
+		V1, V2
+	}
+
+	/**
+	 * Selector that executes a {@link Handler} if all {@link Selector}s
+	 * it contains match.
+	 *
+	 */
+	public static final class CompoundSelector implements Selector {
+		private Selector[] selectors;
+
+		CompoundSelector(Selector... selectors) {
+			this.selectors = selectors;
+		}
+
+		@Override
+		public boolean matches(Transaction request) {
+			for (var s : selectors) {
+				if (!s.matches(request)) {
+					return false;
+				}
+			}
+			return true;
+		}
+	}
+	
 	/**
 	 * Represents some piece of information that can be used to
 	 * authenticate a user.
@@ -434,6 +711,26 @@ public class UHTTPD extends Thread implements Closeable {
 	 */
 	public enum Method {
 		CONNECT, DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT, TRACE
+	}
+
+	/**
+	 * Select a handler based on its {@link Transaction#method()}. If the
+	 * method matches, the handler will be executed.
+	 *
+	 */
+	public static final class MethodSelector implements Selector {
+
+		private List<Method> methods;
+
+		public MethodSelector(Method... methods) {
+			this.methods = Arrays.asList(methods);
+		}
+
+		@Override
+		public boolean matches(Transaction request) {
+			return methods.contains(request.method());
+		}
+
 	}
 
 	public static class Named implements TextPart {
@@ -589,20 +886,15 @@ public class UHTTPD extends Thread implements Closeable {
 	}
 
 	public interface OnWebSocketClose {
-		void closed(WebSocket websocket);
+		void closed(int code, String reason, WebSocket websocket);
 	}
 
 	public interface OnWebSocketData {
-		void receive(ByteBuffer data, WebSocket websocket);
+		void receive(ByteBuffer data, boolean finalFragment, WebSocket websocket);
 	}
 
 	public interface OnWebSocketText {
 		void receive(String text, WebSocket websocket);
-	}
-
-	public interface OnWebSocketError {
-
-		void error(WebSocket websocket, int code, String reason);
 	}
 
 	public interface OnWebSocketHandshake {
@@ -625,10 +917,72 @@ public class UHTTPD extends Thread implements Closeable {
 		}
 	}
 
+	/**
+	 * Select a {@link Handler} based on its {@link Transaction#path()}, i.e. URI.
+	 * If the URI matches, the handler will be executred.
+	 *
+	 */
+	public static final class RegularExpressionSelector implements Selector {
+
+		private Pattern pattern;
+
+		public RegularExpressionSelector(String regexp) {
+			pattern = Pattern.compile(regexp);
+		}
+
+		@Override
+		public boolean matches(Transaction req) {
+			var path = req.path().toString();
+			return pattern.matcher(path).matches();
+		}
+
+	}
+	
+	/**
+	 * Can be used with {@link Transaction#respond} to supply response
+	 * content piece by piece. Each call you are expected to fill a {@link ByteBuffer}
+	 * until there is no more content, when the buffer should be returned with a zero
+	 * limit. 
+	 * 
+	 */
+	public interface Responder {
+		/**
+		 * Supply some more data for the response. Upon invocation, the
+		 * byte buffer will be reset. If there is content, before exit 
+		 * it should NOT be {@link ByteBuffer#flip()}ped so that {@link ByteBuffer#position()} is greater than zero.
+		 * <p>
+		 * If there is no more content, the {@link ByteBuffer#position()} should be zero. So
+		 * if you just don't write anything to the buffer this will be the case.
+		 * <p>
+		 * If the size and type of the content is known, {@link Transaction#responseLength(long)} and
+		 * {@link Transaction#responseType(String)} should be set.
+		 *   
+		 * @param buffer buffer to fill
+		 */
+		void supply(ByteBuffer buffer);
+	}
+
+	/**
+	 * The "Same Site" attribute used by {@link Cookie} to 
+	 * mitigate CSRF attacks. Currently a draft. https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-07
+	 */
+	public enum SameSite {
+		STRICT, LAX, NONE;
+	}
+
+	/**
+	 * A selector decides if a {@link Handler} applies
+	 * to a given {@link Transaction}, e.g. should a handler
+	 * handle a GET request for a certain URI.
+	 */
 	public interface Selector {
 		boolean matches(Transaction request);
 	}
 
+	/**
+	 * Builder to create a new instance of the main server,
+	 * an {@link UHTTPD} instance.
+	 */
 	public final static class ServerBuilder {
 		private int backlog = 10;
 		private boolean cache = true;
@@ -715,24 +1069,29 @@ public class UHTTPD extends Thread implements Closeable {
 			return this;
 		}
 
-		public ServerBuilder withClasspathResources(String regexpWithGroups) {
-			return withClasspathResources(regexpWithGroups, "");
+		public ServerBuilder withClasspathResources(String regexpWithGroups, Handler... handler) {
+			return withClasspathResources(regexpWithGroups, "", handler);
 		}
 
 		public ServerBuilder withClasspathResources(String regexpWithGroups, Optional<ClassLoader> loader,
-				String prefix) {
-			handle(new RegularExpressionSelector(regexpWithGroups),
-					new ClasspathResources(regexpWithGroups, loader, prefix));
+				String prefix, Handler... handler) {
+			var l = new ArrayList<Handler>();
+			l.add(new ClasspathResources(regexpWithGroups, loader, prefix));
+			l.addAll(Arrays.asList(handler));
+			handle(new RegularExpressionSelector(regexpWithGroups), l.toArray(new Handler[0]));
 			return this;
 		}
 
-		public ServerBuilder withClasspathResources(String regexpWithGroups, String prefix) {
+		public ServerBuilder withClasspathResources(String regexpWithGroups, String prefix, Handler... handler) {
 			return withClasspathResources(regexpWithGroups,
-					Optional.ofNullable(Thread.currentThread().getContextClassLoader()), prefix);
+					Optional.ofNullable(Thread.currentThread().getContextClassLoader()), prefix, handler);
 		}
 
-		public ServerBuilder withFileResources(String regexpWithGroups, Path root) {
-			handle(new RegularExpressionSelector(regexpWithGroups), new FileResources(regexpWithGroups, root));
+		public ServerBuilder withFileResources(String regexpWithGroups, Path root, Handler... handler) {
+			var l = new ArrayList<Handler>();
+			l.add(new FileResources(regexpWithGroups, root));
+			l.addAll(Arrays.asList(handler));
+			handle(new RegularExpressionSelector(regexpWithGroups), l.toArray(new Handler[0]));
 			return this;
 		}
 
@@ -921,15 +1280,18 @@ public class UHTTPD extends Thread implements Closeable {
 		private Optional<Status> code = Optional.empty();
 		private Supplier<Optional<Content>> contentSupplier;
 		private final Map<String, Named> incomingHeaders = new LinkedHashMap<>();
+		private final Map<String, String> incomingCookies = new LinkedHashMap<>();
 		private final List<String> matches = new ArrayList<>();
 		private final Method method;
 		private Optional<String> outgoingContentType = Optional.empty();
 		private final Map<String, Named> outgoingHeaders = new LinkedHashMap<>();
+		private final Map<String, Cookie> outgoingCookies = new LinkedHashMap<>();
 		private final Map<String, Named> parameters = new LinkedHashMap<>();
 		private final Path path;
 		private Optional<Principal> principal = Optional.empty();
 		private final Protocol protocol;
 		private Optional<Object> response = Optional.empty();
+		private Optional<Responder> responder = Optional.empty();
 		private Optional<Long> responseLength = Optional.empty();
 		private Optional<String> responseText = Optional.empty();
 		private Optional<Selector> selector = Optional.empty();
@@ -998,24 +1360,41 @@ public class UHTTPD extends Thread implements Closeable {
 			return headerOr(name).orElseThrow();
 		}
 
+		public Transaction cookie(Cookie cookie) {
+			outgoingCookies.put(cookie.name(), cookie);
+			return this;
+		}
+
+		public Transaction cookie(String name, String value) {
+			return cookie(UHTTPD.cookie(name,value).build());
+		}
+
+		public String cookie(String name) {
+			return cookieOr(name).orElseThrow();
+		}
+
 		public Transaction header(String name, String value) {
 			outgoingHeaders.put(name.toLowerCase(), new Named(name.toLowerCase(), value));
 			return this;
 		}
 
 		public Optional<String> headerOr(String name) {
-			return headerValueOr(name).map(h -> h.value().get());
+			return headersOr(name).map(h -> h.value().get());
+		}
+
+		public Optional<String> cookieOr(String name) {
+			return Optional.ofNullable(incomingCookies.get(name));
 		}
 
 		public final List<Named> headers() {
 			return Collections.unmodifiableList(new ArrayList<>(incomingHeaders.values()));
 		}
 
-		public Named headerValue(String name) {
-			return headerValueOr(name).orElseThrow();
+		public Named headers(String name) {
+			return headersOr(name).orElseThrow();
 		}
 
-		public Optional<Named> headerValueOr(String name) {
+		public Optional<Named> headersOr(String name) {
 			return incomingHeaders.values().stream().filter(h -> h.name().equals(name.toLowerCase()))
 					.map(h -> Optional.of(h)).reduce((f, s) -> f).orElse(Optional.empty());
 		}
@@ -1083,13 +1462,24 @@ public class UHTTPD extends Thread implements Closeable {
 			return contentSupplier.get();
 		}
 
+		public Transaction responder(Responder responder) {
+			this.responder = Optional.of(responder);
+			return this;
+		}
+
+		public Transaction responder(String responseType, Responder responder) {
+			responseType(responseType);
+			this.responder = Optional.of(responder);
+			return this;
+		}
+
 		public Transaction response(Object response) {
 			this.response = Optional.of(response);
 			return this;
 		}
 
 		public Transaction response(String responseType, Object response) {
-			responseText(responseType);
+			responseType(responseType);
 			this.response = Optional.of(response);
 			return this;
 		}
@@ -1184,7 +1574,6 @@ public class UHTTPD extends Thread implements Closeable {
 		private Optional<OnWebSocketClose> onClose = Optional.empty();
 		private Optional<OnWebSocketData> onData = Optional.empty();
 		private Optional<OnWebSocketText> onText = Optional.empty();
-		private Optional<OnWebSocketError> onError = Optional.empty();
 		private Optional<OnWebSocketHandshake> onHandshake = Optional.empty();
 		private Optional<OnWebSocketOpen> onOpen = Optional.empty();
 		private int maxTextPayloadSize = 32768;
@@ -1216,11 +1605,6 @@ public class UHTTPD extends Thread implements Closeable {
 
 		public WebSocketBuilder onText(OnWebSocketText onText) {
 			this.onText = Optional.of(onText);
-			return this;
-		}
-
-		public WebSocketBuilder onError(OnWebSocketError onError) {
-			this.onError = Optional.of(onError);
 			return this;
 		}
 
@@ -1263,9 +1647,10 @@ public class UHTTPD extends Thread implements Closeable {
 				var code = Short.toUnsignedInt(payload.getShort());
 				var dec = ws.client().charset().newDecoder(); // todo reuse?
 				var out = dec.decode(payload);
+				var text = out.toString();
 				if (LOG.isLoggable(Level.DEBUG))
-					LOG.log(Level.DEBUG, "Received websocket close message. Reason {0}. {1}", code, out.toString());
-				onError.ifPresent(c -> c.error(ws, code, out.toString()));
+					LOG.log(Level.DEBUG, "Received websocket close message. Reason {0}. {1}", code, text);
+				onClose.ifPresent(c -> c.closed(code, text, ws));
 			}
 		}
 
@@ -1277,6 +1662,14 @@ public class UHTTPD extends Thread implements Closeable {
 					throw new IllegalStateException("Control frames must not be fragment.");
 				var pongFrame = new WebSocketFrame(OpCode.PONG, frame.payload, true, frame.mask, frame.key);
 				pongFrame.write(channel);
+			}
+		}
+
+		private class BinaryMessage extends AbstractIncomingMessage {
+
+			@Override
+			void read(WebSocketImpl ws, WebSocketFrame frame, SocketChannel channel) {
+				onData.ifPresent(c -> c.receive(frame.payload, frame.fin, ws));
 			}
 		}
 
@@ -1578,12 +1971,15 @@ public class UHTTPD extends Thread implements Closeable {
 			@Override
 			public void transact() throws IOException {
 				onOpen.ifPresent(h -> h.open(ws));
+				boolean closed = false;
 				try {
 					var channel = ws.client.channel();
 					var frame = new WebSocketFrame();
 					AbstractIncomingMessage lastMessage = null;
 					while (true) {
 						frame.read(channel);
+						if(closed)
+							throw new IllegalStateException("Got another message after a close message.");
 						if (LOG.isLoggable(Level.DEBUG))
 							LOG.log(Level.DEBUG, "Frame: {0}", frame);
 						switch (frame.opCode) {
@@ -1599,9 +1995,14 @@ public class UHTTPD extends Thread implements Closeable {
 						case CLOSE:
 							lastMessage = new CloseMessage();
 							lastMessage.read(ws, frame, channel);
+							closed = true;
 							break;
 						case TEXT:
 							lastMessage = new TextMessage();
+							lastMessage.read(ws, frame, channel);
+							break;
+						case BINARY:
+							lastMessage = new BinaryMessage();
 							lastMessage.read(ws, frame, channel);
 							break;
 						default:
@@ -1611,7 +2012,8 @@ public class UHTTPD extends Thread implements Closeable {
 							lastMessage = null;
 					}
 				} finally {
-					onClose.ifPresent(h -> h.closed(ws));
+					if(!closed)
+						onClose.ifPresent(h -> h.closed(1006, "Unexpected close.", ws));
 				}
 			}
 		}
@@ -1622,7 +2024,6 @@ public class UHTTPD extends Thread implements Closeable {
 
 		private final Optional<OnWebSocketData> onData;
 		private final Optional<OnWebSocketText> onText;
-		private final Optional<OnWebSocketError> onError;
 		private final Optional<OnWebSocketHandshake> onHandshake;
 		private final Optional<OnWebSocketOpen> onOpen;
 		private final int maxTextPayloadSize;
@@ -1632,7 +2033,6 @@ public class UHTTPD extends Thread implements Closeable {
 			this.mask = builder.mask;
 			this.onData = builder.onData;
 			this.onText = builder.onText;
-			this.onError = builder.onError;
 			this.onClose = builder.onClose;
 			this.onOpen = builder.onOpen;
 			this.onHandshake = builder.onHandshake;
@@ -1641,15 +2041,15 @@ public class UHTTPD extends Thread implements Closeable {
 
 		@Override
 		public void get(Transaction req) throws Exception {
-			if (req.headerValueOr(HDR_CONNECTION).orElse(Named.EMPTY).expand(",").contains("Upgrade")
+			if (req.headersOr(HDR_CONNECTION).orElse(Named.EMPTY).expand(",").contains("Upgrade")
 					&& req.headerOr(HDR_UPGRADE).orElse("").equalsIgnoreCase("websocket")) {
 				// TODO https://en.wikipedia.org/wiki/WebSocket
 
 				// TODO origin check
 
 				var key = req.header("sec-websocket-Key");
-				var proto = req.headerValueOr("sec-websocket-protocol");
-				var version = req.headerValue("sec-websocket-version").asInt();
+				var proto = req.headersOr("sec-websocket-protocol");
+				var version = req.headers("sec-websocket-version").asInt();
 				if (version > SUPPORTED_WEBSOCKET_VERSION) {
 					req.header("sec-websocket-version", String.valueOf(SUPPORTED_WEBSOCKET_VERSION));
 					req.responseCode(Status.BAD_REQUEST);
@@ -1798,7 +2198,7 @@ public class UHTTPD extends Thread implements Closeable {
 
 							@Override
 							public Optional<Long> size() {
-								return req.headerValueOr(HDR_CONTENT_LENGTH).map(o -> o.asLong());
+								return req.headersOr(HDR_CONTENT_LENGTH).map(o -> o.asLong());
 							}
 
 							Iterable<Part> asPartsImpl() {
@@ -1862,11 +2262,20 @@ public class UHTTPD extends Thread implements Closeable {
 			}
 
 			var close = !client.keepAlive || Protocol.HTTP_1_1.compareTo(proto) < 0
-					|| req.headerValueOr(HDR_CONNECTION).orElse(Named.EMPTY).expand(",").containsIgnoreCase("close");
+					|| req.headersOr(HDR_CONNECTION).orElse(Named.EMPTY).expand(",").containsIgnoreCase("close");
 
 			if (proto.compareTo(Protocol.HTTP_1_0) > 0) {
 				req.headerOr(HDR_HOST).orElseThrow();
 			}
+			
+			req.headersOr(HDR_COOKIE).ifPresent(c -> {
+				for(var val : c.values()) {
+					var spec = Named.parseSeparatedStrings(val);
+					for(var cookie : spec.values()) {
+						req.incomingCookies.put(cookie.name(), cookie.asString());
+					}
+				}
+			});
 
 			for (var c : client.contentFactories.entrySet()) {
 				if (c.getKey().matches(req)) {
@@ -1888,7 +2297,7 @@ public class UHTTPD extends Thread implements Closeable {
 				}
 			}
 
-			if (!req.response.isPresent()) {
+			if (!req.code.isEmpty() && !req.response.isPresent() && !req.responder.isPresent()) {
 				req.notFound();
 			}
 
@@ -1918,44 +2327,41 @@ public class UHTTPD extends Thread implements Closeable {
 			newline();
 		}
 
-		private void respond(Transaction req, boolean closed) throws IOException {
+		private void respond(Transaction tx, boolean closed) throws IOException {
 
-			var status = req.code.orElse(Status.OK);
+			var status = tx.code.orElse(Status.OK);
 			var close = false;
 
 			if (status.getCode() >= 300)
 				close = true;
 
-			print(req.protocol().text());
+			print(tx.protocol().text());
 			print(" ");
 			print(status.code);
 			print(" ");
-			print(req.responseText.orElse(status.getText()));
+			print(tx.responseText.orElse(status.getText()));
 			newline();
 
 			if (LOG.isLoggable(Level.DEBUG) && !LOG.isLoggable(Level.TRACE))
-				LOG.log(Level.DEBUG, "HTTP OUT: {0} {1} {2}", req.protocol().text(), status.code,
-						req.responseText.orElse(status.getText()));
+				LOG.log(Level.DEBUG, "HTTP OUT: {0} {1} {2}", tx.protocol().text(), status.code,
+						tx.responseText.orElse(status.getText()));
 
-			var responseLength = req.responseLength;
+			var responseLength = tx.responseLength;
 			byte[] responseData = null;
 
 			/* Do our best to get some kind of content length so keep alive works */
-			if (req.response.isPresent()) {
-				var resp = req.response.get();
+			if (!tx.responder.isPresent() && tx.response.isPresent()) {
+				var resp = tx.response.get();
 				if (resp instanceof ByteBuffer) {
 					responseLength = Optional.of((long) ((ByteBuffer) resp).remaining());
 				} else if (resp instanceof ByteBuffer) {
-					var bb = (ByteBuffer) resp;
-					responseData = new byte[bb.remaining()];
-					bb.get(responseData);
-					responseLength = Optional.of((long) responseData.length);
+					responseLength = Optional.of((long) ((ByteBuffer)resp).remaining());
 				} else if (resp instanceof byte[]) {
 					responseData = (byte[]) resp;
-					responseLength = Optional.of((long) responseData.length);
+					responseLength = Optional.of((long) ((byte[])responseData).length);
 				} else if (!(resp instanceof InputStream) && !(resp instanceof Reader)) {
 					responseData = String.valueOf(resp).getBytes();
-					responseLength = Optional.of((long) responseData.length);
+					responseLength = Optional.of((long) ((byte[])responseData).length);
 				}
 			}
 
@@ -1968,37 +2374,57 @@ public class UHTTPD extends Thread implements Closeable {
 				 * else { close = true; }
 				 */
 
-			if (!req.hasResponseHeader(HDR_CONNECTION)) {
-				if (close && req.protocol.compareTo(Protocol.HTTP_2) < 0) {
+			if (!tx.hasResponseHeader(HDR_CONNECTION)) {
+				if (close && tx.protocol.compareTo(Protocol.HTTP_2) < 0) {
 					print(HDR_CONNECTION);
 					println(": close");
-				} else if (req.protocol.compareTo(Protocol.HTTP_1_0) > 0
-						&& req.protocol.compareTo(Protocol.HTTP_2) < 0) {
+				} else if (tx.protocol.compareTo(Protocol.HTTP_1_0) > 0
+						&& tx.protocol.compareTo(Protocol.HTTP_2) < 0) {
 					print(HDR_CONNECTION);
 					println(": keep-alive");
 				}
 			}
 
-			if (req.outgoingContentType.isPresent()) {
+			if (tx.outgoingContentType.isPresent()) {
 				print(HDR_CONTENT_TYPE);
 				print(": ");
-				print(req.outgoingContentType.get());
+				print(tx.outgoingContentType.get());
 				newline();
 			}
-			for (var nvp : req.outgoingHeaders.values()) {
+			
+			for (var nvp : tx.outgoingHeaders.values()) {
 				print(nvp.name());
 				print(": ");
 				print(nvp.value().orElse(""));
 				newline();
 			}
+			
+			for(var cookie : tx.outgoingCookies.values()) {
+				print(HDR_SET_COOKIE);
+				print(": ");
+				print(cookie);
+				newline();
+			}
+			
 			if (!client.cache) {
 				print(HDR_CACHE_CONTROL);
 				println(": no-cache");
 			}
 			newline();
 			flush();
-			if (req.response.isPresent()) {
-				var resp = req.response.get();
+			if (tx.responder.isPresent()) {
+				var buffer = ByteBuffer.allocateDirect(32768); // TODO configurable
+				do {
+					buffer.clear();
+					tx.responder.get().supply(buffer);
+					if(buffer.position() > 0) {
+						buffer.flip();
+						client.channel().write(buffer);
+					}
+				} while(buffer.position() > 0);
+			}
+			else if (tx.response.isPresent()) {
+				var resp = tx.response.get();
 				if (resp instanceof InputStream) {
 					try (var in = (InputStream) resp) {
 						in.transferTo(Channels.newOutputStream(client.channel()));
@@ -2007,20 +2433,16 @@ public class UHTTPD extends Thread implements Closeable {
 					try (var in = (Reader) resp) {
 						in.transferTo(writer);
 					}
-				} else {
-					writer.write(String.valueOf(responseData));
+				}  else if(resp instanceof ByteBuffer) {
+					client.channel().write((ByteBuffer)resp);
+				}
+				else {
+					client.channel().write(ByteBuffer.wrap(responseData));
 				}
 			}
 			flush();
 			if (close)
 				throw new EOFException();
-		}
-	}
-
-	private final static class AllSelector implements Selector {
-		@Override
-		public boolean matches(Transaction request) {
-			return true;
 		}
 	}
 
@@ -2061,24 +2483,6 @@ public class UHTTPD extends Thread implements Closeable {
 
 	}
 
-	private static class CompoundSelector implements Selector {
-		private Selector[] selectors;
-
-		CompoundSelector(Selector... selectors) {
-			this.selectors = selectors;
-		}
-
-		@Override
-		public boolean matches(Transaction request) {
-			for (var s : selectors) {
-				if (!s.matches(request)) {
-					return false;
-				}
-			}
-			return true;
-		}
-	}
-
 	private final static class FileResources implements Handler {
 
 		private final Pattern regexpWithGroups;
@@ -2111,21 +2515,6 @@ public class UHTTPD extends Thread implements Closeable {
 				throw new IllegalStateException(
 						String.format("Handling a request where the pattern '%s' does not match the path '%s'",
 								regexpWithGroups, req.path()));
-		}
-
-	}
-
-	private static class MethodSelector implements Selector {
-
-		private List<Method> methods;
-
-		MethodSelector(Method... methods) {
-			this.methods = Arrays.asList(methods);
-		}
-
-		@Override
-		public boolean matches(Transaction request) {
-			return methods.contains(request.method());
 		}
 
 	}
@@ -2219,22 +2608,6 @@ public class UHTTPD extends Thread implements Closeable {
 
 	}
 
-	private static class RegularExpressionSelector implements Selector {
-
-		private Pattern pattern;
-
-		RegularExpressionSelector(String regexp) {
-			pattern = Pattern.compile(regexp);
-		}
-
-		@Override
-		public boolean matches(Transaction req) {
-			var path = req.path().toString();
-			return pattern.matcher(path).matches();
-		}
-
-	}
-
 	private final static class URLEncodedFormDataPartIterator implements Iterator<Part> {
 
 		StringBuilder buffer = new StringBuilder(256);
@@ -2284,22 +2657,17 @@ public class UHTTPD extends Thread implements Closeable {
 				}
 			}
 		}
-
 	}
 
 	public static final String HDR_CACHE_CONTROL = "cache-control";
-
 	public static final String HDR_CONNECTION = "connection";
-
 	public static final String HDR_CONTENT_DISPOSITION = "content-disposition";
-
-	public static final String HDR_CONTENT_LENGTH = "content-Length";
-
+	public static final String HDR_CONTENT_LENGTH = "content-length";
 	public static final String HDR_CONTENT_TYPE = "content-type";
-
 	public static final String HDR_HOST = "host";
-
 	public static final String HDR_UPGRADE = "upgrade";
+	public static final String HDR_SET_COOKIE = "set-cookie";
+	public static final String HDR_COOKIE = "cookie";
 
 	final static Logger LOG = System.getLogger("UHTTPD");
 
@@ -2313,6 +2681,10 @@ public class UHTTPD extends Thread implements Closeable {
 
 	public static ServerBuilder server() {
 		return new ServerBuilder();
+	}
+
+	public static CookieBuilder cookie(String name, String version) {
+		return new CookieBuilder(name, version);
 	}
 
 	public static WebSocketBuilder websocket() {
@@ -2507,5 +2879,126 @@ public class UHTTPD extends Thread implements Closeable {
 			}
 		}
 	}
+	
+	//
+	// The following code comes from Apache Http client DateUtils under
+	// the same license as this project.
+	//
 
+    /**
+     * Date format pattern used to parse HTTP date headers in RFC 1123 format.
+     */
+    public static final String PATTERN_RFC1123 = "EEE, dd MMM yyyy HH:mm:ss zzz";
+
+    /**
+     * Date format pattern used to parse HTTP date headers in RFC 1036 format.
+     */
+    public static final String PATTERN_RFC1036 = "EEE, dd-MMM-yy HH:mm:ss zzz";
+
+    /**
+     * Date format pattern used to parse HTTP date headers in ANSI C
+     * {@code asctime()} format.
+     */
+    public static final String PATTERN_ASCTIME = "EEE MMM d HH:mm:ss yyyy";
+
+    private static final String[] DEFAULT_PATTERNS = new String[] {
+        PATTERN_RFC1123,
+        PATTERN_RFC1036,
+        PATTERN_ASCTIME
+    };
+
+    private static final Date DEFAULT_TWO_DIGIT_YEAR_START;
+
+    public static final TimeZone GMT = TimeZone.getTimeZone("GMT");
+
+    static {
+        final Calendar calendar = Calendar.getInstance();
+        calendar.setTimeZone(GMT);
+        calendar.set(2000, Calendar.JANUARY, 1, 0, 0, 0);
+        calendar.set(Calendar.MILLISECOND, 0);
+        DEFAULT_TWO_DIGIT_YEAR_START = calendar.getTime();
+    }
+
+	/**
+     * Parses the date value using the given date formats.
+     *
+     * @param dateValue the date value to parse
+     * @param dateFormats the date formats to use
+     * @param startDate During parsing, two digit years will be placed in the range
+     * {@code startDate} to {@code startDate + 100 years}. This value may
+     * be {@code null}. When {@code null} is given as a parameter, year
+     * {@code 2000} will be used.
+     *
+     * @return the parsed date or null if input could not be parsed
+     */
+    static Date parseDate(
+            final String dateValue,
+            final String[] dateFormats,
+            final Date startDate) {
+        final String[] localDateFormats = dateFormats != null ? dateFormats : DEFAULT_PATTERNS;
+        final Date localStartDate = startDate != null ? startDate : DEFAULT_TWO_DIGIT_YEAR_START;
+        String v = dateValue;
+        // trim single quotes around date if present
+        // see issue #5279
+        if (v.length() > 1 && v.startsWith("'") && v.endsWith("'")) {
+            v = v.substring (1, v.length() - 1);
+        }
+
+        for (final String dateFormat : localDateFormats) {
+            final SimpleDateFormat dateParser = DateFormatHolder.formatFor(dateFormat);
+            dateParser.set2DigitYearStart(localStartDate);
+            final ParsePosition pos = new ParsePosition(0);
+            final Date result = dateParser.parse(v, pos);
+            if (pos.getIndex() != 0) {
+                return result;
+            }
+        }
+        return null;
+    }/**
+     * A factory for {@link SimpleDateFormat}s. The instances are stored in a
+     * threadlocal way because SimpleDateFormat is not threadsafe as noted in
+     * {@link SimpleDateFormat its javadoc}.
+     *
+     */
+    final static class DateFormatHolder {
+
+        private static final ThreadLocal<SoftReference<Map<String, SimpleDateFormat>>>
+            THREADLOCAL_FORMATS = new ThreadLocal<SoftReference<Map<String, SimpleDateFormat>>>();
+
+        /**
+         * creates a {@link SimpleDateFormat} for the requested format string.
+         *
+         * @param pattern
+         *            a non-{@code null} format String according to
+         *            {@link SimpleDateFormat}. The format is not checked against
+         *            {@code null} since all paths go through
+         *            {@link DateUtils}.
+         * @return the requested format. This simple dateformat should not be used
+         *         to {@link SimpleDateFormat#applyPattern(String) apply} to a
+         *         different pattern.
+         */
+        public static SimpleDateFormat formatFor(final String pattern) {
+            final SoftReference<Map<String, SimpleDateFormat>> ref = THREADLOCAL_FORMATS.get();
+            Map<String, SimpleDateFormat> formats = ref == null ? null : ref.get();
+            if (formats == null) {
+                formats = new HashMap<String, SimpleDateFormat>();
+                THREADLOCAL_FORMATS.set(
+                        new SoftReference<Map<String, SimpleDateFormat>>(formats));
+            }
+
+            SimpleDateFormat format = formats.get(pattern);
+            if (format == null) {
+                format = new SimpleDateFormat(pattern, Locale.US);
+                format.setTimeZone(TimeZone.getTimeZone("GMT"));
+                formats.put(pattern, format);
+            }
+
+            return format;
+        }
+
+        public static void clearThreadLocal() {
+            THREADLOCAL_FORMATS.remove();
+        }
+
+    }
 }

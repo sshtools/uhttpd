@@ -26,7 +26,7 @@ This will run a server in the foreground on `localhost:8080`. Point your browser
 ### Features
 
  * Supports HTTP and HTTPS (HTTP/1.0 and HTTP/1.1).
- * Easily generate dynamic with simple handlers.
+ * Easily generate dynamic content with simple handlers.
  * Serve static content from classpath resources or files.
  * Zero dependencies.
  * Basic HTTP authentication
@@ -40,10 +40,12 @@ This will run a server in the foreground on `localhost:8080`. Point your browser
  
 ### TODO
 
+ * Chunking
+ * CONNECT
  * HTTP 2 and 3.
- * Cookie helpers.
  * Other authentication.
  * Lots of tests, testing and tuning.
+ * Replace threads with [fibers](https://www.infoworld.com/article/3652596/project-loom-understand-the-new-java-concurrency-model.html).
  
 ### Anti Features
 
@@ -116,6 +118,23 @@ Handling `POST` parameters, e.g. file upload.
 }
  ```
  
+Using a `Responder` to feed response content.
+ 
+ ```java
+try(var httpd = UHTTPD.server().
+	get("/respond", (tx) -> {
+		var line = new AtomicInteger(0);
+		tx.responder(buf -> {
+			if(line.incrementAndGet() < 10) {
+				buf.put(ByteBuffer.wrap(("Line " + line.get() + "\n").getBytes()));
+			}
+		});
+	}).
+	build()) {
+	httpd.run();
+}
+ ```
+ 
 Adding authentication (HTTP Basic) to some pages.
  
  ```java
@@ -164,19 +183,63 @@ Serve static files and classpath resources. The matching pattern usings regular 
 }
  ```
  
-Websockets. The `websocket()` builder has several methods for capturing events other than `onText()`, such as `onData()` for binary data.
+Cookies.
 
-The `send()` method sends text with automatic fragmentation, or the `fragment()` method can be used to send binary fragments.
- 
+```java
+try (var httpd = UHTTPD.server().get("/set-cookie\\.html", (tx) -> {
+	tx.cookie(UHTTPD.cookie("MyCookie", "A Value").build());
+	tx.response("text/html", """
+			<html>
+			<body>
+			<p>I have set a cookie!</p>
+			</body>
+			</html>
+			""");
+}).get("/get-cookie\\.html", (tx) -> {
+	tx.response("text/html", """
+			<html>
+			<body>
+			<p>The cookie value is __cookie__.</p>
+			</body>
+			</html>
+			""".replace("__cookie__", tx.cookie("MyCookie").value()));
+}).build()) {
+	httpd.run();
+}
+```
+
+
+Websockets. 
+
  ```java
-	try (var httpd = UHTTPD.server()
-			.webSocket("/ws", UHTTPD.websocket().onText((txt, ws) -> {
-				ws.send("Got '" + txt + "'");
-			}).build())
-			.withClasspathResources("(.*)", "web")
-			.build()) {
-		httpd.run();
-	} 
+try (var httpd = UHTTPD.server()
+	.webSocket("/ws", UHTTPD.websocket().
+		onText((txt, ws) -> {
+		
+			System.out.println("got '" + txt + "'");
+		
+			ws.send("I received '" + txt + "'"); // text reply
+		}).
+		onData((buf, fin, ws) -> {
+			System.out.println("got " + buf.remaining() + " bytes");
+		
+			ws.send(ByteBuffer.wrap(new byte[] {1,2,3})); // single binary reply
+			
+			ws.fragment(ByteBuffer.wrap(new byte[] {1}), false); // 1st fragment
+			ws.fragment(ByteBuffer.wrap(new byte[] {2}), false); // 2nd fragment
+			ws.fragment(ByteBuffer.wrap(new byte[] {3}), true); // final fragment
+		}).
+		onClose((code, text, ws) -> {
+			// web socket closed
+		}).
+		onOpen((ws) -> {
+			ws.send("Hello!");
+		}).
+		build())
+	.withClasspathResources("(.*)", "web")
+	.build()) {
+	httpd.run();
+} 
  ```
  
 Running the server in the background.

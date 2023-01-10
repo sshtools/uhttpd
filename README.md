@@ -19,7 +19,7 @@ public class SimpleServer {
 }
 ```
 
-This will run a sever in the foreground on `localhost:8080`. Point your browser to [http://localhost:8080/index.txt](http://localhost:8080/index.txt)
+This will run a server in the foreground on `localhost:8080`. Point your browser to [http://localhost:8080/index.txt](http://localhost:8080/index.txt)
 
 ## About
 
@@ -30,11 +30,13 @@ This will run a sever in the foreground on `localhost:8080`. Point your browser 
  * Serve static content from classpath resources or files.
  * Zero dependencies.
  * Basic HTTP authentication
+ * WebSockets
  * Single source file. Can be just dropped into your project with ease.
  
 ### WIP
 
- * WebSockets
+ * Cookie helpers.
+ * Full JavaDoc.
  
 ### TODO
 
@@ -162,12 +164,14 @@ Serve static files and classpath resources. The matching pattern usings regular 
 }
  ```
  
-Websockets. The `websocket()` builder has several methods for capturing events other than `onData()`.
+Websockets. The `websocket()` builder has several methods for capturing events other than `onText()`, such as `onData()` for binary data.
+
+The `send()` method sends text with automatic fragmentation, or the `fragment()` method can be used to send binary fragments.
  
  ```java
 	try (var httpd = UHTTPD.server()
-			.webSocket("/ws", UHTTPD.websocket().onData((buf, ws) -> {
-				ws.send("Got " + buf.remaining() + "bytes");
+			.webSocket("/ws", UHTTPD.websocket().onText((txt, ws) -> {
+				ws.send("Got '" + txt + "'");
 			}).build())
 			.withClasspathResources("(.*)", "web")
 			.build()) {

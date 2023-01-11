@@ -29,13 +29,13 @@ This will run a server in the foreground on `localhost:8080`. Point your browser
  * Easily generate dynamic content with simple handlers.
  * Serve static content from classpath resources or files.
  * Zero dependencies.
- * Basic HTTP authentication
- * WebSockets
+ * Basic HTTP authentication.
+ * WebSockets.
  * Single source file. Can be just dropped into your project with ease.
+ * Cookies.
  
 ### WIP
 
- * Cookie helpers.
  * Full JavaDoc.
  
 ### TODO

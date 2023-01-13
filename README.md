@@ -296,8 +296,8 @@ try(var httpd = UHTTPD.server().
 To use SSL you must provide a `KeyStore`. If you don't specifically supply one, there must a keystore file at `$HOME/.keystore` with a passphrase of `changeit` (this is the default used by the `keytool` command). Otherwise, either provide the path to a keystore file along with passwords, or provide an instance of `KeyStore`. The default port for SSL is 8443.
 
 
-```
-try(var httpd = server().
+```java
+try(var httpd = UHTTPD.server().
 	get("/text.txt", tx -> {
 		tx.response("text/plain", "This is some text.");
 	}).

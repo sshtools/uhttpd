@@ -21,12 +21,15 @@ import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.Closeable;
 import java.io.EOFException;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintWriter;
 import java.io.Reader;
 import java.io.StringReader;
+import java.io.StringWriter;
 import java.io.UncheckedIOException;
 import java.io.UnsupportedEncodingException;
 import java.lang.System.Logger;
@@ -35,6 +38,10 @@ import java.lang.ref.SoftReference;
 import java.math.BigDecimal;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketAddress;
+import java.net.SocketOption;
 import java.net.StandardSocketOptions;
 import java.net.URL;
 import java.net.URLConnection;
@@ -42,24 +49,23 @@ import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.CharBuffer;
 import java.nio.channels.Channels;
+import java.nio.channels.ClosedChannelException;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.Charset;
 import java.nio.charset.CharsetDecoder;
+import java.nio.charset.CharsetEncoder;
 import java.nio.charset.CoderResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.KeyStore;
-import java.security.KeyStoreException;
 import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.security.NoSuchProviderException;
 import java.security.Principal;
 import java.security.SecureRandom;
-import java.security.UnrecoverableKeyException;
-import java.security.cert.CertificateException;
 import java.text.ParsePosition;
 import java.text.SimpleDateFormat;
 import java.time.Instant;
@@ -76,27 +82,35 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.StringTokenizer;
 import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.zip.CRC32;
+import java.util.zip.Deflater;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLSession;
 
 /**
  * Simple HTTP/HTTPS server, configured using a fluent API.
  */
 public class UHTTPD extends Thread implements Closeable {
 
+	static final int DEFAULT_BUFFER_SIZE = 32768;
+
 	/**
 	 * Selector that just matches everything. All handlers will
 	 * be executed.
 	 */
-	public final static class AllSelector implements Selector {
+	public final static class AllSelector implements HandlerSelector {
 		@Override
 		public boolean matches(Transaction request) {
 			return true;
@@ -129,20 +143,21 @@ public class UHTTPD extends Thread implements Closeable {
 	public static final class Client implements Runnable, Closeable {
 
 		final boolean cache;
-		final Map<Selector, Handler> contentFactories;
+		final Map<HandlerSelector, Handler> contentFactories;
 		final boolean keepAlive;
 		final int keepAliveMax;
 		final int keepAliveTimeoutSecs;
-		final Closeable server;
+		final UHTTPD server;
 		final SocketChannel socket;
 
 		boolean closed = false;
 		int times = 0;
 		WireProtocol wireProtocol;
 		Charset charset = Charset.defaultCharset();
+		Selector selector;
 
 		Client(SocketChannel socket, boolean cache, boolean keepAlive, int keepAliveTimeoutSecs, int keepAliveMax,
-				Map<Selector, Handler> contentFactories, Closeable server) throws IOException {
+				Map<HandlerSelector, Handler> contentFactories, UHTTPD server) throws IOException {
 			this.socket = socket;
 			this.cache = cache;
 			this.keepAlive = keepAlive;
@@ -152,6 +167,21 @@ public class UHTTPD extends Thread implements Closeable {
 			this.server = server;
 
 			wireProtocol = new HTTP11WireProtocol(this);
+			
+			selector = Selector.open();
+			var uchannel = underlyingChannel();
+			var selectionKey = uchannel.register(selector, SelectionKey.OP_WRITE);
+			selectionKey.attach(uchannel);
+		}
+		
+		SocketChannel underlyingChannel() {
+			var ch = channel();
+			if(ch instanceof SSL.SSLSocketChannel) {
+				return ((SSL.SSLSocketChannel)ch).getWrappedSocketChannel();
+			}
+			else {
+				return ch;
+			}
 		}
 
 		public final SocketChannel channel() {
@@ -174,6 +204,7 @@ public class UHTTPD extends Thread implements Closeable {
 		public final void close() throws IOException {
 			if (!closed) {
 				closed = true;
+				selector.close();
 				try {
 					socket.close();
 				} catch (IOException ioe) {
@@ -208,6 +239,7 @@ public class UHTTPD extends Thread implements Closeable {
 					} catch (EOFException e) {
 						LOG.log(Level.TRACE, "EOF.", e);
 					} catch (Exception e) {
+						e.printStackTrace();
 						LOG.log(Level.ERROR, "Failed handling connection.", e);
 					}
 				}
@@ -224,6 +256,14 @@ public class UHTTPD extends Thread implements Closeable {
 
 		public final WireProtocol wireProtocol() {
 			return wireProtocol;
+		}
+
+		public void waitForWrite() {
+			try {
+				selector.select();
+			} catch (IOException e) {
+				throw new UncheckedIOException(e);
+			}
 		}
 
 	}
@@ -545,14 +585,14 @@ public class UHTTPD extends Thread implements Closeable {
 	}
 
 	/**
-	 * Selector that executes a {@link Handler} if all {@link Selector}s
+	 * Selector that executes a {@link Handler} if all {@link HandlerSelector}s
 	 * it contains match.
 	 *
 	 */
-	public static final class CompoundSelector implements Selector {
-		private Selector[] selectors;
+	public static final class CompoundSelector implements HandlerSelector {
+		private HandlerSelector[] selectors;
 
-		CompoundSelector(Selector... selectors) {
+		CompoundSelector(HandlerSelector... selectors) {
 			this.selectors = selectors;
 		}
 
@@ -710,7 +750,8 @@ public class UHTTPD extends Thread implements Closeable {
 	 * Constants for HTTP methods.
 	 */
 	public enum Method {
-		CONNECT, DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT, TRACE
+		CONNECT, DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT, TRACE, COPY,
+		LOCK, MKCOL, MOVE, PROPFIND, PROPPATCH, UNLOCK
 	}
 
 	/**
@@ -718,7 +759,7 @@ public class UHTTPD extends Thread implements Closeable {
 	 * method matches, the handler will be executed.
 	 *
 	 */
-	public static final class MethodSelector implements Selector {
+	public static final class MethodSelector implements HandlerSelector {
 
 		private List<Method> methods;
 
@@ -922,7 +963,7 @@ public class UHTTPD extends Thread implements Closeable {
 	 * If the URI matches, the handler will be executred.
 	 *
 	 */
-	public static final class RegularExpressionSelector implements Selector {
+	public static final class RegularExpressionSelector implements HandlerSelector {
 
 		private Pattern pattern;
 
@@ -939,29 +980,47 @@ public class UHTTPD extends Thread implements Closeable {
 	}
 	
 	/**
-	 * Can be used with {@link Transaction#respond} to supply response
-	 * content piece by piece. Each call you are expected to fill a {@link ByteBuffer}
-	 * until there is no more content, when the buffer should be returned with a zero
-	 * limit. 
+	 * Various operations may need a pre-created buffer to be filled. This interface
+	 * will be expected. 
 	 * 
 	 */
-	public interface Responder {
+	public interface BufferFiller {
 		/**
-		 * Supply some more data for the response. Upon invocation, the
+		 * Supply some more data. Upon invocation, the
 		 * byte buffer will be reset. If there is content, before exit 
 		 * it should NOT be {@link ByteBuffer#flip()}ped so that {@link ByteBuffer#position()} is greater than zero.
 		 * <p>
 		 * If there is no more content, the {@link ByteBuffer#position()} should be zero. So
 		 * if you just don't write anything to the buffer this will be the case.
-		 * <p>
-		 * If the size and type of the content is known, {@link Transaction#responseLength(long)} and
-		 * {@link Transaction#responseType(String)} should be set.
 		 *   
 		 * @param buffer buffer to fill
+		 * @throws IOException on error
 		 */
-		void supply(ByteBuffer buffer);
+		void supply(ByteBuffer buffer) throws IOException;
 	}
-
+	
+	/**
+	 * The {@link Runner} interface provides access to the scheduler. Every 
+	 * HTTP connection access to at least one thread (a second thread may be
+	 * required for tunnelling). This action has been abstracted to allow
+	 * plugging in Fibres from project Loom when it is generally availabel. 
+	 *
+	 */
+	public interface Runner extends Closeable {
+		
+		@Override
+		default void close() {
+		}
+		
+		/**
+		 * Run a task.
+		 * 
+		 * @param runnable task
+		 * @throws Exception
+		 */
+		void run(Runnable runnable);
+	}
+	
 	/**
 	 * The "Same Site" attribute used by {@link Cookie} to 
 	 * mitigate CSRF attacks. Currently a draft. https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-07
@@ -975,7 +1034,7 @@ public class UHTTPD extends Thread implements Closeable {
 	 * to a given {@link Transaction}, e.g. should a handler
 	 * handle a GET request for a certain URI.
 	 */
-	public interface Selector {
+	public interface HandlerSelector {
 		boolean matches(Transaction request);
 	}
 
@@ -987,20 +1046,43 @@ public class UHTTPD extends Thread implements Closeable {
 		private int backlog = 10;
 		private boolean cache = true;
 		private boolean daemon;
-		private Map<Selector, Handler> handlers = new LinkedHashMap<>();
+		private Map<HandlerSelector, Handler> handlers = new LinkedHashMap<>();
+		private Map<Status, Handler> statusHandlers = new LinkedHashMap<>();
 		private Optional<InetAddress> httpAddress = Optional.empty();
 		private Optional<Integer> httpPort = Optional.of(8080);
 		private Optional<InetAddress> httpsAddress = Optional.empty();
 		private Optional<Integer> httpsPort = Optional.empty();
 		private boolean keepAlive = true;
+		private boolean gzip = true;
 		private int keepAliveMax = 100;
 		private int keepAliveTimeoutSecs = 15;
 		private Optional<char[]> keyPassword = Optional.empty();
-		private String keyStoreAlias = "uhttpd";
 		private Optional<Path> keyStoreFile = Optional.empty();
+		private Optional<String> keyStoreType = Optional.empty();
 		private Optional<char[]> keyStorePassword = Optional.empty();
 		private String threadName = "UHTTPD";
-		private Optional<Integer> threads = Optional.empty();
+		private Optional<Runner> runner = Optional.empty();
+		private Optional<Long> gzipMinSize = Optional.empty();
+		private int sendBufferSize = DEFAULT_BUFFER_SIZE;
+		private int recvBufferSize = DEFAULT_BUFFER_SIZE;
+		private Optional<KeyStore> keyStore = Optional.empty();
+		
+		ServerBuilder() {
+			statusHandlers.put(Status.INTERNAL_SERVER_ERROR, (tx) -> {
+				tx.response("text/html", """
+						<html>
+						<body>
+						<h1>Internal Server Error</h1>
+						<p>__msg__</p>
+						<br/>
+						<pre>__trace__</pre>
+						</body>
+						</html>
+						""".
+					replace("__msg__", tx.error().map(e -> e.getMessage()).orElse("No message supplied.")).
+					replace("__trace__", tx.errorTrace().orElse("")));
+			});
+		}
 
 		public ServerBuilder asDaemon() {
 			daemon = true;
@@ -1033,7 +1115,7 @@ public class UHTTPD extends Thread implements Closeable {
 					handler);
 		}
 
-		public ServerBuilder handle(Selector selector, Handler... handler) {
+		public ServerBuilder handle(HandlerSelector selector, Handler... handler) {
 			if (handler.length == 0)
 				throw new IllegalArgumentException("Expect at least one handler.");
 			if (handler.length == 1)
@@ -1053,6 +1135,11 @@ public class UHTTPD extends Thread implements Closeable {
 		public ServerBuilder handle(String regexp, Handler... handler) {
 			return handle(new RegularExpressionSelector(regexp), handler);
 		}
+		
+		public ServerBuilder status(Status status, Handler handler) {
+			statusHandlers.put(status, handler);
+			return this;
+		}
 
 		public ServerBuilder post(String regexp, Handler... handler) {
 			return handle(new CompoundSelector(new MethodSelector(Method.POST), new RegularExpressionSelector(regexp)),
@@ -1062,6 +1149,20 @@ public class UHTTPD extends Thread implements Closeable {
 		public ServerBuilder webSocket(String regexp, WebSocketHandler handler) {
 			return handle(new CompoundSelector(new MethodSelector(Method.GET), new RegularExpressionSelector(regexp)),
 					handler);
+		}
+
+		public ServerBuilder tunnel(TunnelHandler handler) {
+			return handle(new MethodSelector(Method.CONNECT), handler);
+		}
+
+		public ServerBuilder withSendBufferSize(int sendBufferSize) {
+			this.sendBufferSize = sendBufferSize;
+			return this;
+		}
+
+		public ServerBuilder withRecvBufferSize(int recvBufferSize) {
+			this.recvBufferSize = recvBufferSize;
+			return this;
 		}
 
 		public ServerBuilder withBacklog(int backlog) {
@@ -1076,7 +1177,7 @@ public class UHTTPD extends Thread implements Closeable {
 		public ServerBuilder withClasspathResources(String regexpWithGroups, Optional<ClassLoader> loader,
 				String prefix, Handler... handler) {
 			var l = new ArrayList<Handler>();
-			l.add(new ClasspathResources(regexpWithGroups, loader, prefix));
+			l.add(classpathResources(regexpWithGroups, loader, prefix));
 			l.addAll(Arrays.asList(handler));
 			handle(new RegularExpressionSelector(regexpWithGroups), l.toArray(new Handler[0]));
 			return this;
@@ -1114,6 +1215,10 @@ public class UHTTPD extends Thread implements Closeable {
 			return this;
 		}
 
+		public ServerBuilder withHttps() {			
+			return withHttps(8443);
+		}
+
 		public ServerBuilder withHttps(int httpsPort) {
 			this.httpsPort = Optional.of(httpsPort);
 			return this;
@@ -1148,13 +1253,18 @@ public class UHTTPD extends Thread implements Closeable {
 			return this;
 		}
 
-		public ServerBuilder withKeyStoreAlias(String keyStoreAlias) {
-			this.keyStoreAlias = keyStoreAlias;
+		public ServerBuilder withKeyStoreFile(Path keyStoreFile) {
+			this.keyStoreFile = Optional.of(keyStoreFile);
 			return this;
 		}
 
-		public ServerBuilder withKeyStoreFile(Path keyStoreFile) {
-			this.keyStoreFile = Optional.of(keyStoreFile);
+		public ServerBuilder withKeyStoreType(String keyStoreType) {
+			this.keyStoreType = Optional.of(keyStoreType);
+			return this;
+		}
+
+		public ServerBuilder withKeyStore(KeyStore keyStore) {
+			this.keyStore  = Optional.of(keyStore);
 			return this;
 		}
 
@@ -1183,41 +1293,1102 @@ public class UHTTPD extends Thread implements Closeable {
 			return this;
 		}
 
+		public ServerBuilder withoutCompression() {
+			this.gzip = false;
+			return this;
+		}
+
+		public ServerBuilder withMinCompressableSize(long gzipMinSize) {
+			this.gzipMinSize  = Optional.of(gzipMinSize);
+			return this;
+		}
+		
+		public ServerBuilder withRunner(Runner runner) {
+			this.runner = Optional.of(runner);
+			return this;
+		}
+
 		public ServerBuilder withThreadName(String threadName) {
 			this.threadName = threadName;
 			return this;
 		}
+	}
 
-		public ServerBuilder withThreads(int threads) {
-			this.threads = Optional.of(threads);
-			return this;
+	/**
+	 * This is the support for SSL, and it is adapted from the
+	 * <strong>NioSSL</strong> project (https://github.com/baswerc/niossl). We use
+	 * this because we need a {@link SocketChnannel} implementation, but with SSL
+	 * support. The JDK does not provide this.
+	 * 
+	 * Copyright 2015 Corey Baswell
+	 *
+	 * Licensed under the Apache License, Version 2.0 (the "License"); you may not
+	 * use this file except in compliance with the License. You may obtain a copy of
+	 * the License at
+	 *
+	 * http://www.apache.org/licenses/LICENSE-2.0
+	 *
+	 * Unless required by applicable law or agreed to in writing, software
+	 * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+	 * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+	 * License for the specific language governing permissions and limitations under
+	 * the License.
+	 */
+	private final static class SSL {
+		final static Logger SSL_LOG = System.getLogger("UHTTPD-SSL");
+	
+		private final static class SSLEngineBuffer {
+			private final SocketChannel socketChannel;
+	
+			private final SSLEngine sslEngine;
+	
+			private final Runner executorService;
+	
+			private final ByteBuffer networkInboundBuffer;
+	
+			private final ByteBuffer networkOutboundBuffer;
+	
+			private final int minimumApplicationBufferSize;
+	
+			private final ByteBuffer unwrapBuffer;
+	
+			private final ByteBuffer wrapBuffer;
+	
+			public SSLEngineBuffer(SocketChannel socketChannel, SSLEngine sslEngine, Runner executorService) {
+				this.socketChannel = socketChannel;
+				this.sslEngine = sslEngine;
+				this.executorService = executorService;
+	
+				var session = sslEngine.getSession();
+				int networkBufferSize = session.getPacketBufferSize();
+	
+				networkInboundBuffer = ByteBuffer.allocateDirect(networkBufferSize);
+	
+				networkOutboundBuffer = ByteBuffer.allocateDirect(networkBufferSize);
+				networkOutboundBuffer.flip();
+	
+				minimumApplicationBufferSize = session.getApplicationBufferSize();
+				unwrapBuffer = ByteBuffer.allocateDirect(minimumApplicationBufferSize);
+				wrapBuffer = ByteBuffer.allocateDirect(minimumApplicationBufferSize);
+				wrapBuffer.flip();
+			}
+	
+			int unwrap(ByteBuffer applicationInputBuffer) throws IOException {
+				if (applicationInputBuffer.capacity() < minimumApplicationBufferSize) {
+					throw new IllegalArgumentException(
+							"Application buffer size must be at least: " + minimumApplicationBufferSize);
+				}
+	
+				if (unwrapBuffer.position() != 0) {
+					unwrapBuffer.flip();
+					while (unwrapBuffer.hasRemaining() && applicationInputBuffer.hasRemaining()) {
+						applicationInputBuffer.put(unwrapBuffer.get());
+					}
+					unwrapBuffer.compact();
+				}
+	
+				int totalUnwrapped = 0;
+				int unwrapped, wrapped;
+	
+				do {
+					totalUnwrapped += unwrapped = doUnwrap(applicationInputBuffer);
+					wrapped = doWrap(wrapBuffer);
+				} while (unwrapped > 0
+						|| wrapped > 0 && (networkOutboundBuffer.hasRemaining() && networkInboundBuffer.hasRemaining()));
+	
+				return totalUnwrapped;
+			}
+	
+			int wrap(ByteBuffer applicationOutboundBuffer) throws IOException {
+				int wrapped = doWrap(applicationOutboundBuffer);
+				doUnwrap(unwrapBuffer);
+				return wrapped;
+			}
+	
+			int flushNetworkOutbound() throws IOException {
+				return send(socketChannel, networkOutboundBuffer);
+			}
+	
+			int send(SocketChannel channel, ByteBuffer buffer) throws IOException {
+				int totalWritten = 0;
+				while (buffer.hasRemaining()) {
+					int written = channel.write(buffer);
+	
+					if (written == 0) {
+						break;
+					} else if (written < 0) {
+						return (totalWritten == 0) ? written : totalWritten;
+					}
+					totalWritten += written;
+				}
+				if (SSL_LOG.isLoggable(Level.TRACE)) {
+					SSL_LOG.log(Level.TRACE, "sent: {0} out to socket", totalWritten);
+				}
+				return totalWritten;
+			}
+	
+			void close() {
+				try {
+					sslEngine.closeInbound();
+				} catch (Exception e) {
+				}
+	
+				try {
+					sslEngine.closeOutbound();
+				} catch (Exception e) {
+				}
+			}
+	
+			private int doUnwrap(ByteBuffer applicationInputBuffer) throws IOException {
+	
+				if (SSL_LOG.isLoggable(Level.TRACE)) {
+					SSL_LOG.log(Level.TRACE, "unwrap:");
+				}
+	
+				int totalReadFromChannel = 0;
+	
+				// Keep looping until peer has no more data ready or the
+				// applicationInboundBuffer is full
+				UNWRAP: do {
+					// 1. Pull data from peer into networkInboundBuffer
+	
+					int readFromChannel = 0;
+					while (networkInboundBuffer.hasRemaining()) {
+						int read = socketChannel.read(networkInboundBuffer);
+						if (SSL_LOG.isLoggable(Level.TRACE)) {
+							SSL_LOG.log(Level.TRACE, "unwrap: socket read {0} ({1})", read,  + readFromChannel, totalReadFromChannel);
+						}
+						if (read <= 0) {
+							if ((read < 0) && (readFromChannel == 0) && (totalReadFromChannel == 0)) {
+								// No work done and we've reached the end of the channel from peer
+								if (SSL_LOG.isLoggable(Level.TRACE)) {
+									SSL_LOG.log(Level.TRACE, "unwrap: exit: end of channel");
+								}
+								return read;
+							}
+							break;
+						} else {
+							readFromChannel += read;
+						}
+					}
+	
+					networkInboundBuffer.flip();
+					if (!networkInboundBuffer.hasRemaining()) {
+						networkInboundBuffer.compact();
+						// wrap(applicationOutputBuffer, applicationInputBuffer, false);
+						return totalReadFromChannel;
+					}
+	
+					totalReadFromChannel += readFromChannel;
+	
+					try {
+						var result = sslEngine.unwrap(networkInboundBuffer, applicationInputBuffer);
+						if (SSL_LOG.isLoggable(Level.TRACE)) {
+							SSL_LOG.log(Level.TRACE, "unwrap: result: {0}", result);
+						}
+	
+						switch (result.getStatus()) {
+						case OK:
+							var handshakeStatus = result.getHandshakeStatus();
+							switch (handshakeStatus) {
+							case NEED_UNWRAP:
+								break;
+	
+							case NEED_WRAP:
+								break UNWRAP;
+	
+							case NEED_TASK:
+								runHandshakeTasks();
+								break;
+	
+							case NOT_HANDSHAKING:
+							default:
+								break;
+							}
+							break;
+	
+						case BUFFER_OVERFLOW:
+							if (SSL_LOG.isLoggable(Level.TRACE)) {
+								SSL_LOG.log(Level.TRACE, "unwrap: buffer overflow");
+							}
+							break UNWRAP;
+	
+						case CLOSED:
+							if (SSL_LOG.isLoggable(Level.TRACE)) {
+								SSL_LOG.log(Level.TRACE, "unwrap: exit: ssl closed");
+							}
+							return totalReadFromChannel == 0 ? -1 : totalReadFromChannel;
+	
+						case BUFFER_UNDERFLOW:
+							if (SSL_LOG.isLoggable(Level.TRACE)) {
+								SSL_LOG.log(Level.TRACE, "unwrap: buffer underflow");
+							}
+							break;
+						}
+					} finally {
+						networkInboundBuffer.compact();
+					}
+				} while (applicationInputBuffer.hasRemaining());
+	
+				return totalReadFromChannel;
+			}
+	
+			private int doWrap(ByteBuffer applicationOutboundBuffer) throws IOException {
+				if (SSL_LOG.isLoggable(Level.TRACE)) {
+					SSL_LOG.log(Level.TRACE, "wrap:");
+				}
+				int totalWritten = 0;
+	
+				// 1. Send any data already wrapped out channel
+	
+				if (networkOutboundBuffer.hasRemaining()) {
+					totalWritten = send(socketChannel, networkOutboundBuffer);
+					if (totalWritten < 0) {
+						return totalWritten;
+					}
+				}
+	
+				// 2. Any data in application buffer ? Wrap that and send it to peer.
+	
+				WRAP: while (true) {
+					networkOutboundBuffer.compact();
+					var result = sslEngine.wrap(applicationOutboundBuffer, networkOutboundBuffer);
+					if (SSL_LOG.isLoggable(Level.TRACE)) {
+						SSL_LOG.log(Level.TRACE, "wrap: result: {0}", result);
+					}
+	
+					networkOutboundBuffer.flip();
+					if (networkOutboundBuffer.hasRemaining()) {
+						int written = send(socketChannel, networkOutboundBuffer);
+						if (written < 0) {
+							return totalWritten == 0 ? written : totalWritten;
+						} else {
+							totalWritten += written;
+						}
+					}
+	
+					switch (result.getStatus()) {
+					case OK:
+						switch (result.getHandshakeStatus()) {
+						case NEED_WRAP:
+							break;
+	
+						case NEED_UNWRAP:
+							break WRAP;
+	
+						case NEED_TASK:
+							runHandshakeTasks();
+							if (SSL_LOG.isLoggable(Level.TRACE)) {
+								SSL_LOG.log(Level.TRACE, "wrap: exit: need tasks");
+							}
+							break;
+	
+						case NOT_HANDSHAKING:
+							if (applicationOutboundBuffer.hasRemaining()) {
+								break;
+							} else {
+								break WRAP;
+							}
+						default:
+							break;
+						}
+						break;
+	
+					case BUFFER_OVERFLOW:
+						if (SSL_LOG.isLoggable(Level.TRACE)) {
+							SSL_LOG.log(Level.TRACE, "wrap: exit: buffer overflow");
+						}
+						break WRAP;
+	
+					case CLOSED:
+						if (SSL_LOG.isLoggable(Level.TRACE)) {
+							SSL_LOG.log(Level.TRACE, "wrap: exit: closed");
+						}
+						break WRAP;
+	
+					case BUFFER_UNDERFLOW:
+						if (SSL_LOG.isLoggable(Level.TRACE)) {
+							SSL_LOG.log(Level.TRACE, "wrap: exit: buffer underflow");
+						}
+						break WRAP;
+					}
+				}
+	
+				if (SSL_LOG.isLoggable(Level.TRACE)) {
+					SSL_LOG.log(Level.TRACE, "wrap: return: " + totalWritten);
+				}
+				return totalWritten;
+			}
+	
+			private void runHandshakeTasks() {
+				while (true) {
+					final Runnable runnable = sslEngine.getDelegatedTask();
+					if (runnable == null) {
+						break;
+					} else {
+						executorService.run(runnable);
+					}
+				}
+			}
+		}
+	
+		/**
+		 * A wrapper around a real {@link SocketChannel} that adds SSL support.
+		 */
+		private final static class SSLSocketChannel extends SocketChannel {
+			private final SocketChannel socketChannel;
+	
+			private final SSLEngineBuffer sslEngineBuffer;
+	
+			/**
+			 *
+			 * @param socketChannel   The real SocketChannel.
+			 * @param sslEngine       The SSL engine to use for traffic back and forth on
+			 *                        the given SocketChannel.
+			 * @param executorService Used to execute long running, blocking SSL operations
+			 *                        such as certificate validation with a CA (<a href=
+			 *                        "http://docs.oracle.com/javase/7/docs/api/javax/net/ssl/SSLEngineResult.HandshakeStatus.html#NEED_TASK">NEED_TASK</a>)
+			 * @throws IOException
+			 */
+			public SSLSocketChannel(SocketChannel socketChannel, final SSLEngine sslEngine, Runner executorService) {
+				super(socketChannel.provider());
+	
+				this.socketChannel = socketChannel;
+	
+				sslEngineBuffer = new SSLEngineBuffer(socketChannel, sslEngine, executorService);
+			}
+	
+			public final SocketChannel getWrappedSocketChannel() {
+				return socketChannel;
+			}
+
+			/**
+			 * <p>
+			 * Reads a sequence of bytes from this channel into the given buffer.
+			 * </p>
+			 *
+			 * <p>
+			 * An attempt is made to read up to r bytes from the channel, where r is the
+			 * number of bytes remaining in the buffer, that is, dst.remaining(), at the
+			 * moment this method is invoked.
+			 * </p>
+			 *
+			 * <p>
+			 * Suppose that a byte sequence of length n is read, where 0 <= n <= r. This
+			 * byte sequence will be transferred into the buffer so that the first byte in
+			 * the sequence is at index p and the last byte is at index p + n - 1, where p
+			 * is the buffer's position at the moment this method is invoked. Upon return
+			 * the buffer's position will be equal to p + n; its limit will not have
+			 * changed.
+			 * </p>
+			 *
+			 * <p>
+			 * A read operation might not fill the buffer, and in fact it might not read any
+			 * bytes at all. Whether or not it does so depends upon the nature and state of
+			 * the channel. A socket channel in non-blocking mode, for example, cannot read
+			 * any more bytes than are immediately available from the socket's input buffer;
+			 * similarly, a file channel cannot read any more bytes than remain in the file.
+			 * It is guaranteed, however, that if a channel is in blocking mode and there is
+			 * at least one byte remaining in the buffer then this method will block until
+			 * at least one byte is read.</
+			 *
+			 * <p>
+			 * This method may be invoked at any time. If another thread has already
+			 * initiated a read operation upon this channel, however, then an invocation of
+			 * this method will block until the first operation is complete.
+			 * </p>
+			 *
+			 * @param applicationBuffer The buffer into which bytes are to be transferred
+			 * @return The number of bytes read, possibly zero, or -1 if the channel has
+			 *         reached end-of-stream
+			 * @throws java.nio.channels.NotYetConnectedException   If this channel is not
+			 *                                                      yet connected
+			 * @throws java.nio.channels.ClosedChannelException     If this channel is
+			 *                                                      closed
+			 * @throws java.nio.channels.AsynchronousCloseException If another thread closes
+			 *                                                      this channel while the
+			 *                                                      read operation is in
+			 *                                                      progress
+			 * @throws java.nio.channels.ClosedByInterruptException If another thread
+			 *                                                      interrupts the current
+			 *                                                      thread while the read
+			 *                                                      operation is in
+			 *                                                      progress, thereby
+			 *                                                      closing the channel and
+			 *                                                      setting the current
+			 *                                                      thread's interrupt
+			 *                                                      status
+			 * @throws IOException                                  If some other I/O error
+			 *                                                      occurs
+			 * @throws IllegalArgumentException                     If the given
+			 *                                                      applicationBuffer
+			 *                                                      capacity
+			 *                                                      ({@link ByteBuffer#capacity()}
+			 *                                                      is less then the
+			 *                                                      application buffer size
+			 *                                                      of the {@link SSLEngine}
+			 *                                                      session application
+			 *                                                      buffer size
+			 *                                                      ({@link SSLSession#getApplicationBufferSize()}
+			 *                                                      this channel was
+			 *                                                      constructed was.
+			 */
+			@Override
+			synchronized public int read(ByteBuffer applicationBuffer) throws IOException, IllegalArgumentException {
+				if (SSL_LOG.isLoggable(Level.TRACE)) {
+					SSL_LOG.log(Level.TRACE, "read: {0} {1}", applicationBuffer.position(), applicationBuffer.limit());
+				}
+				int intialPosition = applicationBuffer.position();
+	
+				int readFromChannel = sslEngineBuffer.unwrap(applicationBuffer);
+				if (SSL_LOG.isLoggable(Level.TRACE)) {
+					SSL_LOG.log(Level.TRACE, "read: from channel: {0}", readFromChannel);
+				}
+	
+				if (readFromChannel < 0) {
+					if (SSL_LOG.isLoggable(Level.TRACE)) {
+						SSL_LOG.log(Level.TRACE, "read: channel closed.");
+					}
+					return readFromChannel;
+				} else {
+					int totalRead = applicationBuffer.position() - intialPosition;
+					if (SSL_LOG.isLoggable(Level.TRACE)) {
+						SSL_LOG.log(Level.TRACE, "read: total read {0}", totalRead);
+					}
+					return totalRead;
+				}
+			}
+	
+			/**
+			 * <p>
+			 * Writes a sequence of bytes to this channel from the given buffer.
+			 * </p>
+			 *
+			 * <p>
+			 * An attempt is made to write up to r bytes to the channel, where r is the
+			 * number of bytes remaining in the buffer, that is, src.remaining(), at the
+			 * moment this method is invoked.
+			 * </p>
+			 *
+			 * <p>
+			 * Suppose that a byte sequence of length n is written, where 0 <= n <= r. This
+			 * byte sequence will be transferred from the buffer starting at index p, where
+			 * p is the buffer's position at the moment this method is invoked; the index of
+			 * the last byte written will be p + n - 1. Upon return the buffer's position
+			 * will be equal to p + n; its limit will not have changed.
+			 * </p>
+			 *
+			 * <p>
+			 * Unless otherwise specified, a write operation will return only after writing
+			 * all of the r requested bytes. Some types of channels, depending upon their
+			 * state, may write only some of the bytes or possibly none at all. A socket
+			 * channel in non-blocking mode, for example, cannot write any more bytes than
+			 * are free in the socket's output buffer.
+			 * </p>
+			 *
+			 * <p>
+			 * This method may be invoked at any time. If another thread has already
+			 * initiated a write operation upon this channel, however, then an invocation of
+			 * this method will block until the first operation is complete.
+			 * </p>
+			 *
+			 * @param applicationBuffer The buffer from which bytes are to be retrieved
+			 * @return The number of bytes written, possibly zero
+			 * @throws java.nio.channels.NotYetConnectedException   If this channel is not
+			 *                                                      yet connected
+			 * @throws java.nio.channels.ClosedChannelException     If this channel is
+			 *                                                      closed
+			 * @throws java.nio.channels.AsynchronousCloseException If another thread closes
+			 *                                                      this channel while the
+			 *                                                      read operation is in
+			 *                                                      progress
+			 * @throws java.nio.channels.ClosedByInterruptException If another thread
+			 *                                                      interrupts the current
+			 *                                                      thread while the read
+			 *                                                      operation is in
+			 *                                                      progress, thereby
+			 *                                                      closing the channel and
+			 *                                                      setting the current
+			 *                                                      thread's interrupt
+			 *                                                      status
+			 * @throws IOException                                  If some other I/O error
+			 *                                                      occurs
+			 * @throws IllegalArgumentException                     If the given
+			 *                                                      applicationBuffer
+			 *                                                      capacity
+			 *                                                      ({@link ByteBuffer#capacity()}
+			 *                                                      is less then the
+			 *                                                      application buffer size
+			 *                                                      of the {@link SSLEngine}
+			 *                                                      session application
+			 *                                                      buffer size
+			 *                                                      ({@link SSLSession#getApplicationBufferSize()}
+			 *                                                      this channel was
+			 *                                                      constructed was.
+			 */
+			@Override
+			synchronized public int write(ByteBuffer applicationBuffer) throws IOException, IllegalArgumentException {
+				if (SSL_LOG.isLoggable(Level.TRACE)) {
+					SSL_LOG.log(Level.TRACE, "write:");
+				}
+	
+				int intialPosition = applicationBuffer.position();
+				int writtenToChannel = sslEngineBuffer.wrap(applicationBuffer);
+	
+				if (writtenToChannel < 0) {
+					if (SSL_LOG.isLoggable(Level.TRACE)) {
+						SSL_LOG.log(Level.TRACE, "write: channel closed");
+					}
+					return writtenToChannel;
+				} else {
+					int totalWritten = applicationBuffer.position() - intialPosition;
+					if (SSL_LOG.isLoggable(Level.TRACE)) {
+						SSL_LOG.log(Level.TRACE, "write: total written: {0} amount available in network outbound: {1}", totalWritten, 
+								applicationBuffer.remaining());
+					}
+					return totalWritten;
+				}
+			}
+	
+			/**
+			 * <p>
+			 * Reads a sequence of bytes from this channel into a subsequence of the given
+			 * buffers.
+			 * </p>
+			 *
+			 * <p>
+			 * An invocation of this method attempts to read up to r bytes from this
+			 * channel, where r is the total number of bytes remaining the specified
+			 * subsequence of the given buffer array, that is,
+			 * 
+			 * <pre>
+			 * {@code
+			 * dsts[offset].remaining()
+			 *   + dsts[offset+1].remaining()
+			 *   + ... + dsts[offset+length-1].remaining()
+			 * }
+			 * </pre>
+			 * <p>
+			 * at the moment that this method is invoked.
+			 * </p>
+			 *
+			 * <p>
+			 * Suppose that a byte sequence of length n is read, where 0 <= n <= r. Up to
+			 * the first dsts[offset].remaining() bytes of this sequence are transferred
+			 * into buffer dsts[offset], up to the next dsts[offset+1].remaining() bytes are
+			 * transferred into buffer dsts[offset+1], and so forth, until the entire byte
+			 * sequence is transferred into the given buffers. As many bytes as possible are
+			 * transferred into each buffer, hence the final position of each updated
+			 * buffer, except the last updated buffer, is guaranteed to be equal to that
+			 * buffer's limit.
+			 * </p>
+			 *
+			 * <p>
+			 * This method may be invoked at any time. If another thread has already
+			 * initiated a read operation upon this channel, however, then an invocation of
+			 * this method will block until the first operation is complete.
+			 * </p>
+			 *
+			 * @param applicationByteBuffers The buffers into which bytes are to be
+			 *                               transferred
+			 * @param offset                 The offset within the buffer array of the first
+			 *                               buffer into which bytes are to be transferred;
+			 *                               must be non-negative and no larger than
+			 *                               dsts.length
+			 * @param length                 The maximum number of buffers to be accessed;
+			 *                               must be non-negative and no larger than
+			 *                               <code>dsts.length - offset</code>
+			 * @return The number of bytes read, possibly zero, or -1 if the channel has
+			 *         reached end-of-stream
+			 * @throws java.nio.channels.NotYetConnectedException   If this channel is not
+			 *                                                      yet connected
+			 * @throws java.nio.channels.ClosedChannelException     If this channel is
+			 *                                                      closed
+			 * @throws java.nio.channels.AsynchronousCloseException If another thread closes
+			 *                                                      this channel while the
+			 *                                                      read operation is in
+			 *                                                      progress
+			 * @throws java.nio.channels.ClosedByInterruptException If another thread
+			 *                                                      interrupts the current
+			 *                                                      thread while the read
+			 *                                                      operation is in
+			 *                                                      progress, thereby
+			 *                                                      closing the channel and
+			 *                                                      setting the current
+			 *                                                      thread's interrupt
+			 *                                                      status
+			 * @throws IOException                                  If some other I/O error
+			 *                                                      occurs
+			 * @throws IllegalArgumentException                     If one of the given
+			 *                                                      applicationBuffers
+			 *                                                      capacity
+			 *                                                      ({@link ByteBuffer#capacity()}
+			 *                                                      is less then the
+			 *                                                      application buffer size
+			 *                                                      of the {@link SSLEngine}
+			 *                                                      session application
+			 *                                                      buffer size
+			 *                                                      ({@link SSLSession#getApplicationBufferSize()}
+			 *                                                      this channel was
+			 *                                                      constructed was.
+			 */
+			@Override
+			public long read(ByteBuffer[] applicationByteBuffers, int offset, int length)
+					throws IOException, IllegalArgumentException {
+				long totalRead = 0;
+				for (int i = offset; i < length; i++) {
+					ByteBuffer applicationByteBuffer = applicationByteBuffers[i];
+					if (applicationByteBuffer.hasRemaining()) {
+						int read = read(applicationByteBuffer);
+						if (read > 0) {
+							totalRead += read;
+							if (applicationByteBuffer.hasRemaining()) {
+								break;
+							}
+						} else {
+							if ((read < 0) && (totalRead == 0)) {
+								totalRead = -1;
+							}
+							break;
+						}
+					}
+				}
+				return totalRead;
+			}
+	
+			/**
+			 * <p>
+			 * Writes a sequence of bytes to this channel from a subsequence of the given
+			 * buffers.
+			 * </p>
+			 *
+			 * <p>
+			 * An attempt is made to write up to r bytes to this channel, where r is the
+			 * total number of bytes remaining in the specified subsequence of the given
+			 * buffer array, that is,
+			 * </p>
+			 * 
+			 * <pre>
+			 * {@code
+			 * srcs[offset].remaining()
+			 *   + srcs[offset+1].remaining()
+			 *   + ... + srcs[offset+length-1].remaining()
+			 * }
+			 * </pre>
+			 * <p>
+			 * at the moment that this method is invoked.
+			 * </p>
+			 *
+			 * <p>
+			 * Suppose that a byte sequence of length n is written, where 0 <= n <= r. Up to
+			 * the first srcs[offset].remaining() bytes of this sequence are written from
+			 * buffer srcs[offset], up to the next srcs[offset+1].remaining() bytes are
+			 * written from buffer srcs[offset+1], and so forth, until the entire byte
+			 * sequence is written. As many bytes as possible are written from each buffer,
+			 * hence the final position of each updated buffer, except the last updated
+			 * buffer, is guaranteed to be equal to that buffer's limit.
+			 * </p>
+			 *
+			 * <p>
+			 * Unless otherwise specified, a write operation will return only after writing
+			 * all of the r requested bytes. Some types of channels, depending upon their
+			 * state, may write only some of the bytes or possibly none at all. A socket
+			 * channel in non-blocking mode, for example, cannot write any more bytes than
+			 * are free in the socket's output buffer.
+			 * </p>
+			 *
+			 * <p>
+			 * This method may be invoked at any time. If another thread has already
+			 * initiated a write operation upon this channel, however, then an invocation of
+			 * this method will block until the first operation is complete.
+			 * </p>
+			 *
+			 * @param applicationByteBuffers The buffers from which bytes are to be
+			 *                               retrieved
+			 * @param offset                 offset - The offset within the buffer array of
+			 *                               the first buffer from which bytes are to be
+			 *                               retrieved; must be non-negative and no larger
+			 *                               than <code>srcs.length</code>
+			 * @param length                 The maximum number of buffers to be accessed;
+			 *                               must be non-negative and no larger than
+			 *                               <code>srcs.length - offset</code>
+			 * @return The number of bytes written, possibly zero
+			 * @throws java.nio.channels.NotYetConnectedException   If this channel is not
+			 *                                                      yet connected
+			 * @throws java.nio.channels.ClosedChannelException     If this channel is
+			 *                                                      closed
+			 * @throws java.nio.channels.AsynchronousCloseException If another thread closes
+			 *                                                      this channel while the
+			 *                                                      read operation is in
+			 *                                                      progress
+			 * @throws java.nio.channels.ClosedByInterruptException If another thread
+			 *                                                      interrupts the current
+			 *                                                      thread while the read
+			 *                                                      operation is in
+			 *                                                      progress, thereby
+			 *                                                      closing the channel and
+			 *                                                      setting the current
+			 *                                                      thread's interrupt
+			 *                                                      status
+			 * @throws IOException                                  If some other I/O error
+			 *                                                      occurs
+			 * @throws IllegalArgumentException                     If one of the given
+			 *                                                      applicationBuffers
+			 *                                                      capacity
+			 *                                                      ({@link ByteBuffer#capacity()}
+			 *                                                      is less then the
+			 *                                                      application buffer size
+			 *                                                      of the {@link SSLEngine}
+			 *                                                      session application
+			 *                                                      buffer size
+			 *                                                      ({@link SSLSession#getApplicationBufferSize()}
+			 *                                                      this channel was
+			 *                                                      constructed was.
+			 */
+			@Override
+			public long write(ByteBuffer[] applicationByteBuffers, int offset, int length)
+					throws IOException, IllegalArgumentException {
+				long totalWritten = 0;
+				for (int i = offset; i < length; i++) {
+					ByteBuffer byteBuffer = applicationByteBuffers[i];
+					if (byteBuffer.hasRemaining()) {
+						int written = write(byteBuffer);
+						if (written > 0) {
+							totalWritten += written;
+							if (byteBuffer.hasRemaining()) {
+								break;
+							}
+						} else {
+							if ((written < 0) && (totalWritten == 0)) {
+								totalWritten = -1;
+							}
+							break;
+						}
+					}
+				}
+				return totalWritten;
+			}
+	
+			@Override
+			public Socket socket() {
+				return socketChannel.socket();
+			}
+	
+			@Override
+			public boolean isConnected() {
+				return socketChannel.isConnected();
+			}
+	
+			@Override
+			public boolean isConnectionPending() {
+				return socketChannel.isConnectionPending();
+			}
+	
+			@Override
+			public boolean connect(SocketAddress socketAddress) throws IOException {
+				return socketChannel.connect(socketAddress);
+			}
+	
+			@Override
+			public boolean finishConnect() throws IOException {
+				return socketChannel.finishConnect();
+			}
+	
+			@Override
+			public SocketChannel bind(SocketAddress local) throws IOException {
+				socketChannel.bind(local);
+				return this;
+			}
+	
+			@Override
+			public SocketAddress getLocalAddress() throws IOException {
+				return socketChannel.getLocalAddress();
+			}
+	
+			@Override
+			public <T> SocketChannel setOption(SocketOption<T> name, T value) throws IOException {
+				return socketChannel.setOption(name, value);
+			}
+	
+			@Override
+			public <T> T getOption(SocketOption<T> name) throws IOException {
+				return socketChannel.getOption(name);
+			}
+	
+			@Override
+			public Set<SocketOption<?>> supportedOptions() {
+				return socketChannel.supportedOptions();
+			}
+	
+			@Override
+			public SocketChannel shutdownInput() throws IOException {
+				return socketChannel.shutdownInput();
+			}
+	
+			@Override
+			public SocketChannel shutdownOutput() throws IOException {
+				return socketChannel.shutdownOutput();
+			}
+	
+			@Override
+			public SocketAddress getRemoteAddress() throws IOException {
+				return socketChannel.getRemoteAddress();
+			}
+	
+			@Override
+			protected void implConfigureBlocking(boolean b) throws IOException {
+				socketChannel.configureBlocking(b);
+			}
+	
+			@Override
+			protected void implCloseSelectableChannel() throws IOException {
+				try {
+					sslEngineBuffer.flushNetworkOutbound();
+				} catch (Exception e) {
+				}
+	
+				socketChannel.close();
+				sslEngineBuffer.close();
+			}
+		}
+		/**
+		 * <p>
+		 * A wrapper around a real {@link ServerSocketChannel} that produces
+		 * {@link SSLSocketChannel} on {@link #accept()}. The real ServerSocketChannel
+		 * must be bound externally (to this class) before calling the accept method.
+		 * </p>
+		 *
+		 * @see SSLSocketChannel
+		 */
+		private final static class SSLServerSocketChannel extends ServerSocketChannel {
+			/**
+			 * Should the SSLSocketChannels created from the accept method be put in
+			 * blocking mode. Default is {@code false}.
+			 */
+			public boolean blockingMode;
+	
+			/**
+			 * Should the SS server ask for client certificate authentication? Default is
+			 * {@code false}.
+			 */
+			public boolean wantClientAuthentication;
+	
+			/**
+			 * Should the SSL server require client certificate authentication? Default is
+			 * {@code false}.
+			 */
+			public boolean needClientAuthentication;
+	
+			/**
+			 * The list of SSL protocols (TLSv1, TLSv1.1, etc.) supported for the SSL
+			 * exchange. Default is the JVM default.
+			 */
+			public List<String> includedProtocols;
+	
+			/**
+			 * A list of SSL protocols (SSLv2, SSLv3, etc.) to explicitly exclude for the
+			 * SSL exchange. Default is none.
+			 */
+			public List<String> excludedProtocols;
+	
+			/**
+			 * The list of ciphers allowed for the SSL exchange. Default is the JVM default.
+			 */
+			public List<String> includedCipherSuites;
+	
+			/**
+			 * A list of ciphers to explicitly exclude for the SSL exchange. Default is
+			 * none.
+			 */
+			public List<String> excludedCipherSuites;
+	
+			private final ServerSocketChannel serverSocketChannel;
+	
+			private final SSLContext sslContext;
+	
+			private final Runner threadPool;
+	
+			/**
+			 *
+			 * @param serverSocketChannel The real server socket channel that accepts
+			 *                            network requests.
+			 * @param sslContext          The SSL context used to create the
+			 *                            {@link SSLEngine} for incoming requests.
+			 * @param threadPool          The thread pool passed to SSLSocketChannel used to
+			 *                            execute long running, blocking SSL operations such
+			 *                            as certificate validation with a CA (<a href=
+			 *                            "http://docs.oracle.com/javase/7/docs/api/javax/net/ssl/SSLEngineResult.HandshakeStatus.html#NEED_TASK">NEED_TASK</a>)
+			 * @param logger              The logger for debug and error messages. A null
+			 *                            logger will result in no log operations.
+			 */
+			public SSLServerSocketChannel(ServerSocketChannel serverSocketChannel, SSLContext sslContext,
+					Runner threadPool) {
+				super(serverSocketChannel.provider());
+				this.serverSocketChannel = serverSocketChannel;
+				this.sslContext = sslContext;
+				this.threadPool = threadPool;
+			}
+	
+			/**
+			 * <p>
+			 * Accepts a connection made to this channel's socket.
+			 * </p>
+			 *
+			 * <p>
+			 * If this channel is in non-blocking mode then this method will immediately
+			 * return null if there are no pending connections. Otherwise it will block
+			 * indefinitely until a new connection is available or an I/O error occurs.
+			 * </p>
+			 *
+			 * <p>
+			 * The socket channel returned by this method, if any, will be in blocking mode
+			 * regardless of the blocking mode of this channel.
+			 * </p>
+			 *
+			 * <p>
+			 * This method performs exactly the same security checks as the accept method of
+			 * the ServerSocket class. That is, if a security manager has been installed
+			 * then for each new connection this method verifies that the address and port
+			 * number of the connection's remote endpoint are permitted by the security
+			 * manager's checkAccept method.
+			 * </p>
+			 *
+			 * @return An SSLSocketChannel or {@code null} if this channel is in
+			 *         non-blocking mode and no connection is available to be accepted.
+			 * @throws java.nio.channels.NotYetConnectedException   If this channel is not
+			 *                                                      yet connected
+			 * @throws java.nio.channels.ClosedChannelException     If this channel is
+			 *                                                      closed
+			 * @throws java.nio.channels.AsynchronousCloseException If another thread closes
+			 *                                                      this channel while the
+			 *                                                      read operation is in
+			 *                                                      progress
+			 * @throws java.nio.channels.ClosedByInterruptException If another thread
+			 *                                                      interrupts the current
+			 *                                                      thread while the read
+			 *                                                      operation is in
+			 *                                                      progress, thereby
+			 *                                                      closing the channel and
+			 *                                                      setting the current
+			 *                                                      thread's interrupt
+			 *                                                      status
+			 * @throws IOException                                  If some other I/O error
+			 *                                                      occurs
+			 */
+			@Override
+			public SocketChannel accept() throws IOException {
+				SocketChannel channel = serverSocketChannel.accept();
+				if (channel == null) {
+					return null;
+				} else {
+					channel.configureBlocking(blockingMode);
+	
+					var sslEngine = sslContext.createSSLEngine();
+					sslEngine.setUseClientMode(false);
+					sslEngine.setWantClientAuth(wantClientAuthentication);
+					sslEngine.setNeedClientAuth(needClientAuthentication);
+					sslEngine.setEnabledProtocols(
+							filterArray(sslEngine.getEnabledProtocols(), includedProtocols, excludedProtocols));
+					sslEngine.setEnabledCipherSuites(
+							filterArray(sslEngine.getEnabledCipherSuites(), includedCipherSuites, excludedCipherSuites));
+	
+					return new SSLSocketChannel(channel, sslEngine, threadPool);
+				}
+			}
+	
+			@Override
+			public ServerSocketChannel bind(SocketAddress local, int backlog) throws IOException {
+				return serverSocketChannel.bind(local, backlog);
+			}
+	
+			@Override
+			public SocketAddress getLocalAddress() throws IOException {
+				return serverSocketChannel.getLocalAddress();
+			}
+	
+			@Override
+			public <T> ServerSocketChannel setOption(SocketOption<T> name, T value) throws IOException {
+				return serverSocketChannel.setOption(name, value);
+			}
+	
+			@Override
+			public <T> T getOption(SocketOption<T> name) throws IOException {
+				return serverSocketChannel.getOption(name);
+			}
+	
+			@Override
+			public Set<SocketOption<?>> supportedOptions() {
+				return serverSocketChannel.supportedOptions();
+			}
+	
+			@Override
+			public ServerSocket socket() {
+				return serverSocketChannel.socket();
+			}
+	
+			@Override
+			protected void implCloseSelectableChannel() throws IOException {
+				serverSocketChannel.close();
+			}
+	
+			@Override
+			protected void implConfigureBlocking(boolean b) throws IOException {
+				serverSocketChannel.configureBlocking(b);
+			}
+	
+			static String[] filterArray(String[] items, List<String> includedItems, List<String> excludedItems) {
+				List<String> filteredItems = items == null ? new ArrayList<String>() : Arrays.asList(items);
+				if (includedItems != null) {
+					for (int i = filteredItems.size() - 1; i >= 0; i--) {
+						if (!includedItems.contains(filteredItems.get(i))) {
+							filteredItems.remove(i);
+						}
+					}
+	
+					for (String includedProtocol : includedItems) {
+						if (!filteredItems.contains(includedProtocol)) {
+							filteredItems.add(includedProtocol);
+						}
+					}
+				}
+	
+				if (excludedItems != null) {
+					for (int i = filteredItems.size() - 1; i >= 0; i--) {
+						if (excludedItems.contains(filteredItems.get(i))) {
+							filteredItems.remove(i);
+						}
+					}
+				}
+	
+				return filteredItems.toArray(new String[filteredItems.size()]);
+			}
 		}
 	}
 
 	public enum Status {
-
+	
 		BAD_REQUEST(400, "Bad Request"), CONTINUE(100, "Continue"), FORBIDDEN(403, "Forbidden"), FOUND(302, "Found"),
 		INTERNAL_SERVER_ERROR(500, "Not Found"), MOVED_PERMANENTLY(301, "Moved Permanently"),
 		NOT_FOUND(404, "Not Found"), NOT_IMPLEMENTED(501, "Not Implemented"), OK(200, "OK"),
 		SERVICE_UNAVAILABLE(503, "Service Unavailable"), SWITCHING_PROTOCOLS(101, "Switching Protocols"),
 		UNAUTHORIZED(401, "Unauthorized");
-
+	
 		private int code;
 		private String text;
-
+	
 		Status(int code, String text) {
 			this.code = code;
 			this.text = text;
 		}
-
+	
 		public int getCode() {
 			return code;
 		}
-
+	
 		public String getText() {
 			return text;
 		}
-
+	
 	}
 
 	public interface TextPart extends Part {
@@ -1272,6 +2443,39 @@ public class UHTTPD extends Thread implements Closeable {
 
 		Optional<String> value();
 	}
+	
+	private final static class ThreadPoolRunner implements Runner {
+		private ExecutorService pool;
+		
+		ThreadPoolRunner(Optional<Integer> threads) {
+			pool = threads.isPresent() ? Executors.newFixedThreadPool(threads.get())
+					: Executors.newCachedThreadPool();
+		}
+
+		@Override
+		public void close() {
+			pool.shutdown();
+		}
+
+		@Override
+		public void run(Runnable runnable) {
+			pool.execute(runnable);
+		}
+		
+	}
+	
+	public final static class ThreadPoolRunnerBuilder {
+		private Optional<Integer> threads = Optional.empty();
+
+		public ThreadPoolRunnerBuilder withThreads(int threads) {
+			this.threads = Optional.of(threads);
+			return this;
+		}
+		
+		public Runner build() {
+			return new ThreadPoolRunner(threads);
+		}
+	}
 
 	public final static class Transaction {
 
@@ -1290,17 +2494,20 @@ public class UHTTPD extends Thread implements Closeable {
 		private final Path path;
 		private Optional<Principal> principal = Optional.empty();
 		private final Protocol protocol;
-		private Optional<Object> response = Optional.empty();
-		private Optional<Responder> responder = Optional.empty();
+		private Optional<BufferFiller> responder = Optional.empty();
 		private Optional<Long> responseLength = Optional.empty();
 		private Optional<String> responseText = Optional.empty();
-		private Optional<Selector> selector = Optional.empty();
+		private Optional<HandlerSelector> selector = Optional.empty();
 		private final String urlHost;
+		private final String uri;
+
+		private Optional<Throwable> error;
 
 		Transaction(String pathSpec, Method method, Protocol protocol, Client client) {
 			this.method = method;
 			this.protocol = protocol;
 			this.client = client;
+			this.uri = pathSpec;
 
 			var sepIdx = pathSpec.indexOf("://");
 			if (sepIdx == -1) {
@@ -1335,7 +2542,20 @@ public class UHTTPD extends Thread implements Closeable {
 			return client;
 		}
 
-		public void error(Exception ise) {
+		public Optional<String> errorTrace() {
+			return error.map(e -> {
+				var sw = new StringWriter();
+				e.printStackTrace(new PrintWriter(sw));
+				return sw.toString();
+			});
+		}
+
+		public Optional<Throwable> error() {
+			return error;
+		}
+		
+		public void error(Throwable ise) {
+			this.error= Optional.of(ise);
 			responseCode(Status.INTERNAL_SERVER_ERROR);
 			if (ise.getMessage() != null)
 				responseText(ise.getMessage());
@@ -1363,6 +2583,10 @@ public class UHTTPD extends Thread implements Closeable {
 		public Transaction cookie(Cookie cookie) {
 			outgoingCookies.put(cookie.name(), cookie);
 			return this;
+		}
+		
+		public String uri() {
+			return uri;
 		}
 
 		public Transaction cookie(String name, String value) {
@@ -1462,26 +2686,38 @@ public class UHTTPD extends Thread implements Closeable {
 			return contentSupplier.get();
 		}
 
-		public Transaction responder(Responder responder) {
+		public Transaction responder(BufferFiller responder) {
 			this.responder = Optional.of(responder);
 			return this;
 		}
 
-		public Transaction responder(String responseType, Responder responder) {
+		public Transaction responder(String responseType, BufferFiller responder) {
 			responseType(responseType);
 			this.responder = Optional.of(responder);
 			return this;
 		}
 
+		/**
+		 * Respond with a generic object. This method supports a few basic
+		 * types, with everything else being converted to a string using {@link Object#toString()}.
+		 * If the response is an {@link InputStream} or a {@link Reader}, it's contents
+		 * will be streamed. If it is a {@link ByteBuffer}, it will be transferred as is. All
+		 * other types will be converted.
+		 * <p>
+		 * If there is no {@link #responseLength(long)} set, then attempts will
+		 * be made to set it from the content. This can be done up front with a {@link ByteBuffer}
+		 * or other non-streamed type.
+		 * 
+		 * @param response
+		 * @return this for chaining.
+		 */
 		public Transaction response(Object response) {
-			this.response = Optional.of(response);
-			return this;
+			return responder(new DefaultResponder(response, this));
 		}
 
 		public Transaction response(String responseType, Object response) {
 			responseType(responseType);
-			this.response = Optional.of(response);
-			return this;
+			return response(response);
 		}
 
 		public Transaction responseCode(Status code) {
@@ -1508,11 +2744,11 @@ public class UHTTPD extends Thread implements Closeable {
 			return this;
 		}
 
-		public Selector selector() {
+		public HandlerSelector selector() {
 			return selector.orElseThrow();
 		}
 
-		public Optional<Selector> selectorOr() {
+		public Optional<HandlerSelector> selectorOr() {
 			return selector;
 		}
 
@@ -1520,7 +2756,7 @@ public class UHTTPD extends Thread implements Closeable {
 		public String toString() {
 			return "Request [path=" + path + ", parameters=" + parameters + ", incomingHeaders=" + incomingHeaders
 					+ ", outgoingHeaders=" + outgoingHeaders + ", outgoingContentLength=" + responseLength
-					+ ", outgoingContentType=" + outgoingContentType + ", response=" + response + ", code=" + code
+					+ ", outgoingContentType=" + outgoingContentType + /* ", response=" + response + */ ", code=" + code
 					+ ", responseText=" + responseText + ", principal=" + principal + ", method=" + method
 					+ ", protocol=" + protocol + ", urlHost=" + urlHost + "]";
 		}
@@ -1533,8 +2769,170 @@ public class UHTTPD extends Thread implements Closeable {
 			return this;
 
 		}
-	}
 
+		public final boolean hasResponse() {
+			return responder.isPresent();
+		}
+	}
+	
+	private final static class DefaultResponder implements BufferFiller {
+
+		private final Object response;
+		private final Charset charset;
+		private final boolean needLength;
+		private CharsetEncoder enc;
+		private final Transaction tx;
+		private CharBuffer charBuffer;
+
+		DefaultResponder(Object response, Transaction tx) {
+			this.charset = tx.client.charset;
+			var needLength = tx.responseLength.isEmpty();
+			var needType = tx.outgoingContentType.isEmpty();
+			if(response instanceof Path) {
+				var path = (Path)response;
+				try {
+					response = Files.newInputStream(path);
+					if(needLength) {
+						tx.responseLength(Files.size(path));
+						needLength = false;
+					}
+					if(needType)
+						tx.outgoingContentType = Optional.of(getMimeType(path.toUri().toURL()));
+				}
+				catch(IOException ioe) {
+					throw new UncheckedIOException("Failed to responsd with file.", ioe);
+				}
+			}
+			else if(response instanceof File) {
+				var path = (File)response;
+				try {
+					response = new FileInputStream(path);
+					if(needLength) {
+						tx.responseLength(path.length());
+						needLength = false;
+					}
+					if(needType)
+						tx.outgoingContentType = Optional.of(getMimeType(path.toURI().toURL()));
+				}
+				catch(IOException ioe) {
+					throw new UncheckedIOException("Failed to responsd with file.", ioe);
+				}
+			}
+			else if(response instanceof ByteBuffer) {
+				if(needLength) {
+					needLength = false;
+					tx.responseLength(((ByteBuffer)response).remaining());
+				}
+			}
+			else if(!(response instanceof InputStream) && !(response instanceof Reader)) {
+				response = ByteBuffer.wrap(String.valueOf(response).getBytes(charset));
+				if(needLength) {
+					needLength = false;
+					tx.responseLength = Optional.of((long)((ByteBuffer)response).remaining());
+				}				
+			}
+			
+			this.tx = tx;
+			this.response = response;
+			this.needLength = needLength;
+		}
+
+		@Override
+		public void supply(ByteBuffer buf) throws IOException {
+			if(response instanceof ByteBuffer) {
+				var respBuff = (ByteBuffer)response;
+				if(respBuff.hasRemaining()) {
+					if(respBuff.remaining() > buf.remaining()) {
+						var p = respBuff.position();
+						respBuff.position(p + buf.remaining());
+						respBuff = respBuff.slice(p, buf.remaining());
+					}
+					buf.put(respBuff);
+				}
+			}
+			else if(response instanceof Reader) {
+				if(enc == null) {
+					enc = charset.newEncoder();
+				}
+				if(charBuffer == null) {
+					charBuffer = CharBuffer.allocate(buf.remaining() * 2);
+				}
+				var encoded = enc.encode(charBuffer);
+				if(encoded.hasRemaining()) {
+					if(needLength) {
+						tx.responseLength = Optional.of(tx.responseLength.orElse(0l) + encoded.remaining());
+					}
+					buf.put(encoded);
+				}
+			}
+			else if(response instanceof InputStream) {
+				var in = (InputStream)response;
+				byte[] arr;
+				int off = 0;
+				if(buf.isDirect()) {
+					arr = new byte[buf.remaining()];
+				}
+				else {
+					arr = buf.array();
+					off = buf.arrayOffset();
+				}
+				var read = in.read(arr, off, arr.length - off);
+				if(read != -1) {
+					if(needLength) {
+						tx.responseLength = Optional.of(tx.responseLength.orElse(0l) + read);
+					}
+					if(buf.isDirect()) {
+						buf.put(arr, 0, read);
+					}
+				}
+			}
+			else
+				throw new UnsupportedOperationException();
+		}
+		
+	}
+	
+	public interface TunnelHandler extends Handler {
+		
+	}
+	
+	public final static class TunnelBuilder {
+		private Optional<BufferFiller> reader = Optional.empty();
+		private Optional<BufferFiller> writer = Optional.empty();
+		private Optional<Runnable> onClose = Optional.empty();
+		private Optional<Integer> bufferSize = Optional.empty();
+		
+		public TunnelBuilder withBufferSize(int bufferSize) {
+			this.bufferSize = Optional.of(bufferSize);
+			return this;
+		}
+		
+		public TunnelBuilder withReader(BufferFiller reader) {
+			this.reader =Optional.of(reader);
+			return this;
+		}
+		
+		public TunnelBuilder withWriter(BufferFiller writer) {
+			this.writer =Optional.of(writer);
+			return this;
+		}
+		
+		public TunnelBuilder onClose(Runnable onClose) {
+			this.onClose =Optional.of(onClose);
+			return this;
+		}
+		
+		public TunnelHandler build() {
+			return new AbstractTunnelHandler() {
+				@Override
+				com.sshtools.uhttpd.UHTTPD.AbstractTunnelHandler.TunnelWireProtocol create(String host, int port, Client client)
+						throws IOException {
+					return new TunnelWireProtocol(bufferSize, reader.orElseThrow(), writer.orElseThrow(), onClose, client);
+				}
+			};
+		}
+	}
+	
 	public interface UsernameAndPassword extends Credential {
 		char[] password();
 
@@ -1576,7 +2974,7 @@ public class UHTTPD extends Thread implements Closeable {
 		private Optional<OnWebSocketText> onText = Optional.empty();
 		private Optional<OnWebSocketHandshake> onHandshake = Optional.empty();
 		private Optional<OnWebSocketOpen> onOpen = Optional.empty();
-		private int maxTextPayloadSize = 32768;
+		private Optional<Integer> maxTextPayloadSize = Optional.empty();
 		private boolean mask = true;
 
 		public WebSocketHandler build() {
@@ -1589,7 +2987,7 @@ public class UHTTPD extends Thread implements Closeable {
 		}
 
 		public WebSocketBuilder withMaxTextPayloadSize(int maxTextPayloadSize) {
-			this.maxTextPayloadSize = maxTextPayloadSize;
+			this.maxTextPayloadSize = Optional.of(maxTextPayloadSize);
 			return this;
 		}
 
@@ -1924,6 +3322,7 @@ public class UHTTPD extends Thread implements Closeable {
 				var frame = new WebSocketFrame(OpCode.BINARY, data, finalPacket);
 				try {
 					frame.write(client.channel());
+					client.waitForWrite();
 				} catch (IOException e) {
 					throw new UncheckedIOException("Failed to send websocket text.", e);
 				}
@@ -1944,6 +3343,7 @@ public class UHTTPD extends Thread implements Closeable {
 						var frame = new WebSocketFrame(OpCode.TEXT, payload, fin);
 						try {
 							frame.write(client.channel());
+							client.waitForWrite();
 						} catch (IOException e) {
 							throw new UncheckedIOException("Failed to send websocket text.", e);
 						}
@@ -2036,7 +3436,7 @@ public class UHTTPD extends Thread implements Closeable {
 			this.onClose = builder.onClose;
 			this.onOpen = builder.onOpen;
 			this.onHandshake = builder.onHandshake;
-			this.maxTextPayloadSize = builder.maxTextPayloadSize;
+			this.maxTextPayloadSize = builder.maxTextPayloadSize.orElse(DEFAULT_BUFFER_SIZE);
 		}
 
 		@Override
@@ -2109,24 +3509,131 @@ public class UHTTPD extends Thread implements Closeable {
 
 		void transact() throws IOException;
 	}
+	
+	private static final class HTTPContent implements Content {
+		private final Transaction tx;
+		private boolean asNamedParts;
+		private boolean asParts;
+		private boolean asStream;
+		private List<Part> parts;
 
+		private HTTPContent(Transaction tx) {
+			this.tx = tx;
+		}
+
+		@Override
+		public Iterable<Part> asParts() {
+			if (asStream || asNamedParts) {
+				throw new IllegalStateException("Already have content as stream or named parts.");
+			}
+			asParts = true;
+			return asPartsImpl();
+		}
+
+		@Override
+		public InputStream asStream() {
+			if (asParts || asNamedParts)
+				throw new IllegalStateException("Already have content as named or iterated parts.");
+			asStream = true;
+			return Channels.newInputStream(tx.client.channel());
+		}
+
+		@Override
+		public Optional<String> contentType() {
+			return tx.headerOr(HDR_CONTENT_TYPE);
+		}
+
+		@SuppressWarnings("unchecked")
+		@Override
+		public <P extends Part> Optional<P> part(String name, Class<P> clazz) {
+			if (asStream || asParts) {
+				throw new IllegalStateException(
+						"Already have content as stream or iterated parts.");
+			}
+			for (var part : asPartsImpl()) {
+				if (part.name().equals(name))
+					return (Optional<P>) Optional.of(part);
+			}
+
+			return Optional.empty();
+		}
+
+		@Override
+		public Optional<Long> size() {
+			return tx.headersOr(HDR_CONTENT_LENGTH).map(o -> o.asLong());
+		}
+
+		Iterable<Part> asPartsImpl() {
+			if (parts == null) {
+				parts = new ArrayList<>();
+				return new Iterable<>() {
+					@Override
+					public Iterator<Part> iterator() {
+						var it = iteratorImpl(new BufferedReader(Channels.newReader(tx.client.channel(),tx.client.charset)));
+						return new Iterator<>() {
+
+							@Override
+							public boolean hasNext() {
+								return it.hasNext();
+							}
+
+							@Override
+							public Part next() {
+								var next = it.next();
+								parts.add(next);
+								return next;
+							}
+
+						};
+					}
+
+					private Iterator<Part> iteratorImpl(BufferedReader input) {
+						var content = Named.parseSeparatedStrings(contentType().get());
+						var type = content.values().iterator().next();
+						switch (type.name()) {
+						case "multipart/form-data":
+							return new MultipartFormDataPartIterator(input,
+									content.containsKey("boundary")
+											? content.get("boundary").asString()
+											: null,
+									size().orElse(Long.MAX_VALUE));
+						case "application/x-www-form-urlencoded":
+							return new URLEncodedFormDataPartIterator(input,
+									size().orElse(Long.MAX_VALUE));
+						default:
+							throw new UnsupportedOperationException("Unknown content encoding.");
+						}
+					}
+				};
+			}
+			return parts;
+		}
+	}
+	
 	static final class HTTP11WireProtocol implements WireProtocol {
+		
 
 		final Client client;
 		final BufferedReader reader;
 		final PrintWriter writer;
+		GzipChannelWriter gzipWriter;
 
 		HTTP11WireProtocol(Client client) {
 			this.client = client;
-			reader = new BufferedReader(Channels.newReader(client.channel(), client.charset));
-			writer = new PrintWriter(Channels.newWriter(client.channel(), client.charset));
+			reader = new BufferedReader(Channels.newReader(client.channel(), client.charset.newDecoder(), (int)client.server.recvBufferSize));
+			writer = new PrintWriter(Channels.newWriter(client.channel(), client.charset.newEncoder(), (int)client.server.sendBufferSize));
 		}
 
 		@Override
 		public void transact() throws IOException {
+			if (LOG.isLoggable(Level.DEBUG))
+				LOG.log(Level.DEBUG, "Awaiting HTTP start");
 			var line = reader.readLine();
 			if (line == null)
 				throw new EOFException();
+			if (LOG.isLoggable(Level.DEBUG))
+				LOG.log(Level.DEBUG, "HTTP IN: {0}", line);
+			
 			var tkns = new StringTokenizer(line);
 			var firstToken = tkns.nextToken();
 			var method = Method.GET;
@@ -2137,7 +3644,7 @@ public class UHTTPD extends Thread implements Closeable {
 				uri = tkns.nextToken();
 				proto = Protocol.valueOf(tkns.nextToken().replace('/', '_').replace('.', '_'));
 
-				if (Protocol.HTTP_1_1.compareTo(proto) > 0) {
+				if (Protocol.HTTP_1_1.compareTo(proto) < 0) {
 					throw new UnsupportedOperationException(
 							String.format("Only currently supports up to %s", Protocol.HTTP_1_1));
 				}
@@ -2145,164 +3652,100 @@ public class UHTTPD extends Thread implements Closeable {
 				uri = firstToken;
 			}
 			var req = new Transaction(uri, method, proto, client);
-			if (LOG.isLoggable(Level.DEBUG))
-				LOG.log(Level.DEBUG, "HTTP IN: {0}", line);
-			req.contentSupplier = new Supplier<>() {
+			var close = true;
+			try {
+				req.contentSupplier = new Supplier<>() {
 
-				private boolean asNamedParts;
-				private boolean asParts;
-				private boolean asStream;
-				private Optional<Content> content;
-				private List<Part> parts;
+					private Optional<Content> content;
 
-				@Override
-				public Optional<Content> get() {
-					if (content == null) {
-						content = Optional.ofNullable(new Content() {
-							@Override
-							public Iterable<Part> asParts() {
-								if (asStream || asNamedParts) {
-									throw new IllegalStateException("Already have content as stream or named parts.");
-								}
-								asParts = true;
-								return asPartsImpl();
-							}
-
-							@Override
-							public InputStream asStream() {
-								if (asParts || asNamedParts)
-									throw new IllegalStateException("Already have content as named or iterated parts.");
-								asStream = true;
-								return Channels.newInputStream(client.channel());
-							}
-
-							@Override
-							public Optional<String> contentType() {
-								return req.headerOr(HDR_CONTENT_TYPE);
-							}
-
-							@SuppressWarnings("unchecked")
-							@Override
-							public <P extends Part> Optional<P> part(String name, Class<P> clazz) {
-								if (asStream || asParts) {
-									throw new IllegalStateException(
-											"Already have content as stream or iterated parts.");
-								}
-								for (var part : asPartsImpl()) {
-									if (part.name().equals(name))
-										return (Optional<P>) Optional.of(part);
-								}
-
-								return Optional.empty();
-							}
-
-							@Override
-							public Optional<Long> size() {
-								return req.headersOr(HDR_CONTENT_LENGTH).map(o -> o.asLong());
-							}
-
-							Iterable<Part> asPartsImpl() {
-								if (parts == null) {
-									parts = new ArrayList<>();
-									return new Iterable<>() {
-										@Override
-										public Iterator<Part> iterator() {
-											var it = iteratorImpl(reader);
-											return new Iterator<>() {
-
-												@Override
-												public boolean hasNext() {
-													return it.hasNext();
-												}
-
-												@Override
-												public Part next() {
-													var next = it.next();
-													parts.add(next);
-													return next;
-												}
-
-											};
-										}
-
-										private Iterator<Part> iteratorImpl(BufferedReader input) {
-											var content = Named.parseSeparatedStrings(contentType().get());
-											var type = content.values().iterator().next();
-											switch (type.name()) {
-											case "multipart/form-data":
-												return new MultipartFormDataPartIterator(input,
-														content.containsKey("boundary")
-																? content.get("boundary").asString()
-																: null,
-														size().orElse(Long.MAX_VALUE));
-											case "application/x-www-form-urlencoded":
-												return new URLEncodedFormDataPartIterator(input,
-														size().orElse(Long.MAX_VALUE));
-											default:
-												throw new UnsupportedOperationException("Unknown content encoding.");
-											}
-										}
-									};
-								}
-								return parts;
-							}
-						});
+					@Override
+					public Optional<Content> get() {
+						if (content == null) {
+							content = Optional.ofNullable(new HTTPContent(req));
+						}
+						return content;
 					}
-					return content;
+
+				};
+	
+				/* Read headers up to content */
+				while ((line = reader.readLine()) != null && !line.equals("")) {
+					if (LOG.isLoggable(Level.TRACE))
+						LOG.log(Level.TRACE, "HTTP IN: {0}", line);
+					var nvp = Named.parseHeader(line);
+					req.incomingHeaders.put(nvp.name, nvp);
+				}
+	
+				close = !client.keepAlive || Protocol.HTTP_1_1.compareTo(proto) > 0
+						|| req.headersOr(HDR_CONNECTION).orElse(Named.EMPTY).expand(",").containsIgnoreCase("close");
+	
+				if (proto.compareTo(Protocol.HTTP_1_0) > 0) {
+					req.headerOr(HDR_HOST).orElseThrow();
+				}
+				
+				req.headersOr(HDR_COOKIE).ifPresent(c -> {
+					for(var val : c.values()) {
+						var spec = Named.parseSeparatedStrings(val);
+						for(var cookie : spec.values()) {
+							req.incomingCookies.put(cookie.name(), cookie.asString());
+						}
+					}
+				});
+	
+				for (var c : client.contentFactories.entrySet()) {
+					if (c.getKey().matches(req)) {
+						req.selector = Optional.of(c.getKey());
+						try {
+							c.getValue().get(req);
+							if(!req.responsed() && !req.hasResponse())
+								req.responseCode(Status.OK); 
+						} catch (FileNotFoundException fnfe) {
+							if(LOG.isLoggable(Level.DEBUG))
+								LOG.log(Level.DEBUG, "File not found. {0}", fnfe.getMessage());
+							req.notFound();
+						} catch (Exception ise) {
+							LOG.log(Level.ERROR, "Request handling failed.", ise);
+							req.error(ise);
+						}
+	
+						if (req.responsed() || req.hasResponse())
+							break;
+					}
 				}
 
-			};
-
-			/* Read headers up to content */
-			while ((line = reader.readLine()) != null && !line.equals("")) {
-				if (LOG.isLoggable(Level.TRACE))
-					LOG.log(Level.TRACE, "HTTP IN: {0}", line);
-				var nvp = Named.parseHeader(line);
-				req.incomingHeaders.put(nvp.name, nvp);
+				if (req.code.isEmpty() && !req.hasResponse()) {
+					req.notFound();
+				}
+				
 			}
-
-			var close = !client.keepAlive || Protocol.HTTP_1_1.compareTo(proto) < 0
-					|| req.headersOr(HDR_CONNECTION).orElse(Named.EMPTY).expand(",").containsIgnoreCase("close");
-
-			if (proto.compareTo(Protocol.HTTP_1_0) > 0) {
-				req.headerOr(HDR_HOST).orElseThrow();
+			catch(Exception e) {
+				LOG.log(Level.ERROR, "Failed HTTP transaction.", e);
+				req.error(e);
 			}
 			
-			req.headersOr(HDR_COOKIE).ifPresent(c -> {
-				for(var val : c.values()) {
-					var spec = Named.parseSeparatedStrings(val);
-					for(var cookie : spec.values()) {
-						req.incomingCookies.put(cookie.name(), cookie.asString());
-					}
-				}
-			});
 
-			for (var c : client.contentFactories.entrySet()) {
-				if (c.getKey().matches(req)) {
-					req.selector = Optional.of(c.getKey());
+			while(true) {
+				var statusHandler = client.server.statusHandlers.get(req.code.orElse(Status.OK));
+				if(statusHandler == null) {
+					break;
+				}
+				else {
 					try {
-						c.getValue().get(req);
-					} catch (FileNotFoundException fnfe) {
-						req.notFound();
-					} catch (Exception ise) {
-						LOG.log(Level.ERROR, "Request handling failed.", ise);
-						req.error(ise);
-					}
-
-					if (req.responsed()) {
-						respond(req, close);
-						return;
-					} else if (req.response.isPresent())
+						statusHandler.get(req);
 						break;
+					} catch (Exception e) {
+						LOG.log(Level.ERROR, "Status handler failed.", e);
+						req.error(e);
+					}
 				}
 			}
+			
+			respond(req);
+			if(close)
+				throw new EOFException();
 
-			if (!req.code.isEmpty() && !req.response.isPresent() && !req.responder.isPresent()) {
-				req.notFound();
-			}
-
-			respond(req, close);
-
+			if (LOG.isLoggable(Level.DEBUG))
+				LOG.log(Level.DEBUG, "Exited transaction normally, setting socket timeout to {0}s", client.keepAliveTimeoutSecs);
 			client.socket.socket().setSoTimeout(client.keepAliveTimeoutSecs * 1000);
 		}
 
@@ -2320,18 +3763,23 @@ public class UHTTPD extends Thread implements Closeable {
 			if (LOG.isLoggable(Level.TRACE))
 				LOG.log(Level.TRACE, "HTTP OUT: {0}", text);
 			writer.append(text.toString());
+			writer.flush();
 		}
 
 		private void println(Object text) throws IOException {
-			print(text);
-			newline();
+
+			if (LOG.isLoggable(Level.TRACE))
+				LOG.log(Level.TRACE, "HTTP OUT: {0} <newline>", text);
+			writer.append(text.toString());
+			writer.append("\r\n");
+			writer.flush();
 		}
 
-		private void respond(Transaction tx, boolean closed) throws IOException {
+		private void respond(Transaction tx) throws IOException {
 
 			var status = tx.code.orElse(Status.OK);
+			
 			var close = false;
-
 			if (status.getCode() >= 300)
 				close = true;
 
@@ -2347,30 +3795,41 @@ public class UHTTPD extends Thread implements Closeable {
 						tx.responseText.orElse(status.getText()));
 
 			var responseLength = tx.responseLength;
-			byte[] responseData = null;
-
-			/* Do our best to get some kind of content length so keep alive works */
-			if (!tx.responder.isPresent() && tx.response.isPresent()) {
-				var resp = tx.response.get();
-				if (resp instanceof ByteBuffer) {
-					responseLength = Optional.of((long) ((ByteBuffer) resp).remaining());
-				} else if (resp instanceof ByteBuffer) {
-					responseLength = Optional.of((long) ((ByteBuffer)resp).remaining());
-				} else if (resp instanceof byte[]) {
-					responseData = (byte[]) resp;
-					responseLength = Optional.of((long) ((byte[])responseData).length);
-				} else if (!(resp instanceof InputStream) && !(resp instanceof Reader)) {
-					responseData = String.valueOf(resp).getBytes();
-					responseLength = Optional.of((long) ((byte[])responseData).length);
+			
+			var responseBigEnoughToCompress = (responseLength.isEmpty() || (responseLength.get() >= client.server.minGzipSize) ) ;
+			var gzip = responseBigEnoughToCompress && client.server.gzip && tx.hasResponse() && tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) &&
+					tx.outgoingHeaders.get(HDR_CONTENT_ENCODING).containsIgnoreCase("gzip");
+			var chunk = false;
+			var lengthPresent = responseLength.isPresent();
+			
+			if(responseBigEnoughToCompress && client.server.gzip && !tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) && tx.hasResponse()) {
+				var ae = tx.headersOr(HDR_ACCEPT_ENCODING); 
+				if(ae.isPresent() && ae.get().expand(",").containsIgnoreCase("gzip")) {
+					print(HDR_CONTENT_ENCODING);
+					println(": gzip");
+					gzip = true;
+					lengthPresent = false;
 				}
-			}
-
-			if (responseLength.isPresent()) {
+			} 
+			
+			if (lengthPresent) {
 				print(HDR_CONTENT_LENGTH);
 				print(": ");
 				print(responseLength.get());
 				newline();
-			} /*
+			}
+			else {
+				// TEMP to force raw
+				if(tx.protocol.compareTo(Protocol.HTTP_1_0) > 0 && tx.protocol.compareTo(Protocol.HTTP_2) < 0) {
+					print(HDR_TRANSFER_ENCODING);
+					println(": chunked");
+					chunk = true;
+				}
+				else
+					close = true;
+			}
+			
+			/*
 				 * else { close = true; }
 				 */
 
@@ -2410,40 +3869,165 @@ public class UHTTPD extends Thread implements Closeable {
 				print(HDR_CACHE_CONTROL);
 				println(": no-cache");
 			}
+			
 			newline();
 			flush();
+			if(gzip) {
+				if(LOG.isLoggable(Level.DEBUG))
+				LOG.log(Level.DEBUG, "Activating GZip");
+				if(gzipWriter == null)
+					gzipWriter =new GzipChannelWriter();
+				else
+					gzipWriter.reset();
+			}
+			
 			if (tx.responder.isPresent()) {
-				var buffer = ByteBuffer.allocateDirect(32768); // TODO configurable
+				if(gzip)
+					write(chunk, gzipWriter.writeGzipHeader());
+				var buffer = ByteBuffer.allocateDirect(client.server.sendBufferSize); // TODO configurable
 				do {
 					buffer.clear();
 					tx.responder.get().supply(buffer);
 					if(buffer.position() > 0) {
 						buffer.flip();
-						client.channel().write(buffer);
+						write(chunk, gzip ? gzipWriter.write(buffer) : buffer);
 					}
 				} while(buffer.position() > 0);
+				
+				// TODO The only way i can make this work is NOT having a trailer!?!				
+				//      I had believed that Deflator does not output actual gzip, which
+				//		needs both the header and the trailer
+				// if(gzip)
+				//    write(chunk, gzipWriter.writeGzipTrailer());
+				
+				if(chunk) {
+					println("0"); // terminating chunk
+					newline(); // end of chunking
+				}
 			}
-			else if (tx.response.isPresent()) {
-				var resp = tx.response.get();
-				if (resp instanceof InputStream) {
-					try (var in = (InputStream) resp) {
-						in.transferTo(Channels.newOutputStream(client.channel()));
-					}
-				} else if (resp instanceof Reader) {
-					try (var in = (Reader) resp) {
-						in.transferTo(writer);
-					}
-				}  else if(resp instanceof ByteBuffer) {
-					client.channel().write((ByteBuffer)resp);
-				}
-				else {
-					client.channel().write(ByteBuffer.wrap(responseData));
-				}
+			else if(chunk) {
+				println("0"); // terminating chunk
+				newline(); // end of chunking
 			}
 			flush();
 			if (close)
 				throw new EOFException();
 		}
+		
+		void write(boolean chunk, ByteBuffer data) throws IOException {
+			if(chunk) {
+				if(LOG.isLoggable(Level.DEBUG))
+					LOG.log(Level.DEBUG, "Writing chunk of {0} bytes.", data.limit());
+				println(Integer.toHexString(data.limit()));
+			}
+			else
+				if(LOG.isLoggable(Level.DEBUG))
+					LOG.log(Level.DEBUG, "Writing block of {0} bytes.", data.limit());
+			client.channel().write(data);
+			client.waitForWrite();
+			if(chunk) {
+				newline();
+			}
+		}
+
+	}
+	
+	private final static class GzipChannelWriter {
+	    
+		static final int GZIP_MAGIC = 0x8b1f;
+	    static final byte OS_UNKNOWN = (byte) 255;
+		
+		final Deflater def;
+	    final CRC32 crc = new CRC32();
+//	    long in;
+
+		GzipChannelWriter() {
+			def = new Deflater(Deflater.DEFAULT_COMPRESSION, true);
+		}
+		
+		void reset() {
+			crc.reset();
+			def.reset();
+		}
+		
+		ByteBuffer write(ByteBuffer data) throws IOException {
+//			in += data.remaining();
+			crc.update(data);
+			data.flip();
+			return deflateBuffer(data);
+		}
+		
+//	    private ByteBuffer writeGzipTrailer() throws IOException {
+//	    	def.end();
+//	    	var totalIn = def.getTotalIn();
+//	    	var b=  ByteBuffer.allocate(8);
+//	    	b.order(ByteOrder.LITTLE_ENDIAN);
+//			b.putInt(totalIn);
+//	    	b.putInt((int)in);
+//	    	b.flip();
+//	    	return b;
+//	    }
+	    
+	    private ByteBuffer writeGzipHeader() throws IOException {
+			return ByteBuffer.wrap(new byte[] { (byte) GZIP_MAGIC, (byte) (GZIP_MAGIC >> 8), Deflater.DEFLATED,
+					0, 0, 0, 0, 0, 0, OS_UNKNOWN });
+	    }
+
+		private ByteBuffer deflateBuffer(ByteBuffer data) {
+			var outSize = data.remaining() + 1024;
+			var out = ByteBuffer.allocateDirect(outSize);
+	        if (!def.finished()) {
+				def.setInput(data);
+	            while (!def.needsInput()) {
+	                def.deflate(out, Deflater.SYNC_FLUSH);
+	            }
+	        }
+			out.flip();
+			return out;
+		}
+	}
+
+	private final static class URLResource implements Handler {
+
+		private URL url;
+
+		private URLResource(URL url) {
+			this.url = url;
+		}
+
+		@Override
+		public void get(Transaction req) throws Exception {
+			LOG.log(Level.DEBUG, "Resource @{0}", url);
+			var conx = url.openConnection();
+			req.responseLength(conx.getContentLengthLong());
+			req.responseType(conx.getContentType());
+			req.response(url.openStream());
+		}
+
+	}
+
+	private final static class ClasspathResource implements Handler {
+
+		private Optional<ClassLoader> loader;
+		private final String path;
+
+		private ClasspathResource(Optional<ClassLoader> loader, String path) {
+			this.loader = loader;
+			this.path = path;
+		}
+
+		@Override
+		public void get(Transaction req) throws Exception {
+			LOG.log(Level.DEBUG, "Locating resource for {0}", path);
+			var fullPath = Paths.get(path).normalize().toString();
+			var url = loader.orElse(ClasspathResources.class.getClassLoader()).getResource(fullPath);
+			if (url == null)
+				throw new FileNotFoundException(fullPath);
+			else {
+				urlResource(url).get(req);;
+			}
+		}
+
 	}
 
 	private final static class ClasspathResources implements Handler {
@@ -2452,7 +4036,7 @@ public class UHTTPD extends Thread implements Closeable {
 		private final String prefix;
 		private final Pattern regexpWithGroups;
 
-		public ClasspathResources(String regexpWithGroups, Optional<ClassLoader> loader, String prefix) {
+		private ClasspathResources(String regexpWithGroups, Optional<ClassLoader> loader, String prefix) {
 			this.loader = loader;
 			this.prefix = prefix;
 			this.regexpWithGroups = Pattern.compile(regexpWithGroups);
@@ -2462,25 +4046,30 @@ public class UHTTPD extends Thread implements Closeable {
 		public void get(Transaction req) throws Exception {
 			var matcher = regexpWithGroups.matcher(req.path().toString());
 			if (matcher.find()) {
-				var path = matcher.group(1);
-				LOG.log(Level.DEBUG, "Locating resource for {0}", path);
-				var fullPath = prefix + Paths.get(path).normalize().toString();
-				var url = loader.orElse(ClasspathResources.class.getClassLoader()).getResource(fullPath);
-				if (url == null)
-					throw new FileNotFoundException(fullPath);
-				else {
-					LOG.log(Level.DEBUG, "Resource @{0}", url);
-					var conx = url.openConnection();
-					req.responseLength(conx.getContentLengthLong());
-					req.responseType(conx.getContentType());
-					req.response(url.openStream());
-				}
+				classpathResource(loader, prefix + matcher.group(1)).get(req);
 			} else
 				throw new IllegalStateException(
 						String.format("Handling a request where the pattern '%s' does not match the path '%s'",
 								regexpWithGroups, req.path()));
 		}
 
+	}
+
+	private final static class FileResource implements Handler {
+
+		private Path file;
+
+		private FileResource(Path file) {
+			this.file = file;
+		}
+
+		@Override
+		public void get(Transaction req) throws Exception {
+			LOG.log(Level.DEBUG, "File resource {0}", file);
+			req.responseLength(Files.size(file));
+			req.responseType(getMimeType(file.toUri().toURL()));
+			req.response(Files.newInputStream(file));
+		}
 	}
 
 	private final static class FileResources implements Handler {
@@ -2501,13 +4090,11 @@ public class UHTTPD extends Thread implements Closeable {
 				while (path.startsWith("/"))
 					path = path.substring(1);
 				var fullPath = root.resolve(Paths.get(path).normalize());
-				LOG.log(Level.DEBUG, "Location resource for {0}", path);
+				LOG.log(Level.DEBUG, "Locating resource for {0}", path);
 				if (Files.exists(fullPath)) {
 					if (!Files.isDirectory(fullPath)) {
-						LOG.log(Level.DEBUG, "Location resource for {0}", fullPath);
-						req.responseLength(Files.size(fullPath));
-						req.responseType(getMimeType(fullPath.toUri().toURL()));
-						req.response(Files.newInputStream(fullPath));
+						LOG.log(Level.DEBUG, "Located resource for {0}", fullPath);
+						fileResource(fullPath).get(req);
 					}
 				} else
 					throw new FileNotFoundException(fullPath.toString());
@@ -2605,9 +4192,124 @@ public class UHTTPD extends Thread implements Closeable {
 				}
 			}
 		}
+	}
+	
+	private static abstract class AbstractTunnelHandler implements TunnelHandler {
+
+		@Override
+		public final void get(Transaction tx) throws Exception {
+			// https://en.wikipedia.org/wiki/HTTP_tunnel
+			// TODO - proxy auth
+			tx.responseCode(Status.OK);
+			var target = tx.uri().split(":");
+			if(LOG.isLoggable(Level.DEBUG))
+				LOG.log(Level.DEBUG, "Opening tunnel to {0}", tx.uri());
+			tx.client.wireProtocol = create(target[0], Integer.parseInt(target[1]), tx.client());
+		}
+		
+		abstract TunnelWireProtocol create(String host, int port, Client client) throws IOException;
+
+		class TunnelWireProtocol implements WireProtocol {
+			
+			private final ByteBuffer sndBuf;
+			private final ByteBuffer recvBuf;
+			private final Client client;
+			private final BufferFiller reader;
+			private final BufferFiller writer;
+			private final Optional<Runnable> close;
+			private AtomicBoolean closed = new AtomicBoolean();
+			
+			TunnelWireProtocol(Optional<Integer> bufferSize, BufferFiller reader, BufferFiller writer,  Optional<Runnable> close, Client client) {
+				this.client = client;
+				this.reader = reader;
+				this.writer = writer;
+				this.close = close;
+
+				sndBuf = ByteBuffer.allocateDirect(bufferSize.orElse(DEFAULT_BUFFER_SIZE)); // TODO configurable
+				recvBuf = ByteBuffer.allocateDirect(bufferSize.orElse(DEFAULT_BUFFER_SIZE)); // TODO configurable
+			}
+
+			@Override
+			public void transact() throws IOException {
+				client.server.runner.run(() -> {
+					try {
+						while(true) {
+							if(LOG.isLoggable(Level.TRACE))
+								LOG.log(Level.TRACE, "Tunnel HTTP receiving thread waiting data.");
+							client.socket.read(recvBuf);
+							if(recvBuf.position() == 0)
+								break;
+							if(LOG.isLoggable(Level.TRACE))
+								LOG.log(Level.TRACE, "Tunnel HTTP receiving thread got {0} bytes.", recvBuf.position());
+							recvBuf.flip();
+							writer.supply(recvBuf);
+							if(LOG.isLoggable(Level.TRACE))
+								LOG.log(Level.TRACE, "Tunnel HTTP receiving passed on {0} bytes.", recvBuf.position());
+							recvBuf.flip();
+						}
+					}
+					catch(ClosedChannelException eof) {
+						if(LOG.isLoggable(Level.TRACE))
+							LOG.log(Level.TRACE, "Receiver closed.");
+					}
+					catch(IOException ioe) {
+						LOG.log(Level.ERROR, "HTTP Receiving thread failed.",ioe);
+					}
+					finally {
+						if(!closed.getAndSet(true)) {
+							close.ifPresent(c -> c.run());
+						}
+						if(LOG.isLoggable(Level.DEBUG))
+							LOG.log(Level.DEBUG, "Tunnel HTTP receiving thread done");
+					}
+				});
+				try {
+					while(true) {
+						if(LOG.isLoggable(Level.TRACE))
+							LOG.log(Level.TRACE, "Tunnel HTTP sending thread waiting data.");
+						reader.supply(sndBuf);
+						if(sndBuf.position() == 0)
+							break;
+						if(LOG.isLoggable(Level.TRACE))
+							LOG.log(Level.TRACE, "Tunnel HTTP sending thread got {0} bytes.", sndBuf.position());
+						sndBuf.flip();
+						client.socket.write(sndBuf);
+						if(LOG.isLoggable(Level.TRACE))
+							LOG.log(Level.TRACE, "Tunnel HTTP sending passed on {0} bytes.", sndBuf.position());
+						sndBuf.flip();
+					}
+				}
+				catch(ClosedChannelException ace) {
+					if(LOG.isLoggable(Level.TRACE))
+						LOG.log(Level.TRACE, "Sender closed.");
+				}
+				finally {
+					if(!closed.getAndSet(true)) {
+						close.ifPresent(c -> c.run());
+					}
+					if(LOG.isLoggable(Level.DEBUG))
+						LOG.log(Level.DEBUG, "Tunnel HTTP sending thread done");
+				}
+				throw new EOFException();
+			}
+		}
+	}
+	
+	private static final class SocketTunnelHandler extends AbstractTunnelHandler {
+
+		@Override
+		TunnelWireProtocol create(String host, int port, Client client) throws IOException {
+			var sckt = SocketChannel.open(new InetSocketAddress(host, port));
+			return new TunnelWireProtocol(Optional.of(client.server.sendBufferSize), sckt::read, sckt::write, Optional.of(() -> { 
+				try {
+					sckt.close();
+				} catch (IOException e) {
+				} 
+			}), client);
+		}
 
 	}
-
+	
 	private final static class URLEncodedFormDataPartIterator implements Iterator<Part> {
 
 		StringBuilder buffer = new StringBuilder(256);
@@ -2660,9 +4362,12 @@ public class UHTTPD extends Thread implements Closeable {
 	}
 
 	public static final String HDR_CACHE_CONTROL = "cache-control";
+	public static final String HDR_ACCEPT_ENCODING = "accept-encoding";
+	public static final String HDR_CONTENT_ENCODING = "content-encoding";
 	public static final String HDR_CONNECTION = "connection";
 	public static final String HDR_CONTENT_DISPOSITION = "content-disposition";
 	public static final String HDR_CONTENT_LENGTH = "content-length";
+	public static final String HDR_TRANSFER_ENCODING = "transfer-encoding";
 	public static final String HDR_CONTENT_TYPE = "content-type";
 	public static final String HDR_HOST = "host";
 	public static final String HDR_UPGRADE = "upgrade";
@@ -2671,7 +4376,7 @@ public class UHTTPD extends Thread implements Closeable {
 
 	final static Logger LOG = System.getLogger("UHTTPD");
 
-	private final static Selector ALL_SELECTOR = new AllSelector();
+	private final static HandlerSelector ALL_SELECTOR = new AllSelector();
 
 	private static final String WEBSOCKET_UUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -2682,13 +4387,45 @@ public class UHTTPD extends Thread implements Closeable {
 	public static ServerBuilder server() {
 		return new ServerBuilder();
 	}
+	
+	public static ThreadPoolRunnerBuilder threadPoolRunner() {
+		return new ThreadPoolRunnerBuilder();
+	}
+
+	public static Handler fileResource(Path path) {
+		return new FileResource(path);
+	}
+
+	public static Handler fileResources(String regexpPatternWithGroups, Path root) {
+		return new FileResources(regexpPatternWithGroups, root);
+	}
+
+	public static Handler classpathResource(String path) {
+		return classpathResource(Optional.empty(), path);
+	}
+
+	public static Handler classpathResource(Optional<ClassLoader> classLoader, String path) {
+		return new ClasspathResource(classLoader, path);
+	}
+
+	public static Handler classpathResources(String regexpPatternWithGroups, Optional<ClassLoader> classLoader, String prefix) {
+		return new ClasspathResources(regexpPatternWithGroups, classLoader, prefix);
+	}
+
+	public static Handler urlResource(URL url) {
+		return new URLResource(url);
+	}
 
 	public static CookieBuilder cookie(String name, String version) {
 		return new CookieBuilder(name, version);
 	}
 
-	public static WebSocketBuilder websocket() {
-		return new WebSocketBuilder();
+	public static TunnelHandler socketTunnel() {
+		return new SocketTunnelHandler();
+	}
+
+	public static TunnelBuilder tunnel() {
+		return new TunnelBuilder();
 	}
 
 	private static String getMimeType(URL url) {
@@ -2710,7 +4447,7 @@ public class UHTTPD extends Thread implements Closeable {
 
 	private final int backlog;
 	private final boolean cache;
-	private final Map<Selector, Handler> contentFactories = new LinkedHashMap<>();
+	private final Map<HandlerSelector, Handler> contentFactories = new LinkedHashMap<>();
 	private final Optional<InetAddress> httpAddress;
 	private final Optional<Integer> httpPort;
 	private final Optional<InetAddress> httpsAddress;
@@ -2718,16 +4455,15 @@ public class UHTTPD extends Thread implements Closeable {
 	private final boolean keepAlive;
 	private final int keepAliveMax;
 	private final int keepAliveTimeoutSecs;
-	private final Optional<char[]> keyPassword;
-	private final String keyStoreAlias;
-	private final Optional<Path> keyStoreFile;
-
-	private final Optional<char[]> keyStorePassword;
+	private final boolean gzip;
+	private final int sendBufferSize;
+	private final int recvBufferSize;
+	private final long minGzipSize;
+	private final Map<Status, Handler> statusHandlers;
 	private boolean open = true;
+	private final Runner runner;
 	private Thread otherThread;
-	private ExecutorService pool;
 	private ServerSocketChannel serversocket;
-
 	private ServerSocketChannel sslServersocket;
 
 	private UHTTPD(ServerBuilder builder) throws UnknownHostException, IOException {
@@ -2737,18 +4473,18 @@ public class UHTTPD extends Thread implements Closeable {
 		httpsPort = builder.httpsPort;
 		httpAddress = builder.httpAddress;
 		httpsAddress = builder.httpsAddress;
-		keyStoreFile = builder.keyStoreFile;
-		keyStorePassword = builder.keyStorePassword;
-		keyPassword = builder.keyPassword;
-		keyStoreAlias = builder.keyStoreAlias;
 		backlog = builder.backlog;
 		contentFactories.putAll(builder.handlers);
 		cache = builder.cache;
 		keepAlive = builder.keepAlive;
+		gzip = builder.gzip;
+		sendBufferSize = builder.sendBufferSize;
+		recvBufferSize = builder.recvBufferSize;
 		keepAliveTimeoutSecs = builder.keepAliveTimeoutSecs;
 		keepAliveMax = builder.keepAliveMax;
-		pool = builder.threads.isPresent() ? Executors.newFixedThreadPool(builder.threads.get())
-				: Executors.newCachedThreadPool();
+		runner = builder.runner.orElse(threadPoolRunner().build());
+		minGzipSize = builder.gzipMinSize.orElse(300l);
+		statusHandlers = Collections.unmodifiableMap(builder.statusHandlers);
 
 		if (httpPort.isPresent()) {
 			LOG.log(Level.INFO, "Starting HTTP server on port {0}", httpPort.get());
@@ -2765,35 +4501,68 @@ public class UHTTPD extends Thread implements Closeable {
 				KeyStore ks = null;
 				KeyManagerFactory kmf = null;
 
-				if (keyStoreFile.isPresent() && Files.exists(keyStoreFile.get())) {
-					LOG.log(Level.INFO, "Using keystore {0}", keyStoreFile.get());
-					try (var in = Files.newInputStream(keyStoreFile.get())) {
-						ks = loadKeyStoreFromJKS(in, keyStorePassword.orElse(new char[0]));
-						kmf = KeyManagerFactory.getInstance("SunX509");
-						kmf.init(ks, keyPassword.orElse(keyStorePassword.orElse(new char[0])));
-					} catch (Exception e) {
-						LOG.log(Level.ERROR, "Failed to load temporary keystore, reverting to default.", e);
-						ks = null;
+				if(builder.keyStore.isPresent()) {
+					LOG.log(Level.INFO, "Using provided keystore");
+					ks = builder.keyStore.get();
+				}
+				else if (builder.keyStoreFile.isPresent() && Files.exists(builder.keyStoreFile.get())) {
+					LOG.log(Level.INFO, "Using keystore {0}", builder.keyStoreFile.get());
+					try (var in = Files.newInputStream(builder.keyStoreFile.get())) {
+						ks = KeyStore.getInstance(builder.keyStoreType.orElse(KeyStore.getDefaultType()));
+						ks.load(in, builder.keyStorePassword.orElse(new char[0]));
 					}
 				}
-
-				if (ks == null) {
-					LOG.log(Level.INFO, "Using default keystore");
-
-					ks = KeyStore.getInstance("JKS");
+				else {
+					var p = Paths.get(System.getProperty("user.home"), ".keystore");
+					if(Files.exists(p)) {
+						try (var in = Files.newInputStream(p)) {
+							ks = KeyStore.getInstance(builder.keyStoreType.orElse(KeyStore.getDefaultType()));
+							ks.load(in, builder.keyStorePassword.orElse("changeit".toCharArray()));
+							LOG.log(Level.INFO, "Using user default keystore");
+						}
+						catch(Exception e) {
+							LOG.log(Level.WARNING, "Could not load user keystore at {0}.", p, e);
+						}
+					}
+					
+					if(ks == null) {
+						LOG.log(Level.INFO, "Using system default keystore");
+						sc = SSLContext.getDefault();
+					}
 				}
-
-				sc = SSLContext.getInstance("TLS");
-				sc.init(kmf.getKeyManagers(), null, null);
+				
+				if(sc == null) {
+					kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+					kmf.init(ks, builder.keyPassword.orElse(builder.keyStorePassword.orElse(new char[0])));
+					sc = SSLContext.getInstance("TLS");
+					sc.init(kmf.getKeyManagers(), null, null);
+				}
+				
 			} catch (Exception e) {
 				throw new IOException("Failed to configure SSL.", e);
 			}
 
-//			var ssf = sc.getServerSocketFactory();
-//			sslServersocket = (SSLServerSocket) ssf.createServerSocket(httpsPort.get(), backlog,
-//					httpsAddress.orElse(InetAddress.getLocalHost()));
-//			sslServersocket.setReuseAddress(true);
-			throw new UnsupportedOperationException("TODO SSL backed socket channel");
+			var plainSslServerSocket = ServerSocketChannel.open().setOption(StandardSocketOptions.SO_REUSEADDR, true)
+					.bind(new InetSocketAddress(httpsAddress.orElse(InetAddress.getByName("127.0.0.1")),
+							httpsPort.orElse(8443)), backlog);
+			
+			// TEMP TEST
+//			var runner = new Runner() {
+//
+//				private Executor pool = new ThreadPoolExecutor(1, 1, 25, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>());
+//				
+//				@Override
+//				public void close() throws IOException {
+//				}
+//
+//				@Override
+//				public void run(Runnable runnable) {
+//					pool.execute(runnable);
+//				}
+//				
+//			};
+
+			sslServersocket = new SSL.SSLServerSocketChannel(plainSslServerSocket, sc, runner);
 		}
 	}
 
@@ -2820,7 +4589,7 @@ public class UHTTPD extends Thread implements Closeable {
 						}
 					}
 				}
-				pool.shutdown();
+				runner.close();
 			}
 		}
 	}
@@ -2859,22 +4628,15 @@ public class UHTTPD extends Thread implements Closeable {
 			throw new IllegalStateException();
 	}
 
-	private KeyStore loadKeyStoreFromJKS(InputStream jksFile, char[] passphrase)
-			throws KeyStoreException, NoSuchAlgorithmException, IOException, NoSuchProviderException,
-			UnrecoverableKeyException, CertificateException {
-
-		var keystore = KeyStore.getInstance("JKS");
-		keystore.load(jksFile, passphrase);
-		return keystore;
-	}
 
 	private void runOn(ServerSocketChannel so) {
 		while (open) {
 			LOG.log(Level.DEBUG, "Waiting for connection");
 			try {
-				pool.execute(new Client(so.accept(), cache, keepAlive, keepAliveTimeoutSecs, keepAliveMax,
+				runner.run(new Client(so.accept(), cache, keepAlive, keepAliveTimeoutSecs, keepAliveMax,
 						contentFactories, this));
 			} catch (Exception e) {
+				e.printStackTrace();
 				LOG.log(Level.ERROR, "Failed waiting for connection.", e);
 			}
 		}

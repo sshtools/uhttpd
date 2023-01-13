@@ -33,15 +33,17 @@ This will run a server in the foreground on `localhost:8080`. Point your browser
  * WebSockets.
  * Single source file. Can be just dropped into your project with ease.
  * Cookies.
+ * CONNECT tunnels.
  
 ### WIP
 
  * Full JavaDoc.
+ * Compression (content and websocket extension).
+ * Chunking (output done).
  
 ### TODO
 
- * Chunking
- * CONNECT
+ * Character sets.
  * HTTP 2 and 3.
  * Other authentication.
  * Lots of tests, testing and tuning.
@@ -55,8 +57,23 @@ This will run a server in the foreground on `localhost:8080`. Point your browser
  * It will not use non-blocking IO or any other framework based on it. 
 
 ## More Examples
+
+Simple examples. Most will start the server in the foreground indefinitely.
+
+ * [Serving some HTML](#serving-some-html)
+ * [Handling `GET` parameters](#handling-get-parameters)
+ * [Handling `POST` parameters](#handling-post-parameters)
+ * [Responder](#responder)
+ * [Authentication](#authentication)
+ * [Static Content](#static-content)
+ * [Cookies](#cookies)
+ * [WebSockets](#websockets)
+ * [Tunnels](#tunnels)
+ * [Error Pages](#error-pages)
+ * [SSL](#ssl) 
+ * [Running In Background](#running-in-background)
  
-Serving some HTML.
+### Serving some HTML
  
  ```java
 try(var httpd = UHTTPD.server().
@@ -83,7 +100,7 @@ try(var httpd = UHTTPD.server().
 }
  ``` 
  
-Handling `GET` parameters.
+### Handling `GET` parameters
  
  ```java
 try(var httpd = UHTTPD.server().
@@ -98,7 +115,9 @@ try(var httpd = UHTTPD.server().
 }
  ```
  
-Handling `POST` parameters, e.g. file upload.
+### Handling `POST` parameters
+
+For example, file uploads.
  
  ```java
  try(var httpd = UHTTPD.server().
@@ -117,8 +136,10 @@ Handling `POST` parameters, e.g. file upload.
 	httpd.run();
 }
  ```
- 
-Using a `Responder` to feed response content.
+
+### Responder
+
+Use a `responder()` to feed response content chunk by chunk.
  
  ```java
 try(var httpd = UHTTPD.server().
@@ -135,6 +156,8 @@ try(var httpd = UHTTPD.server().
 }
  ```
  
+### Authentication
+
 Adding authentication (HTTP Basic) to some pages.
  
  ```java
@@ -172,18 +195,22 @@ try(var httpd = UHTTPD.server().
 }
  ```
  
+### Static Content
+
 Serve static files and classpath resources. The matching pattern usings regular expression capture groups. 
  
  ```java
  try(var httpd = UHTTPD.server().
-	withClasspathResources("/cp/(.*)", "web").
-	withFileResources("/local/(.*)", Paths.get("/home/auser/share")).
+	classpathResources("/cp/(.*)", "web").
+	fileResources("/local/(.*)", Paths.get("/home/auser/share")).
 	build()) {
 	httpd.run();
 }
  ```
+
+### Cookies
  
-Cookies.
+Receiving cookie string values and responding with `Cookie` objects.
 
 ```java
 try (var httpd = UHTTPD.server().get("/set-cookie\\.html", (tx) -> {
@@ -208,12 +235,13 @@ try (var httpd = UHTTPD.server().get("/set-cookie\\.html", (tx) -> {
 }
 ```
 
+### WebSockets
 
-Websockets. 
+Send and receive text and binary messages. 
 
  ```java
 try (var httpd = UHTTPD.server()
-	.webSocket("/ws", UHTTPD.websocket().
+	.webSocket("/ws", UHTTPD.webSocket().
 		onText((txt, ws) -> {
 		
 			System.out.println("got '" + txt + "'");
@@ -236,18 +264,63 @@ try (var httpd = UHTTPD.server()
 			ws.send("Hello!");
 		}).
 		build())
-	.withClasspathResources("(.*)", "web")
+	.classpathResources("(.*)", "web")
 	.build()) {
 	httpd.run();
 } 
  ```
+ 
+### Tunnels
+
+Tunnelling using the `CONNECT` header. This directly connects a new Socket. You can optionally use `UHTTPD.tunnel()` which returns a `TunnelBuilder` which allows you to handle the incoming and outgoing data yourself.  
+ 
+ ```java
+ try(var httpd = UHTTPD.server().tunnel(UHTTPD.socketTunnel()).build()) {
+	httpd.run();
+}
+ ```
+
+### Error Pages
+
+Setting error pages. You can set a handler that is invoked when a particular status code occurs.
+
+```java
+try(var httpd = UHTTPD.server().	
+	status(Status.NOT_FOUND, UHTTPD.classpathResource("web/404.html")).build()) {
+	httpd.run();
+}
+```
+
+### SSL
+
+To use SSL you must provide a `KeyStore`. If you don't specifically supply one, there must a keystore file at `$HOME/.keystore` with a passphrase of `changeit` (this is the default used by the `keytool` command). Otherwise, either provide the path to a keystore file along with passwords, or provide an instance of `KeyStore`. The default port for SSL is 8443.
+
+
+```
+try(var httpd = server().
+	get("/text.txt", tx -> {
+		tx.response("text/plain", "This is some text.");
+	}).
+	withHttps().
+	build()) {
+	httpd.run();
+}
+```
+
+To generate a self signed certificate for development use, run `keytool`. 
+
+```
+keytool -genkey -alias uhttpd -keyalg RSA
+```
+
+### Running In Background
  
 Running the server in the background.
  
  ```java
  var builder = UTTPD.server();
  
- builder.withFileResources("/local/(.*)", Paths.get("/home/auser/share"));
+ builder.fileResources("/local/(.*)", Paths.get("/home/auser/share"));
  builder.withHttp(8081);
  
  var server = builder.build();

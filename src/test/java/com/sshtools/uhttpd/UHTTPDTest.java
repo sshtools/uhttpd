@@ -85,7 +85,9 @@ public class UHTTPDTest {
 			
 			try(var httpd = UHTTPD.server().
 				post("/upload", (tx) -> {
-					var in = tx.request().asStream();
+					var content = tx.request();
+					Assertions.assertEquals("application/octet-stream", content.contentType().orElseThrow());
+					var in = content.asStream();
 					var read = 0;
 					try(var sourceIn = Files.newInputStream(tf)) {
 						while(true) {

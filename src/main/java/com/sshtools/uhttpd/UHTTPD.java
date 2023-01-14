@@ -222,11 +222,9 @@ public class UHTTPD {
 			try {
 				var client = socket.getLocalAddress();
 				if (client == null) {
-					LOG.log(Level.ERROR, """
-							Socket was lost between accepting it and starting to handle it. This can be caused
-							by the system socket factory being swapped out for another while the boot HTTP server
-							is running. Closing down the server now, it has become useless!
-							""");
+					LOG.log(Level.ERROR, "Socket was lost between accepting it and starting to handle it. "
+							+ "This can be caused by the system socket factory being swapped out for another "
+							+ "while the boot HTTP server is running. Closing down the server now, it has become useless!");
 					try {
 						rootContext.close();
 					} catch (IOException e) {
@@ -1948,14 +1946,7 @@ public class UHTTPD {
 		private final class WebSocketFrame {
 
 			private static final long MAX_PAYLOAD_SIZE = Integer.MAX_VALUE - 8; // TODO make configurable and much
-																				// smaller
-
-			private static byte[] makeKey() {
-				// TODO optimise
-				var b = new byte[4];
-				new SecureRandom().nextBytes(b);
-				return b;
-			}
+				
 			ByteBuffer buffer = ByteBuffer.allocate(14); // enough for header
 			boolean fin, rsv1, rsv2, rsv3, mask;
 			byte[] key;
@@ -2334,10 +2325,6 @@ public class UHTTPD {
 
         private static final ThreadLocal<SoftReference<Map<String, SimpleDateFormat>>>
             THREADLOCAL_FORMATS = new ThreadLocal<SoftReference<Map<String, SimpleDateFormat>>>();
-
-        public static void clearThreadLocal() {
-            THREADLOCAL_FORMATS.remove();
-        }
 
         /**
          * creates a {@link SimpleDateFormat} for the requested format string.
@@ -2788,16 +2775,7 @@ public class UHTTPD {
 
 		AbstractWebContextBuilder() {
 			statusHandlers.put(Status.INTERNAL_SERVER_ERROR, (tx) -> {
-				tx.response("text/html", """
-						<html>
-						<body>
-						<h1>Internal Server Error</h1>
-						<p>__msg__</p>
-						<br/>
-						<pre>__trace__</pre>
-						</body>
-						</html>
-						""".
+				tx.response("text/html", "<html><body><h1>Internal Server Error</h1><p>__msg__</p><br/><pre>__trace__</pre></body></html>".
 					replace("__msg__", tx.error().map(e -> e.getMessage()).orElse("No message supplied.")).
 					replace("__trace__", tx.errorTrace().orElse("")));
 			});
@@ -4735,6 +4713,13 @@ public class UHTTPD {
 			}
 		}
 		final static Logger SSL_LOG = System.getLogger("UHTTPD-SSL");
+	}																// smaller
+
+	private static byte[] makeKey() {
+		// TODO optimise
+		var b = new byte[4];
+		new SecureRandom().nextBytes(b);
+		return b;
 	}
 	
 	private final static class ThreadPoolRunner implements Runner {

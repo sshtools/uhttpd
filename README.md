@@ -124,7 +124,7 @@ For example, file uploads.
  
  ```java
  try(var httpd = UHTTPD.server().
-	get("/upload", (tx) -> {
+	post("/upload", (tx) -> {
 		var content = tx.request();
 		var tmpFile = Files.createTempFile("upload", ".test");
 		var file = content.asFormData("file");

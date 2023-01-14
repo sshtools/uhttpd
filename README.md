@@ -34,6 +34,8 @@ This will run a server in the foreground on `localhost:8080`. Point your browser
  * Single source file. Can be just dropped into your project with ease.
  * Cookies.
  * CONNECT tunnels.
+ * Multiple contexts.
+ * Can work with [fibers](https://www.infoworld.com/article/3652596/project-loom-understand-the-new-java-concurrency-model.html).
  
 ### WIP
 
@@ -47,14 +49,13 @@ This will run a server in the foreground on `localhost:8080`. Point your browser
  * HTTP 2 and 3.
  * Other authentication.
  * Lots of tests, testing and tuning.
- * Replace threads with [fibers](https://www.infoworld.com/article/3652596/project-loom-understand-the-new-java-concurrency-model.html).
  
 ### Anti Features
 
  * It will not support the servlet spec (although an extension could).
  * It will not support non-programmatic configuration (although an extension could).
  * It will not allow configuration change at runtime.
- * It will not use non-blocking IO or any other framework based on it. 
+ * It will not use non-blocking IO framework. 
 
 ## More Examples
 
@@ -64,6 +65,7 @@ Simple examples. Most will start the server in the foreground indefinitely.
  * [Handling `GET` parameters](#handling-get-parameters)
  * [Handling `POST` parameters](#handling-post-parameters)
  * [Responder](#responder)
+ * [Contexts](#contexts)
  * [Authentication](#authentication)
  * [Static Content](#static-content)
  * [Cookies](#cookies)
@@ -71,6 +73,7 @@ Simple examples. Most will start the server in the foreground indefinitely.
  * [Tunnels](#tunnels)
  * [Error Pages](#error-pages)
  * [SSL](#ssl) 
+ * [Using Fibers](#using-fibers) 
  * [Running In Background](#running-in-background)
  
 ### Serving some HTML
@@ -156,6 +159,25 @@ try(var httpd = UHTTPD.server().
 }
  ```
  
+### Contexts
+
+Contexts let you isolate and group any `Handler` under a single path. Any paths of the contained handlers are then relative to the context path. Contexts can be nested. 
+
+Contexts are themselves a `Handler`, so can be added with a `HandlerSelector`, or preceeded by authentication handlers etc. 
+ 
+```java
+try(var httpd = UHTTPD.server().
+	context(UHTTPD.context("/others/(.*)").
+		get("/file.txt", tx -> tx.response("Some more text.")).
+		get("/file2.txt", tx -> tx.response("More other text.")).
+		build()).
+	get("/file.txt", tx -> tx.response("Some text")).
+	get("/file2.txt", tx -> tx.response("Other text")).
+	withHttps().
+	build()) {
+	httpd.run();
+}
+```
 ### Authentication
 
 Adding authentication (HTTP Basic) to some pages.
@@ -313,24 +335,36 @@ To generate a self signed certificate for development use, run `keytool`.
 keytool -genkey -alias uhttpd -keyalg RSA
 ```
 
+### Using Fibers
+
+If you hava Java 19 and use the `--enable-preview` argument to both compile and run, you can try out the use of [fibers](https://www.infoworld.com/article/3652596/project-loom-understand-the-new-java-concurrency-model.html). These are lightweight threads that should greatly increase scalability. Once the feature is enabled, simply set a custom `Runner`.
+
+```java
+try(var httpd = server().
+	get("/file.txt", tx -> tx.response(Paths.get("/home/tanktarta/Desktop/SMS and EMAIL API Example.java"))).
+	withRunner(r -> Thread.startVirtualThread(r)).
+	build()) {
+	httpd.run();
+}
+```
+
 ### Running In Background
  
 Running the server in the background.
  
- ```java
- var builder = UTTPD.server();
+```java
+var builder = UTTPD.server();
  
- builder.fileResources("/local/(.*)", Paths.get("/home/auser/share"));
- builder.withHttp(8081);
+builder.fileResources("/local/(.*)", Paths.get("/home/auser/share"));
+builder.withHttp(8081);
  
- var server = builder.build();
- server.start(); // starts in background
+var server = builder.build();
+server.start(); // starts in background
  
- // ...
- // do other stuff 
- // ...
+// ...
+// do other stuff 
+// ...
  
- server.close();
- server.join(); // optionally wait for threads to shutdown
- 
- ```
+server.close();
+server.join(); // optionally wait for threads to shutdown
+```

@@ -26,6 +26,8 @@
 		<maven.compiler.source>17</maven.compiler.source>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 		<project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+		<junit.jupiter.version>5.9.2</junit.jupiter.version>
+		<junit.platform.version>1.9.2</junit.platform.version>
 	</properties>
 	<developers>
 		<developer>
@@ -62,6 +64,26 @@
 		<url>https://github.com/sshtools/uhttpd</url>
 		<connection>https://github.com/sshtools/uhttpd.git</connection>
 	</scm>
+	<dependencies>
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter-engine</artifactId>
+			<version>${junit.jupiter.version}</version>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.junit.jupiter</groupId>
+			<artifactId>junit-jupiter-api</artifactId>
+			<version>${junit.jupiter.version}</version>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.junit.platform</groupId>
+			<artifactId>junit-platform-runner</artifactId>
+			<version>${junit.platform.version}</version>
+			<scope>test</scope>
+		</dependency>
+	</dependencies>
 	<build>
 		<pluginManagement>
 			<plugins>
@@ -179,7 +201,6 @@
 			</plugins>
 		</pluginManagement>
 	</build>
-	
 	<profiles>
 		<profile>
 			<id>loom</id>

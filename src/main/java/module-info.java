@@ -16,5 +16,6 @@
 
 module com.sshtools.uhttpd {
 	exports com.sshtools.uhttpd;
+	requires transitive java.net.http;
 
 }

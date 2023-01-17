@@ -153,7 +153,7 @@ public class UHTTPD {
 	 * will be expected. 
 	 * 
 	 */
-	public interface BufferFiller {
+	public interface BufferFiller extends Closeable {
 		/**
 		 * Supply some more data. Upon invocation, the
 		 * byte buffer will be reset. If there is content, before exit 
@@ -166,6 +166,10 @@ public class UHTTPD {
 		 * @throws IOException on error
 		 */
 		void supply(ByteBuffer buffer) throws IOException;
+
+		@Override
+		default void close() throws IOException {
+		}
 	}
 
 	/**
@@ -2783,14 +2787,19 @@ public class UHTTPD {
 			try(var  out = responseWriter(tx)) {
 				if (tx.responder.isPresent()) {
 					var buffer = ByteBuffer.allocateDirect(client.rootContext.sendBufferSize);
-					do {
-						buffer.clear();
-						tx.responder.get().supply(buffer);
-						if(buffer.position() > 0) {
-							buffer.flip();
-							out.write(buffer);
-						}
-					} while(buffer.position() > 0);
+					try {
+						do {
+							buffer.clear();
+							tx.responder.get().supply(buffer);
+							if(buffer.position() > 0) {
+								buffer.flip();
+								out.write(buffer);
+							}
+						} while(buffer.position() > 0);
+					}
+					finally {
+						tx.responder.get().close();
+					}
 				}
 			}
 		}
@@ -3275,6 +3284,19 @@ public class UHTTPD {
 		}
 
 		@Override
+		public void close() throws IOException {
+			if(response instanceof ReadableByteChannel) {
+				((ReadableByteChannel)response).close();
+			}
+			else if(response instanceof Reader) {
+				((Reader)response).close();
+			}
+			else if(response instanceof InputStream) {
+				((InputStream)response).close();
+			}
+		}
+
+		@Override
 		public void supply(ByteBuffer buf) throws IOException {
 			if(response instanceof ReadableByteChannel) {
 				var chan = (ReadableByteChannel)response;
@@ -3393,9 +3415,6 @@ public class UHTTPD {
 	
 	private final static class GZIPChannel implements WritableByteChannel {
 	    
-		static final int GZIP_MAGIC = 0x8b1f;
-	    static final byte OS_UNKNOWN = (byte) 255;
-		
 		private final Deflater def;
 		private final CRC32 crc = new CRC32();
 		private WritableByteChannel out;

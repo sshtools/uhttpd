@@ -45,7 +45,6 @@ This will run a server in the foreground on `localhost:8080`. Point your browser
  
 ### TODO
 
- * Character sets.
  * HTTP 2 and 3.
  * Other authentication.
  * Lots of tests, testing and tuning.
@@ -65,6 +64,7 @@ Simple examples. Most will start the server in the foreground indefinitely.
  * [Handling `GET` parameters](#handling-get-parameters)
  * [Handling `POST` parameters](#handling-post-parameters)
  * [Responder](#responder)
+ * [Response Writer](#response-writer)
  * [Contexts](#contexts)
  * [Authentication](#authentication)
  * [Static Content](#static-content)
@@ -153,6 +153,30 @@ try(var httpd = UHTTPD.server().
 				buf.put(ByteBuffer.wrap(("Line " + line.get() + "\n").getBytes()));
 			}
 		});
+	}).
+	build()) {
+	httpd.run();
+}
+ ```
+
+### Response Writer
+
+You can also get a `WritableByteChannel` (and so also create a traditional `Writer` using `Channels` utility methods). As soon as you use this, all other methods of `Transaction` that would modify the response can no longer be used.
+
+Make sure you `close()` the writer, as this marks the end of the response (for chunked encoding etc).
+ 
+ ```java
+try(var httpd = UHTTPD.server().
+	get("/writer.html", (tx) -> {
+		tx.responseType("text/html");
+		try(var w = new PrintWriter(Channels.newWriter(tx.responseWriter(), tx.client().charset()), true)) {
+			w.println("<html>");
+			w.println("<body>");
+			w.println("<h1>Some title</h1>");
+			w.println("<p>A paragraph of text</p>");
+			w.println("</body>");
+			w.println("</html>");
+		}
 	}).
 	build()) {
 	httpd.run();

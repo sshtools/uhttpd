@@ -22,7 +22,6 @@ import java.io.ByteArrayInputStream;
 import java.io.Closeable;
 import java.io.EOFException;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
@@ -32,6 +31,7 @@ import java.io.StringReader;
 import java.io.StringWriter;
 import java.io.UncheckedIOException;
 import java.io.UnsupportedEncodingException;
+import java.io.Writer;
 import java.lang.System.Logger;
 import java.lang.System.Logger.Level;
 import java.lang.ref.SoftReference;
@@ -51,10 +51,12 @@ import java.nio.CharBuffer;
 import java.nio.channels.AsynchronousCloseException;
 import java.nio.channels.Channels;
 import java.nio.channels.ClosedChannelException;
+import java.nio.channels.ReadableByteChannel;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.nio.channels.WritableByteChannel;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.Charset;
 import java.nio.charset.CharsetDecoder;
@@ -78,6 +80,7 @@ import java.util.Calendar;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -85,11 +88,13 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.Stack;
 import java.util.StringTokenizer;
 import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -103,6 +108,18 @@ import javax.net.ssl.SSLSession;
 
 /**
  * Simple HTTP/HTTPS server, configured using a fluent API.
+ * 
+ * <pre>
+ * public class SimpleServer {
+ *	   public static void main(String[] args) throws Exception {
+ *		   try(var httpd = UHTTPD.server().
+ *			   get("/index\\.txt", (tx) -> tx.response("Hello World!")).
+ *			   build()); {
+ *			   httpd.run();
+ *		   }
+ *	   }
+ * }
+ * </pre>
  */
 public class UHTTPD {
 
@@ -164,16 +181,22 @@ public class UHTTPD {
 
 		final RootContextImpl rootContext;
 		final SocketChannel socket;
+		final Scheme scheme;
+		final int port;
 
 		boolean closed = false;
 		int times = 0;
 		WireProtocol wireProtocol;
 		Charset charset = Charset.defaultCharset();
 		Selector selector;
+		
 
-		Client(SocketChannel socket, RootContextImpl rootContext) throws IOException {
+		Client(int port, Scheme scheme, SocketChannel socket, RootContextImpl rootContext) throws IOException {
+			this.port = port;
+			this.scheme = scheme;
 			this.socket = socket;
 			this.rootContext = rootContext;
+			this.rootContext.clients.add(this);
 
 			wireProtocol = new HTTP11WireProtocol(this);
 
@@ -184,18 +207,14 @@ public class UHTTPD {
 				selectionKey.attach(uchannel);
 			}
 		}
-		
-		public final SocketChannel channel() {
-			return socket;
-		}
 
+		/**
+		 * Get the active character set.
+		 * 
+		 * @return character set
+		 */
 		public final Charset charset() {
 			return charset;
-		}
-
-		public final Client charset(Charset charset) {
-			this.charset = charset;
-			return this;
 		}
 
 		/**
@@ -211,6 +230,7 @@ public class UHTTPD {
 					socket.close();
 				} catch (IOException ioe) {
 				}
+				rootContext.clients.remove(this);
 			}
 		}
 
@@ -236,7 +256,7 @@ public class UHTTPD {
 							wireProtocol.transact();
 							times++;
 						} while (times < rootContext.keepAliveMax);
-					} catch (EOFException e) {
+					} catch (ClosedChannelException | EOFException e) {
 						LOG.log(Level.TRACE, "EOF.", e);
 					} catch (Exception e) {
 						e.printStackTrace();
@@ -254,7 +274,30 @@ public class UHTTPD {
 			}
 		}
 
-		public void waitForWrite() {
+		/**
+		 * Get the underlying protocol currently active. This may change as the connection is
+		 * upgraded to a WebSocket.
+		 * 
+		 * @return current wire protocol
+		 */
+		public final WireProtocol wireProtocol() {
+			return wireProtocol;
+		}
+
+		/**
+		 * Get the scheme this connection is using.
+		 * 
+		 * @return scheme
+		 */
+		public final  Scheme scheme() {
+			return scheme;
+		}
+		
+		final SocketChannel channel() {
+			return socket;
+		}
+
+		final void waitForWrite() {
 			if(selector == null)
 				return;
 			try {
@@ -264,11 +307,7 @@ public class UHTTPD {
 			}
 		}
 
-		public final WireProtocol wireProtocol() {
-			return wireProtocol;
-		}
-
-		SocketChannel underlyingChannel() {
+		final SocketChannel underlyingChannel() {
 			var ch = channel();
 			if(ch instanceof SSL.SSLSocketChannel) {
 				return ((SSL.SSLSocketChannel)ch).getWrappedSocketChannel();
@@ -276,6 +315,19 @@ public class UHTTPD {
 			else {
 				return ch;
 			}
+		}
+
+		final int port() {
+			try {
+				var addr = socket.getLocalAddress();
+				if(addr instanceof InetSocketAddress) {
+					return ((InetSocketAddress)addr).getPort();
+				}
+			}
+			catch(Exception e) {
+				LOG.log(Level.TRACE, "Failed to get socket address.", e);
+			}
+			return port;
 		}
 
 	}
@@ -411,9 +463,11 @@ public class UHTTPD {
 	}
 	
 	public interface Context extends Closeable, Handler {
+
+		String generateETag(Path resource);
 	}
 	
-	public final static class ContextBuilder extends AbstractWebContextBuilder<ContextBuilder> {
+	public final static class ContextBuilder extends AbstractWebContextBuilder<ContextBuilder, Context> {
 		
 		private final String pathExpression;
 
@@ -1053,7 +1107,7 @@ public class UHTTPD {
 	 * Builder to create a new instance of the main server,
 	 * an {@link UHTTPD} instance.
 	 */
-	public final static class RootContextBuilder extends AbstractWebContextBuilder<RootContextBuilder> {
+	public final static class RootContextBuilder extends AbstractWebContextBuilder<RootContextBuilder, RootContext> {
 		private int backlog = 10;
 		private boolean cache = true;
 		private boolean daemon;
@@ -1081,7 +1135,7 @@ public class UHTTPD {
 			return this;
 		}
 
-		public RootContext build() throws UnknownHostException, IOException {
+		public RootContext build() throws IOException {
 			return new RootContextImpl(this);
 		}
 		
@@ -1248,6 +1302,10 @@ public class UHTTPD {
 		STRICT, LAX, NONE;
 	}
 	
+	public enum Scheme {
+		HTTP, HTTPS
+	}
+	
 	public enum Status {
 		CONTINUE(100, "Continue"), 
 		SWITCHING_PROTOCOLS(101, "Switching Protocols"), 
@@ -1280,7 +1338,7 @@ public class UHTTPD {
 		PRECONDITION_FAILED(412, "Precondition Failed"),
 		REQUEST_ENTITY_TOO_LARGE(413, "Request Entity Too Large"),
 		REQUEST_URI_TOO_LONG(414, "Request-URI Too Long"),
-		UNSUPPORTED_MEDIA_TYE(415, "Request-URI Too Long"),
+		UNSUPPORTED_MEDIA_TYPE(415, "Request-URI Too Long"),
 		UNPROCESSABLE_ENTITY(422, "Unprocessable Entity"),
 		LOCKED(423, "Locked"),
 		FAILED_DEPENDENCY(424, "Failed Dependency"),
@@ -1390,10 +1448,11 @@ public class UHTTPD {
 		private final Map<String, String> incomingCookies = new LinkedHashMap<>();
 		private final List<String> matches = new ArrayList<>();
 		private final Method method;
-		private Optional<String> outgoingContentType = Optional.empty();
+		private Optional<String> responseType = Optional.empty();
 		private final Map<String, Named> outgoingHeaders = new LinkedHashMap<>();
 		private final Map<String, Cookie> outgoingCookies = new LinkedHashMap<>();
 		private final Map<String, Named> parameters = new LinkedHashMap<>();
+		private final Stack<Context> contexts = new Stack<>();
 		private Path path;
 		private Path contextPath;
 		private Path fullPath;
@@ -1405,12 +1464,12 @@ public class UHTTPD {
 		private Optional<HandlerSelector> selector = Optional.empty();
 		private final String urlHost;
 		private final String uri;
-
 		private Optional<Throwable> error;
-
 		private Path fullContextPath;
+		private WritableByteChannel responseChannel;
+		private boolean responseStarted;
 
-		Transaction(String pathSpec, Method method, Protocol protocol, Client client) {
+		Transaction(String pathSpec, Method method, Protocol protocol, Client client, Writer writer) {
 			this.method = method;
 			this.protocol = protocol;
 			this.client = client;
@@ -1440,15 +1499,15 @@ public class UHTTPD {
 			fullPath = contextPath.resolve(path);
 		}
 
-		public void authenticate(Principal principal) {
+		public final void authenticate(Principal principal) {
 			this.principal = Optional.of(principal);
 		}
 		
-		public boolean authenticated() {
+		public final boolean authenticated() {
 			return principal.isPresent();
 		}
 		
-		public Client client() {
+		public final Client client() {
 			return client;
 		}
 		
@@ -1456,28 +1515,30 @@ public class UHTTPD {
 			return contextPath;
 		}
 
-		public Transaction cookie(Cookie cookie) {
+		public final Transaction cookie(Cookie cookie) {
+			checkNotResponded();
 			outgoingCookies.put(cookie.name(), cookie);
 			return this;
 		}
 
-		public String cookie(String name) {
+		public final String cookie(String name) {
 			return cookieOr(name).orElseThrow();
 		}
 
-		public Transaction cookie(String name, String value) {
+		public final Transaction cookie(String name, String value) {
 			return cookie(UHTTPD.cookie(name,value).build());
 		}
 
-		public Optional<String> cookieOr(String name) {
+		public final Optional<String> cookieOr(String name) {
 			return Optional.ofNullable(incomingCookies.get(name));
 		}
 
-		public Optional<Throwable> error() {
+		public final Optional<Throwable> error() {
 			return error;
 		}
 		
-		public void error(Throwable ise) {
+		public final void error(Throwable ise) {
+			checkNotResponded();
 			this.error= Optional.of(ise);
 			responseCode(Status.INTERNAL_SERVER_ERROR);
 			if (ise.getMessage() != null)
@@ -1487,7 +1548,7 @@ public class UHTTPD {
 
 		}
 
-		public Optional<String> errorTrace() {
+		public final Optional<String> errorTrace() {
 			return error.map(e -> {
 				var sw = new StringWriter();
 				e.printStackTrace(new PrintWriter(sw));
@@ -1495,12 +1556,19 @@ public class UHTTPD {
 			});
 		}
 
-		public Transaction found(String location) {
-			responseCode(Status.MOVED_TEMPORARILY);
+		public final Transaction redirect(Status status, String location) {
+			checkNotResponded();
+			if(status != Status.MOVED_PERMANENTLY && status != Status.MOVED_PERMANENTLY)
+				throw new IllegalArgumentException(MessageFormat.format("May only use {0} or {1}.", Status.MOVED_PERMANENTLY, Status.MOVED_PERMANENTLY ));
+			responseCode(status);
 			header("Location", location == null ? "/" : location);
-			responseType("text/plain");
-			responseLength = Optional.empty();
+			resetContent();
 			return this;
+		}
+
+		@Deprecated
+		public final Transaction found(String location) {
+			return redirect(Status.MOVED_PERMANENTLY, location);
 		}
 
 		public final Path fullContextPath() {
@@ -1511,24 +1579,60 @@ public class UHTTPD {
 			return fullPath;
 		}
 		
+		public final Transaction resetContent() {
+			responder = Optional.empty();
+			responseLength = Optional.empty();
+			responseType = Optional.empty();
+			return this;
+		}
+		
+		public final WritableByteChannel responseWriter() {
+			if(responseChannel == null) {
+				responseChannel = new WritableByteChannel() {
+
+					private WritableByteChannel output;
+
+					public boolean isOpen() {
+						return output.isOpen();
+					}
+
+					@Override
+					public void close() throws IOException {
+						output.close();
+					}
+
+					@Override
+					public int write(ByteBuffer src) throws IOException {
+						if(output == null)
+							output = client.wireProtocol.responseWriter(Transaction.this);
+						responseStarted =true;
+						return output.write(src);
+					}
+					
+				};
+			}
+			return responseChannel;
+		}
+		
 		public final boolean hasResponse() {
-			return responder.isPresent();
+			return responder.isPresent() || responseChannel != null;
 		}
 
-		public boolean hasResponseHeader(String name) {
+		public final boolean hasResponseHeader(String name) {
 			return outgoingHeaders.containsKey(name);
 		}
 
-		public String header(String name) {
+		public final String header(String name) {
 			return headerOr(name).orElseThrow();
 		}
 
-		public Transaction header(String name, String value) {
+		public final Transaction header(String name, String value) {
+			checkNotResponded();
 			outgoingHeaders.put(name.toLowerCase(), new Named(name.toLowerCase(), value));
 			return this;
 		}
 
-		public Optional<String> headerOr(String name) {
+		public final Optional<String> headerOr(String name) {
 			return headersOr(name).map(h -> h.value().get());
 		}
 
@@ -1536,55 +1640,69 @@ public class UHTTPD {
 			return Collections.unmodifiableList(new ArrayList<>(incomingHeaders.values()));
 		}
 
-		public Named headers(String name) {
+		public final Named headers(String name) {
 			return headersOr(name).orElseThrow();
 		}
 
-		public Optional<Named> headersOr(String name) {
+		public final Optional<Named> headersOr(String name) {
 			return incomingHeaders.values().stream().filter(h -> h.name().equals(name.toLowerCase()))
 					.map(h -> Optional.of(h)).reduce((f, s) -> f).orElse(Optional.empty());
 		}
+		
+		public final String hostName() {
+			var host = host();
+			var idx = host.indexOf(':');
+			return idx == -1 ? host : host.substring(0, idx);
+		}
+		
+		public final int hostPort() {
+			var host = host();
+			var idx = host.indexOf(':');
+			return idx == -1 ? client.port() : Integer.parseInt(host.substring(idx + 1));
+		}
 
-		public String hostname() {
+		public final String host() {
 			var hdr = headerOr(HDR_HOST);
 			return hdr.isPresent() ? hdr.get() : urlHost;
 		}
 
-		public List<String> matches() {
+		public final List<String> matches() {
 			return Collections.unmodifiableList(matches);
 		}
 
-		public Method method() {
+		public final Method method() {
 			return method;
 		}
 
-		public Transaction notFound() {
+		public final Transaction notFound() {
+			checkNotResponded();
 			responseCode(Status.NOT_FOUND);
 			responseType("text/plain");
 			responseLength = Optional.empty();
 			return this;
 		}
 
-		public Transaction notImplemented() {
+		public final Transaction notImplemented() {
+			checkNotResponded();
 			responseCode(Status.NOT_IMPLEMENTED);
 			responseType("text/plain");
 			responseLength = Optional.empty();
 			return this;
 		}
 
-		public Named parameter(String name) {
+		public final Named parameter(String name) {
 			return parameterOr(name).orElseThrow();
 		}
 
-		public Iterable<String> parameterNames() {
+		public final Iterable<String> parameterNames() {
 			return parameters.keySet();
 		}
 
-		public Optional<Named> parameterOr(String name) {
+		public final Optional<Named> parameterOr(String name) {
 			return Optional.ofNullable(parameters.get(name));
 		}
 
-		public Iterable<Named> parameters() {
+		public final Iterable<Named> parameters() {
 			return parameters.values();
 		}
 
@@ -1592,28 +1710,29 @@ public class UHTTPD {
 			return path;
 		}
 
-		public Optional<Principal> principal() {
+		public final Optional<Principal> principal() {
 			return principal;
 		}
 
-		public Protocol protocol() {
+		public final Protocol protocol() {
 			return protocol;
 		}
 
-		public Content request() {
+		public final Content request() {
 			return contentSupplier.get().orElseThrow();
 		}
 
-		public Optional<Content> requestOr() {
+		public final Optional<Content> requestOr() {
 			return contentSupplier.get();
 		}
 
-		public Transaction responder(BufferFiller responder) {
+		public final Transaction responder(BufferFiller responder) {
 			this.responder = Optional.of(responder);
 			return this;
 		}
 
-		public Transaction responder(String responseType, BufferFiller responder) {
+		public final Transaction responder(String responseType, BufferFiller responder) {
+			checkNotResponded();
 			responseType(responseType);
 			this.responder = Optional.of(responder);
 			return this;
@@ -1633,44 +1752,48 @@ public class UHTTPD {
 		 * @param response
 		 * @return this for chaining.
 		 */
-		public Transaction response(Object response) {
+		public final Transaction response(Object response) {
 			return responder(new DefaultResponder(response, this));
 		}
 
-		public Transaction response(String responseType, Object response) {
+		public final Transaction response(String responseType, Object response) {
 			responseType(responseType);
 			return response(response);
 		}
 
-		public Transaction responseCode(Status code) {
+		public final Transaction responseCode(Status code) {
+			checkNotResponded();
 			this.code = Optional.of(code);
 			return this;
 		}
 
-		public boolean responsed() {
+		public final boolean responsed() {
 			return code.isPresent();
 		}
 
-		public Transaction responseLength(long responseLength) {
+		public final Transaction responseLength(long responseLength) {
+			checkNotResponded();
 			this.responseLength = responseLength == -1 ? Optional.empty() : Optional.of(responseLength);
 			return this;
 		}
 
-		public Transaction responseText(String text) {
+		public final Transaction responseText(String text) {
+			checkNotResponded();
 			this.responseText = Optional.of(text);
 			return this;
 		}
 
-		public Transaction responseType(String contentType) {
-			outgoingContentType = Optional.ofNullable(contentType);
+		public final Transaction responseType(String contentType) {
+			checkNotResponded();
+			responseType = Optional.ofNullable(contentType);
 			return this;
 		}
 
-		public HandlerSelector selector() {
+		public final HandlerSelector selector() {
 			return selector.orElseThrow();
 		}
 
-		public Optional<HandlerSelector> selectorOr() {
+		public final Optional<HandlerSelector> selectorOr() {
 			return selector;
 		}
 
@@ -1678,12 +1801,13 @@ public class UHTTPD {
 		public String toString() {
 			return "Request [path=" + path + ", parameters=" + parameters + ", incomingHeaders=" + incomingHeaders
 					+ ", outgoingHeaders=" + outgoingHeaders + ", outgoingContentLength=" + responseLength
-					+ ", outgoingContentType=" + outgoingContentType + /* ", response=" + response + */ ", code=" + code
+					+ ", outgoingContentType=" + responseType + /* ", response=" + response + */ ", code=" + code
 					+ ", responseText=" + responseText + ", principal=" + principal + ", method=" + method
 					+ ", protocol=" + protocol + ", urlHost=" + urlHost + "]";
 		}
 
 		public Transaction unauthorized(String realm) {
+			checkNotResponded();
 			responseCode(Status.UNAUTHORIZED);
 			responseType("text/plain");
 			header("WWW-Authenticate", String.format("Basic realm=\"%s\"", realm));
@@ -1692,15 +1816,30 @@ public class UHTTPD {
 
 		}
 
-		public String uri() {
+		public final Context context() {
+			return contexts.peek();
+		}
+
+		public final String uri() {
 			return uri;
 		}
 
-		void pushContext(String ctxPath, String resPath) {
+		void pushContext(Context context, String ctxPath, String resPath) {
+			this.contexts.push(context);
 			contextPath = Paths.get(ctxPath);
 			path = Paths.get(resPath);
 			fullContextPath = fullContextPath.resolve(ctxPath.substring(1));
 			fullPath = fullContextPath.resolve(resPath.substring(1));
+		}
+		
+		void checkNotResponded() {
+			if(responseStarted)
+				throw new IllegalStateException("Response already started.");
+		}
+
+		public String pathInfo() {
+			// TODO Auto-generated method stub
+			throw new UnsupportedOperationException("TODO");
 		}
 	}
 
@@ -2313,6 +2452,10 @@ public class UHTTPD {
 	public interface WireProtocol {
 
 		void transact() throws IOException;
+		
+		default WritableByteChannel responseWriter(Transaction tx) throws IOException {
+			throw new UnsupportedOperationException();
+		}
 	}
 	
 	/**
@@ -2359,22 +2502,34 @@ public class UHTTPD {
 
     }
 	
-	private static final class HTTP11WireProtocol implements WireProtocol {
+	private static final class HTTP11WireProtocol extends WebChannel implements WireProtocol {
 		
 
-		final Client client;
 		final BufferedReader reader;
 		final PrintWriter writer;
-		GzipChannelWriter gzipWriter;
+		
+		boolean close;
+		boolean chunk;
+		boolean gzip;
+		boolean headerResponse;
 
 		HTTP11WireProtocol(Client client) {
-			this.client = client;
+			super(client, client.channel());
 			reader = new BufferedReader(Channels.newReader(client.channel(), client.charset.newDecoder(), (int)client.rootContext.recvBufferSize));
 			writer = new PrintWriter(Channels.newWriter(client.channel(), client.charset.newEncoder(), (int)client.rootContext.sendBufferSize));
+		}
+		
+		void reset() {
+			close = true;
+			chunk = false;
+			gzip = false;
+			headerResponse = false;
 		}
 
 		@Override
 		public void transact() throws IOException {
+			reset();
+			
 			if (LOG.isLoggable(Level.DEBUG))
 				LOG.log(Level.DEBUG, "Awaiting HTTP start");
 			var line = reader.readLine();
@@ -2400,8 +2555,7 @@ public class UHTTPD {
 			} else {
 				uri = firstToken;
 			}
-			var tx = new Transaction(uri, method, proto, client);
-			var close = true;
+			var tx = new Transaction(uri, method, proto, client, writer);
 			try {
 				tx.contentSupplier = new Supplier<>() {
 
@@ -2466,8 +2620,16 @@ public class UHTTPD {
 				}
 			}
 			
-			respond(tx);
-			if(close)
+			if(!headerResponse) {
+				respond(tx);
+			}
+			
+			if(tx.responseChannel == null) {
+				responseContent(tx, gzip, chunk);
+			}
+			
+			flush();
+			if (close)
 				throw new EOFException();
 
 			if (LOG.isLoggable(Level.DEBUG))
@@ -2475,53 +2637,55 @@ public class UHTTPD {
 			client.socket.socket().setSoTimeout(client.rootContext.keepAliveTimeoutSecs * 1000);
 		}
 
-		void write(boolean chunk, ByteBuffer data) throws IOException {
+		@Override
+		public WritableByteChannel responseWriter(Transaction tx) throws IOException {
+			if(!headerResponse)
+				respond(tx);
+			
+			var out = client.channel();
+			WritableByteChannel chan = new WritableByteChannel() {
+				
+				private boolean closed;
+				
+				@Override
+				public boolean isOpen() {
+					return !closed;
+				}
+				
+				@Override
+				public void close() throws IOException {
+					closed = true;
+				}
+				
+				@Override
+				public int write(ByteBuffer src) throws IOException {
+					if(closed)
+						throw new IOException("Closed.");
+					var r = out.write(src);
+					client.waitForWrite();
+					return r;
+				}
+			}; 
 			if(chunk) {
-				if(LOG.isLoggable(Level.DEBUG))
-					LOG.log(Level.DEBUG, "Writing chunk of {0} bytes.", data.limit());
-				println(Integer.toHexString(data.limit()));
+				chan = new ChunkedChannel(client, chan);
 			}
-			else
-				if(LOG.isLoggable(Level.DEBUG))
-					LOG.log(Level.DEBUG, "Writing block of {0} bytes.", data.limit());
-			client.channel().write(data);
-			client.waitForWrite();
-			if(chunk) {
-				newline();
+			if(gzip) {
+				chan = new GZIPChannel(chan);
 			}
+			return chan;
 		}
 
 		private void flush() throws IOException {
 			writer.flush();
 		}
 
-		private void newline() throws IOException {
-			writer.append("\r\n");
-			if (LOG.isLoggable(Level.TRACE))
-				LOG.log(Level.TRACE, "HTTP OUT: <newline>");
-		}
-
-		private void print(Object text) throws IOException {
-			if (LOG.isLoggable(Level.TRACE))
-				LOG.log(Level.TRACE, "HTTP OUT: {0}", text);
-			writer.append(text.toString());
-			writer.flush();
-		}
-
-		private void println(Object text) throws IOException {
-
-			if (LOG.isLoggable(Level.TRACE))
-				LOG.log(Level.TRACE, "HTTP OUT: {0} <newline>", text);
-			writer.append(text.toString());
-			writer.append("\r\n");
-			writer.flush();
-		}
-		
 		private void respond(Transaction tx) throws IOException {
-
+			if(headerResponse)
+				throw new IllegalStateException("Headers already written.");
+			headerResponse = true;
+			
 			var status = tx.code.orElse(Status.OK);
 			
-			var close = false;
 			if (status.getCode() >= 300)
 				close = true;
 
@@ -2530,7 +2694,7 @@ public class UHTTPD {
 			print(status.code);
 			print(" ");
 			print(tx.responseText.orElse(status.getText()));
-			newline();
+			println();
 
 			if (LOG.isLoggable(Level.DEBUG) && !LOG.isLoggable(Level.TRACE))
 				LOG.log(Level.DEBUG, "HTTP OUT: {0} {1} {2}", tx.protocol().text(), status.code,
@@ -2539,9 +2703,8 @@ public class UHTTPD {
 			var responseLength = tx.responseLength;
 			
 			var responseBigEnoughToCompress = (responseLength.isEmpty() || (responseLength.get() >= client.rootContext.minGzipSize) ) ;
-			var gzip = responseBigEnoughToCompress && client.rootContext.gzip && tx.hasResponse() && tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) &&
+			gzip = responseBigEnoughToCompress && client.rootContext.gzip && tx.hasResponse() && tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) &&
 					tx.outgoingHeaders.get(HDR_CONTENT_ENCODING).containsIgnoreCase("gzip");
-			var chunk = false;
 			var lengthPresent = responseLength.isPresent();
 			
 			if(responseBigEnoughToCompress && client.rootContext.gzip && !tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) && tx.hasResponse()) {
@@ -2558,7 +2721,7 @@ public class UHTTPD {
 				print(HDR_CONTENT_LENGTH);
 				print(": ");
 				print(responseLength.get());
-				newline();
+				println();
 			}
 			else {
 				// TEMP to force raw
@@ -2586,25 +2749,25 @@ public class UHTTPD {
 				}
 			}
 
-			if (tx.outgoingContentType.isPresent()) {
+			if (tx.responseType.isPresent()) {
 				print(HDR_CONTENT_TYPE);
 				print(": ");
-				print(tx.outgoingContentType.get());
-				newline();
+				print(tx.responseType.get());
+				println();
 			}
 			
 			for (var nvp : tx.outgoingHeaders.values()) {
 				print(nvp.name());
 				print(": ");
 				print(nvp.value().orElse(""));
-				newline();
+				println();
 			}
 			
 			for(var cookie : tx.outgoingCookies.values()) {
 				print(HDR_SET_COOKIE);
 				print(": ");
 				print(cookie);
-				newline();
+				println();
 			}
 			
 			if (!client.rootContext.cache) {
@@ -2612,48 +2775,24 @@ public class UHTTPD {
 				println(": no-cache");
 			}
 			
-			newline();
+			println();
 			flush();
-			if(gzip) {
-				if(LOG.isLoggable(Level.DEBUG))
-				LOG.log(Level.DEBUG, "Activating GZip");
-				if(gzipWriter == null)
-					gzipWriter =new GzipChannelWriter();
-				else
-					gzipWriter.reset();
-			}
-			
-			if (tx.responder.isPresent()) {
-				if(gzip)
-					write(chunk, gzipWriter.writeGzipHeader());
-				var buffer = ByteBuffer.allocateDirect(client.rootContext.sendBufferSize); // TODO configurable
-				do {
-					buffer.clear();
-					tx.responder.get().supply(buffer);
-					if(buffer.position() > 0) {
-						buffer.flip();
-						write(chunk, gzip ? gzipWriter.write(buffer) : buffer);
-					}
-				} while(buffer.position() > 0);
-				
-				// TODO The only way i can make this work is NOT having a trailer!?!				
-				//      I had believed that Deflator does not output actual gzip, which
-				//		needs both the header and the trailer
-				// if(gzip)
-				//    write(chunk, gzipWriter.writeGzipTrailer());
-				
-				if(chunk) {
-					println("0"); // terminating chunk
-					newline(); // end of chunking
+		}
+
+		private void responseContent(Transaction tx, boolean gzip, boolean chunk) throws IOException {
+			try(var  out = responseWriter(tx)) {
+				if (tx.responder.isPresent()) {
+					var buffer = ByteBuffer.allocateDirect(client.rootContext.sendBufferSize);
+					do {
+						buffer.clear();
+						tx.responder.get().supply(buffer);
+						if(buffer.position() > 0) {
+							buffer.flip();
+							out.write(buffer);
+						}
+					} while(buffer.position() > 0);
 				}
 			}
-			else if(chunk) {
-				println("0"); // terminating chunk
-				newline(); // end of chunking
-			}
-			flush();
-			if (close)
-				throw new EOFException();
 		}
 
 	}
@@ -2661,10 +2800,48 @@ public class UHTTPD {
 	private abstract static class AbstractContext implements Context {
 		protected final Map<HandlerSelector, Handler> handlers = new LinkedHashMap<>();
 		protected final Map<Status, Handler> statusHandlers = new LinkedHashMap<>();
+		protected Optional<Function<Path, String>> etagGenerator;
+		protected AbstractContext parent;
 		
-		AbstractContext(AbstractWebContextBuilder<?> b) {
+		AbstractContext(AbstractWebContextBuilder<?, ?> b) {
 			handlers.putAll(b.handlers);
 			statusHandlers.putAll(b.statusHandlers);
+			etagGenerator = b.etagGenerator;
+			
+			handlers.forEach((k,v) -> {
+				if(v instanceof AbstractContext) {
+					((AbstractContext)v).parent = this;
+				}
+			});
+		}
+
+		@Override
+		public String generateETag(Path resource) {
+			return generateETag(this, resource);
+		}
+
+		String generateETag(AbstractContext ctx, Path resource) {
+			var o = ctx.etagGenerator;
+			if(o.isPresent())
+				return o.get().apply(resource);
+			else {
+				if(parent == null) {
+					try {
+						long contentLength = Files.size(resource);
+	                    long lastModified = Files.getLastModifiedTime(resource).toMillis();
+	                    if ((contentLength >= 0) || (lastModified >= 0)) {
+	                        return "W/\"" + contentLength + "-" +
+	                                   lastModified + "\"";
+	                    }
+					}
+					catch(IOException ioe) {
+						LOG.log(Level.ERROR, "Failed to generate etag.", ioe);
+					}
+					return null;
+				}
+				else
+					return generateETag(parent, resource);
+			}
 		}
 	}
 
@@ -2768,10 +2945,47 @@ public class UHTTPD {
 
 		abstract TunnelWireProtocol create(String host, int port, Client client) throws IOException;
 	}
+	
+	public interface WebContextBuilder<T extends WebContextBuilder<T, C>, C extends Context> {
 
-	private static class AbstractWebContextBuilder<T extends AbstractWebContextBuilder<T>> {
+		T chain(Handler... handlers);
+
+		T classpathResources(String regexpWithGroups, Handler... handler);
+
+		T classpathResources(String regexpWithGroups, String prefix, Handler... handler);
+
+		T context(Handler... handlers);
+
+		T delete(String regexp, Handler... handler);
+
+		T fileResources(String regexpWithGroups, Path root, Handler... handler);
+
+		T get(String regexp, Handler... handler);
+
+		T handle(HandlerSelector selector, Handler... handler);
+
+		T handle(String regexp, Handler... handler);
+
+		T post(String regexp, Handler... handler);
+
+		T status(Status status, Handler handler);
+
+		T tunnel(TunnelHandler handler);
+		
+		T withETagGenerator(Function<Path, String> etagCalculator);
+
+		T webSocket(String regexp, WebSocketHandler handler);
+
+		T withClasspathResources(String regexpWithGroups, Optional<ClassLoader> loader, String prefix,
+				Handler... handler);
+
+		C build() throws IOException;
+	}
+
+	private static abstract class AbstractWebContextBuilder<T extends AbstractWebContextBuilder<T, C>, C extends Context>  implements WebContextBuilder<T, C> {
 		Map<HandlerSelector, Handler> handlers = new LinkedHashMap<>();
 		Map<Status, Handler> statusHandlers = new LinkedHashMap<>();
+		Optional<Function<Path, String>> etagGenerator;
 
 		AbstractWebContextBuilder() {
 			statusHandlers.put(Status.INTERNAL_SERVER_ERROR, (tx) -> {
@@ -2779,6 +2993,13 @@ public class UHTTPD {
 					replace("__msg__", tx.error().map(e -> e.getMessage()).orElse("No message supplied.")).
 					replace("__trace__", tx.errorTrace().orElse("")));
 			});
+		}
+
+		@SuppressWarnings("unchecked")
+		@Override
+		public T withETagGenerator(Function<Path, String> etagGenerator) {
+			this.etagGenerator = Optional.of(etagGenerator);
+			return (T) this;
 		}
 
 		@SuppressWarnings("unchecked")
@@ -2959,7 +3180,7 @@ public class UHTTPD {
 				if(LOG.isLoggable(Level.DEBUG))
 					LOG.log(Level.DEBUG, "Path reduced from {0} to context {1} with path {2}", tx.path, ctxPath, resPath);
 				
-				tx.pushContext(ctxPath, resPath);
+				tx.pushContext(this, ctxPath, resPath);
 			}
 				
 			for (var c : handlers.entrySet()) {
@@ -3001,17 +3222,18 @@ public class UHTTPD {
 		DefaultResponder(Object response, Transaction tx) {
 			this.charset = tx.client.charset;
 			var needLength = tx.responseLength.isEmpty();
-			var needType = tx.outgoingContentType.isEmpty();
+			var needType = tx.responseType.isEmpty();
 			if(response instanceof Path) {
 				var path = (Path)response;
 				try {
-					response = Files.newInputStream(path);
+					//response = Files.newInputStream(path);
+					response = Files.newByteChannel(path);
 					if(needLength) {
 						tx.responseLength(Files.size(path));
 						needLength = false;
 					}
 					if(needType)
-						tx.outgoingContentType = Optional.of(getMimeType(path.toUri().toURL()));
+						tx.responseType = Optional.of(mimeType(path.toUri().toURL()));
 				}
 				catch(IOException ioe) {
 					throw new UncheckedIOException("Failed to responsd with file.", ioe);
@@ -3020,13 +3242,14 @@ public class UHTTPD {
 			else if(response instanceof File) {
 				var path = (File)response;
 				try {
-					response = new FileInputStream(path);
+					//response = new FileInputStream(path);
+					response = Files.newByteChannel(path.toPath());
 					if(needLength) {
 						tx.responseLength(path.length());
 						needLength = false;
 					}
 					if(needType)
-						tx.outgoingContentType = Optional.of(getMimeType(path.toURI().toURL()));
+						tx.responseType = Optional.of(mimeType(path.toURI().toURL()));
 				}
 				catch(IOException ioe) {
 					throw new UncheckedIOException("Failed to responsd with file.", ioe);
@@ -3053,15 +3276,25 @@ public class UHTTPD {
 
 		@Override
 		public void supply(ByteBuffer buf) throws IOException {
-			if(response instanceof ByteBuffer) {
+			if(response instanceof ReadableByteChannel) {
+				var chan = (ReadableByteChannel)response;
+				chan.read(buf);
+			}
+			else if(response instanceof ByteBuffer) {
 				var respBuff = (ByteBuffer)response;
 				if(respBuff.hasRemaining()) {
 					if(respBuff.remaining() > buf.remaining()) {
-						var p = respBuff.position();
-						respBuff.position(p + buf.remaining());
-						respBuff = respBuff.slice(p, buf.remaining());
+						var waslimit = respBuff.limit();
+						respBuff.limit(respBuff.position() + buf.remaining());
+						buf.put(respBuff);
+						buf.limit(waslimit);
+						
+//						var p = respBuff.position();
+//						respBuff.position(p + buf.remaining());
+//						respBuff = respBuff.slice(p, buf.remaining());
 					}
-					buf.put(respBuff);
+					else
+						buf.put(respBuff);
 				}
 			}
 			else if(response instanceof Reader) {
@@ -3118,7 +3351,7 @@ public class UHTTPD {
 		public void get(Transaction req) throws Exception {
 			LOG.log(Level.DEBUG, "File resource {0}", file);
 			req.responseLength(Files.size(file));
-			req.responseType(getMimeType(file.toUri().toURL()));
+			req.responseType(mimeType(file.toUri().toURL()));
 			req.response(Files.newInputStream(file));
 		}
 	}
@@ -3156,60 +3389,59 @@ public class UHTTPD {
 		}
 
 	}
-
-	private final static class GzipChannelWriter {
+	
+	
+	private final static class GZIPChannel implements WritableByteChannel {
 	    
 		static final int GZIP_MAGIC = 0x8b1f;
 	    static final byte OS_UNKNOWN = (byte) 255;
 		
-		final Deflater def;
-	    final CRC32 crc = new CRC32();
-//	    long in;
+		private final Deflater def;
+		private final CRC32 crc = new CRC32();
+		private WritableByteChannel out;
+		private ByteBuffer buf;
 
-		GzipChannelWriter() {
-			def = new Deflater(Deflater.DEFAULT_COMPRESSION, true);
+		public GZIPChannel(WritableByteChannel out) {
+			this.out = out;
+			def = new Deflater(Deflater.BEST_SPEED, false);
+			def.setLevel(3);
 		}
 		
-		void reset() {
-			crc.reset();
-			def.reset();
+		@Override
+		public boolean isOpen() {
+			return out.isOpen();
 		}
-		
-		ByteBuffer write(ByteBuffer data) throws IOException {
-//			in += data.remaining();
+
+		@Override
+		public void close() throws IOException {
+			out.close();
+		}
+
+		@Override
+		public int write(ByteBuffer data) throws IOException {
 			crc.update(data);
 			data.flip();
 			return deflateBuffer(data);
 		}
 		
-//	    private ByteBuffer writeGzipTrailer() throws IOException {
-//	    	def.end();
-//	    	var totalIn = def.getTotalIn();
-//	    	var b=  ByteBuffer.allocate(8);
-//	    	b.order(ByteOrder.LITTLE_ENDIAN);
-//			b.putInt(totalIn);
-//	    	b.putInt((int)in);
-//	    	b.flip();
-//	    	return b;
-//	    }
-	    
-	    private ByteBuffer deflateBuffer(ByteBuffer data) {
+	    private int deflateBuffer(ByteBuffer data) throws IOException {
 			var outSize = data.remaining() + 1024;
-			var out = ByteBuffer.allocateDirect(outSize);
+			if(buf == null || buf.capacity() < outSize) {
+				buf = ByteBuffer.allocateDirect(outSize);
+			}
+			else {
+				buf.clear();
+			}
 	        if (!def.finished()) {
 				def.setInput(data);
 	            while (!def.needsInput()) {
-	                def.deflate(out, Deflater.SYNC_FLUSH);
+	                def.deflate(buf, Deflater.SYNC_FLUSH);
 	            }
 	        }
-			out.flip();
-			return out;
+			buf.flip();
+			return this.out.write(buf);
 		}
 
-		private ByteBuffer writeGzipHeader() throws IOException {
-			return ByteBuffer.wrap(new byte[] { (byte) GZIP_MAGIC, (byte) (GZIP_MAGIC >> 8), Deflater.DEFLATED,
-					0, 0, 0, 0, 0, 0, OS_UNKNOWN });
-	    }
 	}
 
 	private static final class HTTPContent implements Content {
@@ -3428,6 +3660,7 @@ public class UHTTPD {
 		private final ServerSocketChannel sslServerSocket;
 		private final String threadName;
 		private final boolean daemon;
+		private final Set<Client> clients = Collections.synchronizedSet(new HashSet<>()); 
 
 		private Thread otherThread;
 		private Thread serverThread;
@@ -3529,9 +3762,9 @@ public class UHTTPD {
 		public void close() throws IOException {
 			if (!open)
 				throw new IOException("Already closed.");
-			LOG.log(Level.INFO, "Closing Mini HTTP server.");
+			LOG.log(Level.INFO, "Closing root HTTP context.");
 			open = false;
-			try {
+			try { 
 				if(serverSocket != null)
 					serverSocket.close();
 			} finally {
@@ -3539,6 +3772,10 @@ public class UHTTPD {
 					if(sslServerSocket != null)
 						sslServerSocket.close();
 				} finally {
+					synchronized(clients) {
+						while(!clients.isEmpty())
+							clients.iterator().next().close();
+					}
 					try {
 						join();
 					} catch (InterruptedException e) {
@@ -3570,7 +3807,7 @@ public class UHTTPD {
 							LOG.log(Level.DEBUG, "File not found. {0}", fnfe.getMessage());
 						tx.notFound();
 					} catch (Exception ise) {
-						LOG.log(Level.ERROR, "Request handling failed.", ise);
+						LOG.log(Level.ERROR, "Request handling failed. {0}", ise);
 						tx.error(ise);
 					}
 
@@ -3601,21 +3838,21 @@ public class UHTTPD {
 	
 			if (serverSocket == null) {
 				/* HTTPS only */
-				runOn(sslServerSocket);
+				runOn(sslServerSocket, Scheme.HTTPS, httpsPort.get());
 			} else if (sslServerSocket == null) {
 				/* HTTP only */
-				runOn(serverSocket);
+				runOn(serverSocket, Scheme.HTTP, httpPort.get());
 			} else if (serverSocket != null && sslServerSocket != null) {
 				/* Both */
 				otherThread = new Thread(threadName + "SSL") {
 					@Override
 					public void run() {
-						runOn(serverSocket);
+						runOn(serverSocket, Scheme.HTTPS, httpsPort.get());
 					}
 				};
 				otherThread.setDaemon(true);
 				otherThread.start();
-				runOn(sslServerSocket);
+				runOn(sslServerSocket, Scheme.HTTP, httpPort.get());
 				try {
 					otherThread.join();
 				} catch (InterruptedException e) {
@@ -3636,11 +3873,11 @@ public class UHTTPD {
 			
 		}
 
-		private void runOn(ServerSocketChannel so) {
+		private void runOn(ServerSocketChannel so, Scheme scheme, int port) {
 			while (open) {
 				LOG.log(Level.DEBUG, "Waiting for connection");
 				try {
-					runner.run(new Client(so.accept(), this));
+					runner.run(new Client(port, scheme, so.accept(), this));
 				} catch(AsynchronousCloseException ace) {
 				} catch (Exception e) {
 					LOG.log(Level.ERROR, "Failed waiting for connection.", e);
@@ -4793,6 +5030,81 @@ public class UHTTPD {
 			}
 		}
 	}
+	
+	private static abstract class WebChannel implements WritableByteChannel {
+		
+		protected final Client client;
+		protected final WritableByteChannel delegate;
+		
+		WebChannel(Client client, WritableByteChannel delegate) {
+			this.client = client;
+			this.delegate = delegate;
+		}
+
+		@Override
+		public boolean isOpen() {
+			return delegate.isOpen();
+		}
+
+		@Override
+		public int write(ByteBuffer src) throws IOException {
+			return delegate.write(src);
+		}
+
+		@Override
+		public void close() throws IOException {
+			delegate.close();
+		}
+
+		protected void println() throws IOException {
+			newline();
+			if (LOG.isLoggable(Level.TRACE))
+				LOG.log(Level.TRACE, "HTTP OUT: <newline>");
+		}
+
+		protected void newline() throws IOException {
+			delegate.write(ByteBuffer.wrap("\r\n".getBytes()));
+		}
+
+		protected void print(Object text) throws IOException {
+			if (LOG.isLoggable(Level.TRACE))
+				LOG.log(Level.TRACE, "HTTP OUT: {0}", text);
+			delegate.write(ByteBuffer.wrap(text.toString().getBytes(client.charset())));
+		}
+
+		protected void println(Object text) throws IOException {
+			if (LOG.isLoggable(Level.TRACE))
+				LOG.log(Level.TRACE, "HTTP OUT: {0} <newline>", text);
+			delegate.write(ByteBuffer.wrap(text.toString().getBytes(client.charset())));
+			newline();
+		}
+	}
+	
+	private final static class ChunkedChannel extends WebChannel {
+
+		public ChunkedChannel(Client client, WritableByteChannel delegate) {
+			super(client, delegate);
+		}
+
+		@Override
+		public int write(ByteBuffer src) throws IOException {
+			if(LOG.isLoggable(Level.DEBUG))
+				LOG.log(Level.DEBUG, "Writing chunk of {0} bytes.", src.limit());
+			println(Integer.toHexString(src.limit()));
+			int res = delegate.write(src);
+			println();
+			return res;
+		}
+
+		@Override
+		public void close() throws IOException {
+			println("0"); // terminating chunk
+			println(); // end of chunking
+			super.close();
+		}
+		
+	}
+	
 	private final static class URLResource implements Handler {
 
 		private URL url;
@@ -4960,7 +5272,9 @@ public class UHTTPD {
             }
         }
         return null;
-    }private static String getMimeType(URL url) {
+    }
+    
+    public static String mimeType(URL url) {
 		try {
 			URLConnection conx = url.openConnection();
 			try {
@@ -4973,7 +5287,11 @@ public class UHTTPD {
 				}
 			}
 		} catch (IOException ioe) {
-			return URLConnection.guessContentTypeFromName(Paths.get(url.getPath()).getFileName().toString());
+			return mimeType(Paths.get(url.getPath()).getFileName().toString());
 		}
+	}
+
+	public static String mimeType(String fileName) {
+		return URLConnection.guessContentTypeFromName(fileName);
 	}
 }

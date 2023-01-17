@@ -44,6 +44,8 @@ public class UHTTPDTest {
 			}).
 			build()) {
 			httpd.start();
+			
+			//			
 			var client = client();
 			var req = HttpRequest.newBuilder().uri(URI.create("http://localhost:8080/calc.html?a=1&b=2")).GET().build();
 			var resp = client.send(req, BodyHandlers.ofString());
@@ -63,6 +65,8 @@ public class UHTTPDTest {
 			}).
 			build()) {
 			httpd.start();
+			
+			//
 			var client = client();
 			var req = HttpRequest.newBuilder().
 					uri(URI.create("http://localhost:8080/order.html")).
@@ -104,6 +108,8 @@ public class UHTTPDTest {
 				}).
 				build()) {
 				httpd.start();
+				
+				//
 				var client = client();
 				var req = HttpRequest.newBuilder().
 						uri(URI.create("http://localhost:8080/upload")).

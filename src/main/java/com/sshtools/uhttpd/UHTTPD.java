@@ -469,6 +469,8 @@ public class UHTTPD {
 	public interface Context extends Closeable, Handler {
 
 		String generateETag(Path resource);
+		
+		Path tmpDir();
 	}
 	
 	public final static class ContextBuilder extends AbstractWebContextBuilder<ContextBuilder, Context> {
@@ -2811,6 +2813,7 @@ public class UHTTPD {
 		protected final Map<Status, Handler> statusHandlers = new LinkedHashMap<>();
 		protected Optional<Function<Path, String>> etagGenerator;
 		protected AbstractContext parent;
+		protected final Path tmpDir;
 		
 		AbstractContext(AbstractWebContextBuilder<?, ?> b) {
 			handlers.putAll(b.handlers);
@@ -2822,6 +2825,17 @@ public class UHTTPD {
 					((AbstractContext)v).parent = this;
 				}
 			});
+			
+			try {
+				tmpDir = b.tmpDir.orElse(Files.createTempDirectory("uhttpd"));
+			} catch (IOException e) {
+				throw new UncheckedIOException("Failed to create temporary directory.", e);
+			}
+		}
+
+		@Override
+		public Path tmpDir() {
+			return tmpDir;
 		}
 
 		@Override
@@ -2987,6 +3001,8 @@ public class UHTTPD {
 
 		T withClasspathResources(String regexpWithGroups, Optional<ClassLoader> loader, String prefix,
 				Handler... handler);
+		
+		T withTmpDir(Path tmpDir);
 
 		C build() throws IOException;
 	}
@@ -2995,6 +3011,7 @@ public class UHTTPD {
 		Map<HandlerSelector, Handler> handlers = new LinkedHashMap<>();
 		Map<Status, Handler> statusHandlers = new LinkedHashMap<>();
 		Optional<Function<Path, String>> etagGenerator;
+		Optional<Path> tmpDir = Optional.empty();
 
 		AbstractWebContextBuilder() {
 			statusHandlers.put(Status.INTERNAL_SERVER_ERROR, (tx) -> {
@@ -3100,6 +3117,13 @@ public class UHTTPD {
 		public T webSocket(String regexp, WebSocketHandler handler) {
 			return handle(new CompoundSelector(new MethodSelector(Method.GET), new RegularExpressionSelector(regexp)),
 					handler);
+		}
+
+		@SuppressWarnings("unchecked")
+		@Override
+		public T withTmpDir(Path tmpDir) {
+			this.tmpDir = Optional.of(tmpDir);
+			return (T)this;
 		}
 
 		@SuppressWarnings("unchecked")

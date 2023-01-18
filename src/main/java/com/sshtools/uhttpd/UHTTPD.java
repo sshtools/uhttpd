@@ -368,7 +368,7 @@ public class UHTTPD {
 		 * A convenience method to get a part that is a piece of {@link FormData} given it's name, throwing
 		 * an exception if there is no such part.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as a stream
+		 * This cannot be used if the content has already been retrieved as a stream, channel
 		 * or parts.
 		 *
 		 * @param name name
@@ -381,7 +381,7 @@ public class UHTTPD {
 		 * A convenience method to get a part that is a {@link Named} given it's name, throwing
 		 * an exception if there is no such part.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as a stream
+		 * This cannot be used if the content has already been retrieved as a stream, channel
 		 * or parts.
 		 *
 		 * @param name name
@@ -394,7 +394,7 @@ public class UHTTPD {
 		/**
 		 * Get all of the {@link Part}s that make up this content.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as a stream
+		 * This cannot be used if the content has already been retrieved as a stream, channel
 		 * or a named part.
 		 *
 		 * @return parts
@@ -404,12 +404,22 @@ public class UHTTPD {
 		/**
 		 * Get the entire content as a stream.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as parts
+		 * This cannot be used if the content has already been retrieved as a channel, parts
 		 * or name parts.
 		 *
 		 * @return as stream
 		 */
 		InputStream asStream();
+
+		/**
+		 * Get the entire content as a channel.
+		 * <p>
+		 * This cannot be used if the content has already been retrieved as a stream, parts
+		 * or name parts.
+		 *
+		 * @return as stream
+		 */
+		ReadableByteChannel asChannel();
 
 		/**
 		 * Get the overall content type (i.e. <code>Content-Type</strong> header) of this
@@ -3492,6 +3502,7 @@ public class UHTTPD {
 		private boolean asNamedParts;
 		private boolean asParts;
 		private boolean asStream;
+		private boolean asChannel;
 		private List<Part> parts;
 
 		private HTTPContent(Transaction tx) {
@@ -3500,7 +3511,7 @@ public class UHTTPD {
 
 		@Override
 		public Iterable<Part> asParts() {
-			if (asStream || asNamedParts) {
+			if (asStream || asNamedParts || asChannel) {
 				throw new IllegalStateException("Already have content as stream or named parts.");
 			}
 			asParts = true;
@@ -3509,10 +3520,18 @@ public class UHTTPD {
 
 		@Override
 		public InputStream asStream() {
-			if (asParts || asNamedParts)
+			if (asParts || asNamedParts || asChannel)
 				throw new IllegalStateException("Already have content as named or iterated parts.");
 			asStream = true;
 			return Channels.newInputStream(tx.client.channel());
+		}
+
+		@Override
+		public ReadableByteChannel asChannel() {
+			if (asParts || asNamedParts || asStream)
+				throw new IllegalStateException("Already have content as named or iterated parts.");
+			asChannel = true;
+			return tx.client.channel();
 		}
 
 		@Override

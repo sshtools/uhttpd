@@ -55,6 +55,21 @@ This will run a server in the foreground on `localhost:8080`. Point your browser
  * It will not support non-programmatic configuration (although an extension could).
  * It will not allow configuration change at runtime.
  * It will not use non-blocking IO framework. 
+ 
+## Setup
+
+Now in Maven Central, so to add to your project just include this single dependency (adjust for other build systems that use Maven repositories).
+
+```xml
+	
+<dependency>
+	<groupId>com.sshtools</groupId>
+	<artifactId>uhttpd</artifactId>
+	<version>0.0.1</version>
+</dependency>
+```
+
+Snapshot versions are in the [Sonatype OSS Snapshot Repository](https://oss.sonatype.org/content/repositories/snapshots/).
 
 ## More Examples
 

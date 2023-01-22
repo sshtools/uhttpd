@@ -36,12 +36,14 @@ This will run a server in the foreground on `localhost:8080`. Point your browser
  * CONNECT tunnels.
  * Multiple contexts.
  * Can work with [fibers](https://www.infoworld.com/article/3652596/project-loom-understand-the-new-java-concurrency-model.html).
+ * Great for unit / integration testing.
  
 ### WIP
 
  * Full JavaDoc.
  * Compression (content and websocket extension).
  * Chunking (output done).
+ * Tests
  
 ### TODO
 

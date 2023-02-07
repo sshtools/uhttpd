@@ -23,8 +23,11 @@ import java.io.Closeable;
 import java.io.EOFException;
 import java.io.File;
 import java.io.FileNotFoundException;
+import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.io.PrintWriter;
 import java.io.Reader;
 import java.io.StringReader;
@@ -47,6 +50,7 @@ import java.net.URL;
 import java.net.URLConnection;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.CharBuffer;
 import java.nio.channels.AsynchronousCloseException;
 import java.nio.channels.ByteChannel;
@@ -82,6 +86,7 @@ import java.util.Arrays;
 import java.util.Base64;
 import java.util.Calendar;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -102,8 +107,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.zip.CRC32;
 import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
 import java.util.zip.Inflater;
 
 import javax.net.ssl.KeyManagerFactory;
@@ -368,7 +376,7 @@ public class UHTTPD {
 	 * Represents the content sent from the client, e.g.
 	 * a form submission. Content is made up of multiple {@link Part}s.
 	 */
-	public interface Content {
+	public interface Content extends Closeable {
 		/**
 		 * Get the entire content as a channel.
 		 * <p>
@@ -775,33 +783,106 @@ public class UHTTPD {
 		private final Optional<String> contentType;
 		private final Optional<String> filename;
 		private final String name;
-		private final Optional<InputStream> content;
+		private final MultipartBoundaryStream content;
 		private final Charset charset;
-		private Optional<String> value = Optional.empty();
-		private boolean valueRead;
+		private Path storedContent;
+		private FilterInputStream filter;
 
-		FormData(String contentType, Charset charset, String contentDisposition, InputStream content) {
+		FormData(String contentType, Charset charset, String contentDisposition, MultipartBoundaryStream content) {
 			Map<String, Named> map = contentDisposition == null ? Collections.emptyMap() : Named.parseSeparatedStrings(contentDisposition);
 			this.name = map.get("name").asString();
 			this.charset = charset;
-			this.content = Optional.ofNullable(content);
+			this.content = content;
 			this.contentType = Optional.ofNullable(contentType);
 			this.filename = Optional.ofNullable(map.get("filename")).map(n -> n.asString());
 		}
 		
 		@Override
+		public void close() {
+			if(storedContent != null) {
+				try {
+					Files.delete(storedContent);
+				} catch (IOException e) {
+					throw new UncheckedIOException(e);
+				} finally {
+					storedContent = null;
+				}
+			}
+		}
+
+		@Override
+		public void satisfy() throws IOException {
+			TextPart.super.satisfy();
+			asStream().transferTo(OutputStream.nullOutputStream());
+		}
+
+		@Override
+		public boolean satisfied() {
+			return content == null || content.state == com.sshtools.uhttpd.UHTTPD.MultipartBoundaryStream.State.END;
+		}
+
+		@Override
 		public final ReadableByteChannel asChannel() {
-			return content.map(m -> Channels.newChannel(m)).orElseThrow();
+			return Channels.newChannel(asStream());
 		}
 
 		@Override
 		public final Reader asReader() {
-			return Channels.newReader(asChannel(), charset());
+			return new InputStreamReader(asStream(), charset());
 		}
 
 		@Override
 		public InputStream asStream() {
-			return content.orElseThrow();
+			if(storedContent == null) {
+				if(filter == null) {
+					try {
+						storedContent = Files.createTempFile("uhttpd", ".part");
+						var out = Files.newOutputStream(storedContent);
+						return filter = new FilterInputStream(content) {
+							@Override
+							public int read() throws IOException {
+								var r = super.read();
+								if(r != -1) {
+									out.write(r);
+								}
+								return r;
+							}
+		
+							@Override
+							public int read(byte[] b, int off, int len) throws IOException {
+								var r = super.read(b, off, len);
+								if(r != -1) {
+									out.write(b, off, r);
+								}
+								return r;
+							}
+	
+							@Override
+							public void close() throws IOException {
+								try {
+									super.close();
+								}
+								finally {
+									out.close();
+								}
+							}
+						};
+					}
+					catch(IOException ioe) {
+						throw new UncheckedIOException(ioe);
+					}
+				}
+				else {
+					return filter;
+				}
+			}
+			else {
+				try {
+					return Files.newInputStream(storedContent);
+				} catch (IOException e) {
+					throw new UncheckedIOException(e);
+				}
+			}
 		}
 
 		public final Charset charset() {
@@ -834,15 +915,12 @@ public class UHTTPD {
 
 		@Override
 		public Optional<String> value() {
-			if(!valueRead) {
-				valueRead = true;
-				try {
-					value = Optional.of(new String(asStream().readAllBytes(), charset));
-				} catch (IOException e) {
-					throw new UncheckedIOException(e);
-				}
+			try(var stream = asStream()) {
+				return Optional.of(new String(stream.readAllBytes(), charset));
 			}
-			return value;
+			catch (IOException e) {
+				throw new UncheckedIOException(e);
+			}
 		}
 	}
 
@@ -1111,6 +1189,11 @@ public class UHTTPD {
 		public List<String> values() {
 			return Collections.unmodifiableList(values);
 		}
+
+		@Override
+		public boolean satisfied() {
+			return true;
+		}
 	}
 
 	public interface OnWebSocketClose {
@@ -1133,8 +1216,18 @@ public class UHTTPD {
 		void receive(String text, WebSocket websocket);
 	}
 	
-	public interface Part {
+	public interface Part extends Closeable {
 		String name();
+		
+		boolean satisfied();
+		
+		default void close() {
+		}
+		
+		default void satisfy() throws IOException {
+			if(satisfied())
+				throw new IllegalStateException("Already satisfied.");
+		}
 	}
 	
 	public enum Protocol {
@@ -1337,7 +1430,7 @@ public class UHTTPD {
 			return this;
 		}
 		
-		public RootContextBuilder witMaxUnchunkedSize(int maxUnchunkedSize) {
+		public RootContextBuilder withMaxUnchunkedSize(int maxUnchunkedSize) {
 			this.maxUnchunkedSize = maxUnchunkedSize;
 			return this;
 		}
@@ -1810,7 +1903,12 @@ public class UHTTPD {
 				var ce = headerOr(HDR_CONTENT_ENCODING);
 				var gzip = ce.isPresent() && ce.get().equals("gzip");
 				if(gzip) {
-					chan = new GZIPChannel(client, chan, StandardOpenOption.READ);
+					try {
+						chan = (ByteChannel) Channels.newChannel(new GZIPInputStream(Channels.newInputStream(chan)));
+					} catch (IOException e) {
+						throw new UncheckedIOException(e);
+					}
+//					chan = new GZIPChannel(client, chan, StandardOpenOption.READ);
 				}
 				content = new HTTPContent(this, chan);
 			}
@@ -2630,6 +2728,7 @@ public class UHTTPD {
 		protected Optional<Function<Path, String>> etagGenerator;
 		protected AbstractContext parent;
 		protected final Path tmpDir;
+		protected final boolean clearTmpDirOnClose;
 		
 		AbstractContext(AbstractWebContextBuilder<?, ?> b) {
 			handlers.putAll(b.handlers);
@@ -2641,11 +2740,22 @@ public class UHTTPD {
 					((AbstractContext)v).parent = this;
 				}
 			});
-			
+			clearTmpDirOnClose = b.tmpDir.isEmpty();
 			try {
 				tmpDir = b.tmpDir.orElse(Files.createTempDirectory("uhttpd"));
 			} catch (IOException e) {
 				throw new UncheckedIOException("Failed to create temporary directory.", e);
+			}
+		}
+
+		@Override
+		public void close() throws IOException {
+			if(clearTmpDirOnClose) {
+				try (var walk = Files.walk(tmpDir)) {
+				    walk.sorted(Comparator.reverseOrder())
+				        .map(Path::toFile)
+				        .forEach(File::delete);
+				}
 			}
 		}
 
@@ -3026,10 +3136,6 @@ public class UHTTPD {
 		}
 
 		@Override
-		public void close() throws IOException {
-		}
-
-		@Override
 		public void get(Transaction tx) throws Exception {
 
 			var matcher = pathPattern.matcher(tx.path().toString());
@@ -3304,19 +3410,48 @@ public class UHTTPD {
 	
 	
 	private final static class GZIPChannel extends WebChannel {
+
+	    private static final int GZIP_MAGIC = 0x8b1f;
+	    private static final byte OS_UNKNOWN = (byte) 255;
+		private static final int TRAILER_SIZE = 8;
 	    
+	    private CRC32 crc = new CRC32();
 		private Deflater def;
 		private Inflater inf;
 		private ByteBuffer buf;
 
 		public GZIPChannel(Client client, ByteChannel out, OpenOption... options) {
 			super(client, out, options);
+			crc.reset();
+		}
+
+		@Override
+		public void close() throws IOException {
+
+	        if (def != null && !def.finished()) {
+                def.finish();
+                while (!def.finished()) {
+                    int len = def.deflate(buf);
+                    if (len > 0) {
+                    	buf.flip();
+                    	delegate.write(buf);
+                    	buf.flip();
+                    }
+                }
+                // if we can't fit the trailer at the end of the last
+                // deflater buffer, we write it separately
+                writeTrailer();
+                def.end();
+	        }
+	        
+//            writeTrailer();
+			super.close();
 		}
 
 		@Override
 		public int read(ByteBuffer dst) throws IOException {
 			if(inf == null) {
-				inf = new Inflater(false);
+				inf = new Inflater(true);
 			}
 			
 			if(buf == null) {
@@ -3348,63 +3483,204 @@ public class UHTTPD {
 
 		@Override
 		public int write(ByteBuffer data) throws IOException {
+
+	        crc.update(data);
+	        data.flip();
+	        
 			if(def == null) {
-				def = new Deflater(Deflater.BEST_SPEED, false);
-				def.setLevel(3);
+				def = new Deflater(Deflater.BEST_SPEED, true);
+				writeHeader();
 			}
-			var outSize = data.remaining() + 1024;
+			var outSize = data.remaining() + MIN_GZIP_BUFFER;
 			if(buf == null || buf.capacity() < outSize) {
 				buf = ByteBuffer.allocateDirect(outSize);
 			}
 			else {
 				buf.clear();
 			}
+			
+			var t = 0;
 	        if (!def.finished()) {
 				def.setInput(data);
 	            while (!def.needsInput()) {
-	                def.deflate(buf, Deflater.SYNC_FLUSH);
+	                t += deflate();
 	            }
 	        }
-			buf.flip();
-			return this.delegate.write(buf);
+	        return t;
 		}
 
+		private int deflate() throws IOException {
+			var r = def.deflate(buf, Deflater.SYNC_FLUSH);
+			var t = 0;
+			if(r > 0) {
+				buf.flip();
+				t += this.delegate.write(buf);
+				buf.flip();
+			}
+			return t;
+		}
+
+	    /*
+	     * Writes GZIP member trailer to a byte array, starting at a given
+	     * offset.
+	     */
+	    private void writeTrailer() throws IOException {
+	    	var b = ByteBuffer.allocateDirect(TRAILER_SIZE);
+	    	b.order(ByteOrder.LITTLE_ENDIAN);
+	    	b.putInt((int)crc.getValue());
+	    	b.putInt((int)def.getTotalIn());
+	    	b.flip();
+			this.delegate.write(b);
+	    	
+//	    	var b  = new byte[TRAILER_SIZE];
+//	    	writeTrailer(b, 0);
+//			this.delegate.write(ByteBuffer.wrap(b));
+	    	
+	    }
+
+	    /*
+	     * Writes GZIP member trailer to a byte array, starting at a given
+	     * offset.
+	     */
+	    private void writeTrailer(byte[] buf, int offset) throws IOException {
+	        writeInt((int)crc.getValue(), buf, offset); // CRC-32 of uncompr. data
+	        writeInt(def.getTotalIn(), buf, offset + 4); // Number of uncompr. bytes
+	    }
+
+	    /*
+	     * Writes integer in Intel byte order to a byte array, starting at a
+	     * given offset.
+	     */
+	    private void writeInt(int i, byte[] buf, int offset) throws IOException {
+	        writeShort(i & 0xffff, buf, offset);
+	        writeShort((i >> 16) & 0xffff, buf, offset + 2);
+	    }
+
+	    /*
+	     * Writes short integer in Intel byte order to a byte array, starting
+	     * at a given offset
+	     */
+	    private void writeShort(int s, byte[] buf, int offset) throws IOException {
+	        buf[offset] = (byte)(s & 0xff);
+	        buf[offset + 1] = (byte)((s >> 8) & 0xff);
+	    }
+		
+		private void writeHeader() throws IOException {
+			this.delegate.write(ByteBuffer.wrap(
+		        new byte[] {
+		                      (byte) GZIP_MAGIC,        // Magic number (short)
+		                      (byte)(GZIP_MAGIC >> 8),  // Magic number (short)
+		                      Deflater.DEFLATED,        // Compression method (CM)
+		                      0,                        // Flags (FLG)
+		                      0,                        // Modification time MTIME (int)
+		                      0,                        // Modification time MTIME (int)
+		                      0,                        // Modification time MTIME (int)
+		                      0,                        // Modification time MTIME (int)
+		                      0,                        // Extra flags (XFLG)
+		                      OS_UNKNOWN                // Operating system (OS)
+		                  }));
+		 }
 	}
 
 	private static final class HTTP11WireProtocol extends WebChannel implements WireProtocol {
 		
-
-		
-		boolean close;
-		boolean chunk;
-		boolean gzip;
-		boolean headerResponse;
+		private boolean close;
+		private boolean chunk;
+		private boolean gzip;
+		private WritableByteChannel responseWriter;
+		private long responseLength;
+		private boolean useLength;
+		private boolean responseBigEnoughToCompress;
+		private boolean haveLength;
 
 		HTTP11WireProtocol(Client client) {
 			super(client, client.channel(), StandardOpenOption.READ, StandardOpenOption.WRITE);
+			reset();
 		}
 		
 		@Override
 		public WritableByteChannel responseWriter(Transaction tx) throws IOException {
-			if(!headerResponse)
-				respond(tx);
-			
-			var out = client.channel();
-			ByteChannel chan = new PsuedoCloseByteChannel() {
-				@Override
-				protected int writeImpl(ByteBuffer src) throws IOException {
-					var r = out.write(src);
-					client.waitForWrite();
-					return r;
+			if(responseWriter == null) {
+				calcResponseLengthAndType(tx);
+				var out = client.channel();
+				WritableByteChannel nioChan = new PsuedoCloseByteChannel() {
+					@Override
+					protected int writeImpl(ByteBuffer src) throws IOException {
+						var r = out.write(src);
+						client.waitForWrite();
+						return r;
+					}
+				}; 
+				
+				if(haveLength && responseLength < client.rootContext.maxUnchunkedSize) {
+					if(gzip) {
+						var buf = ByteBuffer.allocateDirect((int)(responseLength + MIN_GZIP_BUFFER));
+						WritableByteChannel bufchan = new ByteChannel() {
+	
+							boolean closed;
+							
+							@Override
+							public boolean isOpen() {
+								return !closed;
+							}
+							
+							@Override
+							public void close() throws IOException {
+								if(isOpen())  {
+									closed = true;
+									useLength = true;
+									responseLength = buf.position();
+									buf.flip();
+									calcChunkingAndClose(tx);
+									respondWithHeaders(tx);
+									nioChan.write(buf);
+									nioChan.close();
+								}
+							}
+							
+							@Override
+							public int write(ByteBuffer src) throws IOException {
+								var r = src.remaining();
+								buf.put(src);
+								return r;
+							}
+	
+							@Override
+							public int read(ByteBuffer dst) throws IOException {
+								throw new UnsupportedOperationException();
+							}
+						};
+						if(gzip) {
+							//bufchan = new GZIPChannel(client, bufchan, StandardOpenOption.WRITE);
+							bufchan = Channels.newChannel(new GZIPOutputStream(Channels.newOutputStream(bufchan), true));
+						}
+						return bufchan;
+					}
+					else {
+						calcChunkingAndClose(tx);
+						respondWithHeaders(tx);
+						return nioChan;
+					}
 				}
-			}; 
-			if(chunk) {
-				chan = new ChunkedChannel(client, chan, StandardOpenOption.WRITE);
+				else {
+					calcChunkingAndClose(tx);
+					respondWithHeaders(tx);
+					var chan = nioChan;
+					if(chunk) {
+						chan = new ChunkedChannel(client, (ByteChannel)chan, StandardOpenOption.WRITE);
+					}
+					if(gzip) {
+						chan = Channels.newChannel(new GZIPOutputStream(Channels.newOutputStream(chan), true));
+//						chan = new GZIPChannel(client, chan, StandardOpenOption.WRITE);
+					}
+					return chan;
+				}
 			}
-			if(gzip) {
-				chan = new GZIPChannel(client, chan, StandardOpenOption.WRITE);
+			else {
+				return responseWriter;
 			}
-			return chan;
+			
+			
 		}
 
 		@Override
@@ -3441,109 +3717,114 @@ public class UHTTPD {
 			}
 			var tx = new Transaction(uri, method, proto, client, writer(), delegate);
 			try {
-	
-				/* Read headers up to content */
-				while ((line = reader.readLine()) != null && !line.equals("")) {
-					if (LOG.isLoggable(Level.TRACE))
-						LOG.log(Level.TRACE, "HTTP IN: {0}", line);
-					var nvp = Named.parseHeader(line);
-					tx.incomingHeaders.put(nvp.name, nvp);
+				try {
+		
+					/* Read headers up to content */
+					while ((line = reader.readLine()) != null && !line.equals("")) {
+						if (LOG.isLoggable(Level.TRACE))
+							LOG.log(Level.TRACE, "HTTP IN: {0}", line);
+						var nvp = Named.parseHeader(line);
+						tx.incomingHeaders.put(nvp.name, nvp);
+					}
+		
+					close = !client.rootContext.keepAlive || Protocol.HTTP_1_1.compareTo(proto) > 0
+							|| tx.headersOr(HDR_CONNECTION).orElse(Named.EMPTY).expand(",").containsIgnoreCase("close");
+		
+					if (proto.compareTo(Protocol.HTTP_1_0) > 0) {
+						tx.headerOr(HDR_HOST).orElseThrow();
+					}
+					
+					tx.headersOr(HDR_COOKIE).ifPresent(c -> {
+						for(var val : c.values()) {
+							var spec = Named.parseSeparatedStrings(val);
+							for(var cookie : spec.values()) {
+								tx.incomingCookies.put(cookie.name(), cookie.asString());
+							}
+						}
+					});
+		
+					client.rootContext.get(tx);
+					
 				}
-	
-				close = !client.rootContext.keepAlive || Protocol.HTTP_1_1.compareTo(proto) > 0
-						|| tx.headersOr(HDR_CONNECTION).orElse(Named.EMPTY).expand(",").containsIgnoreCase("close");
-	
-				if (proto.compareTo(Protocol.HTTP_1_0) > 0) {
-					tx.headerOr(HDR_HOST).orElseThrow();
+				catch(Exception e) {
+					LOG.log(Level.ERROR, "Failed HTTP transaction.", e);
+					tx.error(e);
 				}
 				
-				tx.headersOr(HDR_COOKIE).ifPresent(c -> {
-					for(var val : c.values()) {
-						var spec = Named.parseSeparatedStrings(val);
-						for(var cookie : spec.values()) {
-							tx.incomingCookies.put(cookie.name(), cookie.asString());
+				while(true) {
+					var statusHandler = client.rootContext.statusHandlers.get(tx.code.orElse(Status.OK));
+					if(statusHandler == null) {
+						break;
+					}
+					else {
+						try {
+							statusHandler.get(tx);
+							break;
+						} catch (Exception e) {
+							LOG.log(Level.ERROR, "Status handler failed.", e);
+							tx.error(e);
 						}
 					}
-				});
-	
-				client.rootContext.get(tx);
+				}
 				
-			}
-			catch(Exception e) {
-				LOG.log(Level.ERROR, "Failed HTTP transaction.", e);
-				tx.error(e);
-			}
-			
-
-			while(true) {
-				var statusHandler = client.rootContext.statusHandlers.get(tx.code.orElse(Status.OK));
-				if(statusHandler == null) {
-					break;
+				if(tx.responseChannel == null) {
+					responseContent(tx);
 				}
-				else {
-					try {
-						statusHandler.get(tx);
-						break;
-					} catch (Exception e) {
-						LOG.log(Level.ERROR, "Status handler failed.", e);
-						tx.error(e);
-					}
-				}
+				
+				writer().flush();
+				if (close)
+					throw new EOFException();
+	
+				if (LOG.isLoggable(Level.DEBUG))
+					LOG.log(Level.DEBUG, "Exited transaction normally, setting socket timeout to {0}s", client.rootContext.keepAliveTimeoutSecs);
+				client.socket.socket().setSoTimeout(client.rootContext.keepAliveTimeoutSecs * 1000);
 			}
-			
-			if(!headerResponse) {
-				respond(tx);
+			finally {
+				if(tx.content != null)
+					tx.content.close();
 			}
-			
-			if(tx.responseChannel == null) {
-				responseContent(tx);
-			}
-			
-			writer().flush();
-			if (close)
-				throw new EOFException();
-
-			if (LOG.isLoggable(Level.DEBUG))
-				LOG.log(Level.DEBUG, "Exited transaction normally, setting socket timeout to {0}s", client.rootContext.keepAliveTimeoutSecs);
-			client.socket.socket().setSoTimeout(client.rootContext.keepAliveTimeoutSecs * 1000);
 		}
 
-		void reset() {
+		private void reset() {
 			close = true;
 			chunk = false;
 			gzip = false;
-			headerResponse = false;
+			responseWriter = null;
+			useLength = false;
+			haveLength = false;
+			responseLength = -1;
 		}
 		
-//		private void calcResponseLengthAndType(Transaction tx) {
-//			var responseLength = tx.responseLength;
-//			
-//			var responseBigEnoughToCompress = (responseLength.isEmpty() || (responseLength.get() >= client.rootContext.minGzipSize) ) ;
-//			gzip = responseBigEnoughToCompress && client.rootContext.gzip && tx.hasResponse() && tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) &&
-//					tx.outgoingHeaders.get(HDR_CONTENT_ENCODING).containsIgnoreCase("gzip");
-//			var lengthPresent = responseLength.isPresent();
-//			
-//			if(responseBigEnoughToCompress && client.rootContext.gzip && !tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) && tx.hasResponse()) {
-//				var ae = tx.headersOr(HDR_ACCEPT_ENCODING); 
-//				if(ae.isPresent() && ae.get().expand(",").containsIgnoreCase("gzip")) {
-//					gzip = true;
-//					lengthPresent = false;
-//				}
-//			} 
-//			
-//			if (!lengthPresent) {
-//				if(tx.protocol.compareTo(Protocol.HTTP_1_0) > 0 && tx.protocol.compareTo(Protocol.HTTP_2) < 0) {
-//					chunk = true;
-//				}
-//				else
-//					close = true;
-//			}
-//		}
+		private void calcResponseLengthAndType(Transaction tx) {
+			chunk = false;
+			haveLength = useLength = tx.responseLength.isPresent();
+			responseLength = useLength ? tx.responseLength.get() : -1;
+			responseBigEnoughToCompress = (!useLength || (responseLength >= client.rootContext.minGzipSize) ) ;
+			
+			// TODO gzip header might contain parameters for compression
+			gzip = responseBigEnoughToCompress && client.rootContext.gzip && tx.hasResponse() && tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) &&
+					tx.outgoingHeaders.get(HDR_CONTENT_ENCODING).containsIgnoreCase("gzip");
+			
+			if(responseBigEnoughToCompress && client.rootContext.gzip && !tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) && tx.hasResponse()) {
+				var ae = tx.headersOr(HDR_ACCEPT_ENCODING); 
+				if(ae.isPresent() && ae.get().expand(",").containsIgnoreCase("gzip")) {
+					gzip = true;
+					useLength = false;
+				}
+			} 
+		}
+		
+		private void calcChunkingAndClose(Transaction tx) {
+			if (!useLength) {
+				if(tx.protocol.compareTo(Protocol.HTTP_1_0) > 0 && tx.protocol.compareTo(Protocol.HTTP_2) < 0) {
+					chunk = true;
+				}
+				else
+					close = true;
+			}
+		}
 
-		private void respond(Transaction tx) throws IOException {
-			if(headerResponse)
-				throw new IllegalStateException("Headers already written.");
-			headerResponse = true;
+		private void respondWithHeaders(Transaction tx) throws IOException {
 			
 			var status = tx.code.orElse(Status.OK);
 			
@@ -3562,39 +3843,26 @@ public class UHTTPD {
 			if (LOG.isLoggable(Level.DEBUG) && !LOG.isLoggable(Level.TRACE))
 				LOG.log(Level.DEBUG, "HTTP OUT: {0} {1} {2}", tx.protocol().text(), status.code,
 						tx.responseText.orElse(status.getText()));
-
-			var responseLength = tx.responseLength;
-			
-			var responseBigEnoughToCompress = (responseLength.isEmpty() || (responseLength.get() >= client.rootContext.minGzipSize) ) ;
-			gzip = responseBigEnoughToCompress && client.rootContext.gzip && tx.hasResponse() && tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) &&
-					tx.outgoingHeaders.get(HDR_CONTENT_ENCODING).containsIgnoreCase("gzip");
-			var lengthPresent = responseLength.isPresent();
 			
 			if(responseBigEnoughToCompress && client.rootContext.gzip && !tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) && tx.hasResponse()) {
 				var ae = tx.headersOr(HDR_ACCEPT_ENCODING); 
 				if(ae.isPresent() && ae.get().expand(",").containsIgnoreCase("gzip")) {
 					w.print(HDR_CONTENT_ENCODING);
 					w.println(": gzip");
-					gzip = true;
-					lengthPresent = false;
 				}
 			} 
 			
-			if (lengthPresent) {
+			if (useLength) {
 				w.print(HDR_CONTENT_LENGTH);
 				w.print(": ");
-				w.print(responseLength.get());
+				w.print(responseLength);
 				w.println();
 			}
-			else {
-				// TEMP to force raw
-				if(tx.protocol.compareTo(Protocol.HTTP_1_0) > 0 && tx.protocol.compareTo(Protocol.HTTP_2) < 0) {
-					w.print(HDR_TRANSFER_ENCODING);
-					w.println(": chunked");
-					chunk = true;
-				}
-				else
-					close = true;
+
+			if(chunk) {
+				w.print(HDR_TRANSFER_ENCODING);
+				w.println(": chunked");
+				chunk = true;
 			}
 			
 			/*
@@ -3674,6 +3942,7 @@ public class UHTTPD {
 		private boolean asStream;
 		private boolean asChannel;
 		private List<Part> parts;
+		private Iterator<Part> partIterator;
 
 		private HTTPContent(Transaction tx, ReadableByteChannel input) {
 			this.tx = tx;
@@ -3716,18 +3985,20 @@ public class UHTTPD {
 				throw new IllegalStateException(
 						"Already have content as stream or iterated parts.");
 			}
-			var wasUninitialised = parts ==  null;
-			P foundPart = null;
+//			var wasUninitialised = parts ==  null;
+//			P foundPart = null;
 			for (var part : asPartsImpl(clazz)) {
 				if (part.name().equals(name)) {
-					if(!wasUninitialised)
-						return (Optional<P>) Optional.of(part);
-					else if(foundPart == null)
-						foundPart = (P)part;
+//					if(!wasUninitialised)
+//						return (Optional<P>) Optional.of(part);
+//					else if(foundPart == null)
+//						foundPart = (P)part;
+					return Optional.of(part);
 				}
 			}
 
-			return Optional.ofNullable(foundPart);
+//			return Optional.ofNullable(foundPart);
+			return Optional.empty();
 		}
 
 		@Override
@@ -3735,79 +4006,137 @@ public class UHTTPD {
 			return tx.headersOr(HDR_CONTENT_LENGTH).map(o -> o.asLong());
 		}
 
+		@Override
+		public void close() {
+			if(parts != null) {
+				parts.forEach(p -> p.close());
+			}
+		}
+
 		@SuppressWarnings("unchecked")
 		<P extends Part> Iterable<P> asPartsImpl(Class<P> partType) {
 			if (parts == null) {
+				/* If we have not started iterating yet */
 				parts = new ArrayList<>();
-				return new Iterable<>() {
+				return (Iterable<P>) createIterable(partType);
+			}
+			else if(partIterator == null) {
+				/* If we have finished iterating */
+				return (Iterable<P>) parts;
+			}
+			else {
+				/* We are part way through iterating */
+				return (Iterable<P>) new Iterable<P>() {
 					@Override
 					public Iterator<P> iterator() {
-						var it = iteratorImpl(new PsuedoCloseByteChannel() {
-							@Override
-							protected int readImpl(ByteBuffer dst) throws IOException {
-								return input.read(dst);
-							}
-							
-						});
-						return new Iterator<>() {
-							
-							private P item;
-
-							@Override
-							public boolean hasNext() {
-								checkNext();
-								return item != null;
-							}
-							
-							@Override
-							public P next() {
-								checkNext();
-								if(item == null)
-									throw new NoSuchElementException();
-								try {
-									if(LOG.isLoggable(Level.DEBUG))
-										LOG.log(Level.DEBUG, "Parsed part. {0}", item.name());
-									parts.add(item);
-									return item;
-								} finally {
-									item = null;
-								}
-							}
-
-							private void checkNext() {
-								if (item == null) {
-									while(it.hasNext()) {
-										Part i = it.next();
-										if(i.getClass().isAssignableFrom(partType)) {
-											item = (P)i;
-											break;
-										}
-									}
-								}
-							}
-						};
-					}
-
-					private Iterator<Part> iteratorImpl(ByteChannel input) {
-						var content = Named.parseSeparatedStrings(contentType().get());
-						var type = content.values().iterator().next();
-						switch (type.name()) {
-						case "multipart/form-data":
-							return new MultipartFormDataPartIterator(tx.client, input,
-									content.containsKey("boundary")
-											? content.get("boundary").asString()
-											: null,
-									size().orElse(Long.MAX_VALUE));
-						case "application/x-www-form-urlencoded":
-							return new URLEncodedFormDataPartIterator(tx.client, input,
-									size().orElse(Long.MAX_VALUE));
-						default:
-							throw new UnsupportedOperationException("Unknown content encoding.");
-						}
+						return (Iterator<P>) partIterator;
 					}
 				};
 			}
-			return (Iterable<P>) parts;
+		}
+
+		Iterator<Part> iteratorImpl(ByteChannel input) {
+			var content = Named.parseSeparatedStrings(contentType().get());
+			var type = content.values().iterator().next();
+			switch (type.name()) {
+			case "multipart/form-data":
+				return new MultipartFormDataPartIterator(tx.client, input,
+						content.containsKey("boundary")
+								? content.get("boundary").asString()
+								: null,
+						size().orElse(Long.MAX_VALUE));
+			case "application/x-www-form-urlencoded":
+				return new URLEncodedFormDataPartIterator(tx.client, input,
+						size().orElse(Long.MAX_VALUE));
+			default:
+				throw new UnsupportedOperationException("Unknown content encoding.");
+			}
+		}
+
+		<P extends Part> Iterable<P> createIterable(Class<P> partType) {
+			return new Iterable<>() {
+
+				@SuppressWarnings("unchecked")
+				@Override
+				public Iterator<P> iterator() {
+					var it = iteratorImpl(new PsuedoCloseByteChannel() {
+						@Override
+						protected int readImpl(ByteBuffer dst) throws IOException {
+							return input.read(dst);
+						}
+						
+					});
+					partIterator = (Iterator<Part>) partCapturingIterator(partType, it);
+					return (Iterator<P>)partIterator;
+				}
+			};
+		}
+
+		<P extends Part> Iterator<P> partCapturingIterator(Class<P> partType, Iterator<Part> it) {
+			return new Iterator<>() {
+				
+				private P item;
+				private P previousItem;
+
+				@Override
+				public boolean hasNext() {
+					checkNext();
+					return item != null;
+				}
+				
+				@Override
+				public P next() {
+					checkNext();
+					if(item == null)
+						throw new NoSuchElementException();
+					try {
+						if(LOG.isLoggable(Level.DEBUG))
+							LOG.log(Level.DEBUG, "Parsed part. {0}", item.name());
+						parts.add(item);
+						return item;
+					} finally {
+						previousItem = item;
+						item = null;
+					}
+				}
+
+				@SuppressWarnings("unchecked")
+				private void checkNext() {
+					if (item == null) {
+						/* TODO If the previous item did not read it's content,
+						 * then drain the content.
+						 * 
+						 * TODO Store it in memory (or disk) until all request handlers
+						 * are done with the part(s)
+						 * 
+						 * TODO will also need to drain content if no parts are iterated
+						 * over at all
+						 */
+						if(previousItem != null && !previousItem.satisfied()) {
+							try {
+								previousItem.satisfy();
+							} catch (IOException e) {
+								throw new UncheckedIOException(e);
+							} finally {
+								previousItem = null;
+							}
+						}
+						
+						
+						while(it.hasNext()) {
+							Part i = it.next();
+							if(i.getClass().isAssignableFrom(partType)) {
+								item = (P)i;
+								break;
+							}
+						}
+						
+						// After this point, take parts from the gathered list
+						if(item == null)
+							partIterator = null;  
+					}
+				}
+			};
 		}
 
 		private ReadableByteChannel channelImpl() {
@@ -4249,31 +4578,36 @@ public class UHTTPD {
 				throw new IOException("Already closed.");
 			LOG.log(Level.INFO, "Closing root HTTP context.");
 			open = false;
-			try { 
-				if(serverSocket != null)
-					serverSocket.close();
-			} finally {
-				try {
-					if(sslServerSocket != null)
-						sslServerSocket.close();
+			try {
+				try { 
+					if(serverSocket != null)
+						serverSocket.close();
 				} finally {
-					synchronized(clients) {
-						while(!clients.isEmpty())
-							clients.iterator().next().close();
-					}
 					try {
-						join();
-					} catch (InterruptedException e) {
+						if(sslServerSocket != null)
+							sslServerSocket.close();
 					} finally {
-						if (otherThread != null) {
-							try {
-								otherThread.join();
-							} catch (InterruptedException e) {
+						synchronized(clients) {
+							while(!clients.isEmpty())
+								clients.iterator().next().close();
+						}
+						try {
+							join();
+						} catch (InterruptedException e) {
+						} finally {
+							if (otherThread != null) {
+								try {
+									otherThread.join();
+								} catch (InterruptedException e) {
+								}
 							}
 						}
+						runner.close();
 					}
-					runner.close();
 				}
+			}
+			finally {
+				super.close();
 			}
 		}
 	
@@ -4292,7 +4626,7 @@ public class UHTTPD {
 							LOG.log(Level.DEBUG, "File not found. {0}", fnfe.getMessage());
 						tx.notFound();
 					} catch (Exception ise) {
-						LOG.log(Level.ERROR, "Request handling failed. {0}", ise);
+						LOG.log(Level.ERROR, "Request handling failed.", ise);
 						tx.error(ise);
 					}
 
@@ -5571,7 +5905,7 @@ public class UHTTPD {
 		BufferedReader reader() throws IOException {
 			if(reader == null) {
 				if(options.contains(StandardOpenOption.READ))
-					reader = new BufferedReader(Channels.newReader(delegate, HTTP_CHARSET_ENCODING));
+					reader = new BufferedReader(Channels.newReader(delegate, HTTP_CHARSET_ENCODING), client.rootContext.recvBufferSize);
 				else
 					throw new IllegalStateException("Channel is not for reading.");
 			}
@@ -5663,6 +5997,8 @@ public class UHTTPD {
     };
 
 	private static final Date DEFAULT_TWO_DIGIT_YEAR_START;
+	
+	private static final int MIN_GZIP_BUFFER = 1024;
 
 	public static final TimeZone GMT = TimeZone.getTimeZone("GMT");
 

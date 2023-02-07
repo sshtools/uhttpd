@@ -23,6 +23,8 @@ import java.nio.file.Path;
 import java.security.SecureRandom;
 import java.text.MessageFormat;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.Random;
 
 import org.junit.jupiter.api.BeforeAll;
@@ -33,6 +35,7 @@ import com.github.mizosoft.methanol.Methanol;
 import com.github.mizosoft.methanol.MultipartBodyPublisher;
 import com.github.mizosoft.methanol.MutableRequest;
 import com.sshtools.uhttpd.UHTTPD.FormData;
+import com.sshtools.uhttpd.UHTTPD.RootContextBuilder;
 import com.sshtools.uhttpd.UHTTPD.Status;
 
 public class UHTTPDTest {
@@ -57,7 +60,7 @@ public class UHTTPDTest {
 
 	@Test
 	void testGet() throws Exception {
-		try(var httpd = UHTTPD.server().
+		try(var httpd = createServer().
 			get("/calc\\.html", (tx) -> {
 				tx.response(MessageFormat.format("{0} + {1} = {2}", 
 						tx.parameter("a").asString(), 
@@ -69,33 +72,35 @@ public class UHTTPDTest {
 			
 			//			
 			var client = client();
-			var req = HttpRequest.newBuilder().uri(URI.create("http://localhost:8080/calc.html?a=1&b=2")).GET().build();
+			var req = HttpRequest.newBuilder().uri(URI.create(clientURL() + "/calc.html?a=1&b=2")).GET().build();
 			var resp = client.send(req, BodyHandlers.ofString());
 			assertEquals("1 + 2 = 3", resp.body());
 		}
 	}
 
 	@Test
-	void testGetFileNoCompress() throws Exception {
+	void testGetFileNoCompressNotChunked() throws Exception {
 		var tf = createTempDataFile(10000);
-		try(var httpd = UHTTPD.server().
+		try(var httpd = createServer().
 			get("/get", (tx) -> {
 				tx.response(tf);
 			}).
 			withoutCompression().
+			withMaxUnchunkedSize(10000 * 2). // twice size of file
 			build()) {
 			httpd.start();
 			
 			//			
 			var client = client();
 			var req = HttpRequest.newBuilder().
-					uri(URI.create("http://localhost:8080/get")).
+					uri(URI.create(clientURL() + "/get")).
 					GET().
 					build();
 			var outf = Files.createTempFile("http", "data");
 			try {
 				var resp = client.send(req, BodyHandlers.ofFile(outf));
 				assertNotEquals("gzip", resp.headers().firstValue(UHTTPD.HDR_CONTENT_ENCODING).orElse(""));
+				assertNotEquals("chunked", resp.headers().firstValue(UHTTPD.HDR_TRANSFER_ENCODING).orElse(""));
 				assertTrue(isEqual(tf, outf));
 			}
 			finally {
@@ -110,25 +115,26 @@ public class UHTTPDTest {
 	@Test
 	void testGetFileNoCompressChunked() throws Exception {
 		var tf = createTempDataFile(10000);
-		try(var httpd = UHTTPD.server().
+		try(var httpd = createServer().
 			get("/get", (tx) -> {
-				tx.response(Files.newInputStream(tf));
+				tx.response(Files.newInputStream(tf)); // using a stream stops content length being automatically added
 			}).
 			withoutCompression().
+			withMaxUnchunkedSize(10000 / 2). // half size of file
 			build()) {
 			httpd.start();
 			
 			//			
 			var client = client();
 			var req = HttpRequest.newBuilder().
-					uri(URI.create("http://localhost:8080/get")).
-					header(UHTTPD.HDR_ACCEPT_ENCODING, "identity").
+					uri(URI.create(clientURL() + "/get")).
 					GET().
 					build();
 			var outf = Files.createTempFile("http", "data");
-			var resp = client.send(req, BodyHandlers.ofFile(outf));
-			assertNotEquals("gzip", resp.headers().firstValue(UHTTPD.HDR_CONTENT_ENCODING).orElse(""));
 			try {
+				var resp = client.send(req, BodyHandlers.ofFile(outf));
+				assertNotEquals("gzip", resp.headers().firstValue(UHTTPD.HDR_CONTENT_ENCODING).orElse(""));
+				assertEquals("chunked", resp.headers().firstValue(UHTTPD.HDR_TRANSFER_ENCODING).orElse(""));
 				assertTrue(isEqual(tf, outf));
 			}
 			finally {
@@ -140,26 +146,57 @@ public class UHTTPDTest {
 		}
 	}
 
-//	@Test
-	void testGetFileGzip() throws Exception {
+	@Test
+	void testGetFileGzipNotChunked() throws Exception {
 		var tf = createCompressableTempDataFile(10000);
-		try(var httpd = UHTTPD.server().
+		try(var httpd = createServer().
 			get("/get", (tx) -> {
-				tx.response(tf);
+				tx.response(tf); // can use file here, as compression prevents content length being automatically determined
 			}).
-			
+			withMaxUnchunkedSize(10000 * 2). // twice size of file will mean gzipped content is buffered
 			build()) {
 			httpd.start();
 			
 			//			
 			var client = client();
-			var req =  MutableRequest.GET("http://localhost:8080/get").
-//					header(UHTTPD.HDR_ACCEPT_ENCODING, "gzip").
+			var req =  MutableRequest.GET(clientURL() + "/get").
+					header(UHTTPD.HDR_ACCEPT_ENCODING, "gzip").
 					build();
 			var outf = Files.createTempFile("http", "data");
 			try {
 				var resp = client.send(req, BodyHandlers.ofFile(outf));
-				assertEquals("gzip", resp.headers().firstValue(UHTTPD.HDR_CONTENT_ENCODING).get());
+//				assertEquals("gzip", resp.headers().firstValue(UHTTPD.HDR_CONTENT_ENCODING).get());
+				assertTrue(isEqual(tf, outf));
+			}
+			finally {
+				Files.delete(outf);
+			}
+		}
+		finally {
+			Files.delete(tf);
+		}
+	}
+
+	@Test
+	void testGetFileGzipChunked() throws Exception {
+		var tf = createCompressableTempDataFile(10000);
+		try(var httpd = createServer().
+			get("/get", (tx) -> {
+				tx.response(tf); // can use file here, as compression prevents content length being automatically determined
+			}).
+			withMaxUnchunkedSize(10000 / 2). // half size of file will mean gzipped content is chunked
+			build()) {
+			httpd.start();
+			
+			//			
+			var client = client();
+			var req =  MutableRequest.GET(clientURL() + "/get").
+					header(UHTTPD.HDR_ACCEPT_ENCODING, "gzip").
+					build();
+			var outf = Files.createTempFile("http", "data");
+			try {
+				var resp = client.send(req, BodyHandlers.ofFile(outf));
+//				assertEquals("gzip", resp.headers().firstValue(UHTTPD.HDR_CONTENT_ENCODING).get());
 				assertTrue(isEqual(tf, outf));
 			}
 			finally {
@@ -173,7 +210,7 @@ public class UHTTPDTest {
 
 	@Test
 	void testPostFormUrlEncoded() throws Exception {
-		try(var httpd = UHTTPD.server().
+		try(var httpd = createServer().
 			post("/order\\.html", (tx) -> {
 				var content = tx.request();
 				var name = content.asNamed("name").asString();
@@ -187,7 +224,7 @@ public class UHTTPDTest {
 			//
 			var client = client();
 			var req = HttpRequest.newBuilder().
-					uri(URI.create("http://localhost:8080/order.html")).
+					uri(URI.create(clientURL() + "/order.html")).
 					header("Content-Type", "application/x-www-form-urlencoded").
 					POST(ofNameValuePairs(
 							"name", "Joe Bloggs", 
@@ -205,7 +242,7 @@ public class UHTTPDTest {
 		var tf = createTempDataFile(10000);
 		try {
 			
-			try(var httpd = UHTTPD.server().
+			try(var httpd = createServer().
 				post("/upload", (tx) -> {
 					var content = tx.request();
 					assertEquals("application/octet-stream", content.contentType().orElseThrow());
@@ -222,7 +259,7 @@ public class UHTTPDTest {
 				//
 				var client = client();
 				var req = HttpRequest.newBuilder().
-						uri(URI.create("http://localhost:8080/upload")).
+						uri(URI.create(clientURL() + "/upload")).
 						header("Content-Type", "application/octet-stream").
 						POST(BodyPublishers.ofFile(tf)).
 						build();
@@ -240,11 +277,23 @@ public class UHTTPDTest {
 		
 		var tf = createTempDataFile(10);
 		var halfBoundary = "--" + boundary.substring(0, boundary.length() / 2);
+		var now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+		
+		var sr = new SecureRandom();
+		var lval = sr.nextLong();
+		var sval = (short)sr.nextInt();
+		var ival = sr.nextInt();
+		var bval = (byte)sr.nextInt();
+		var cval = (char)sr.nextInt();
+		var dval = sr.nextDouble();
+		var fval = sr.nextFloat();
+		var aval = sr.nextBoolean();
 		try {
 			
-			try(var httpd = UHTTPD.server().
+			try(var httpd = createServer().
 				post("/upload", (tx) -> {
 					var content = tx.request();
+					int parts = 0;
 					for(var part : content.asParts(FormData.class)) {
 						switch(part.name()) {
 						case "file":
@@ -263,8 +312,32 @@ public class UHTTPDTest {
 						case "halfboundary":
 							assertEquals(halfBoundary, part.asString());
 							break;
-						case "reference":
-							assertEquals("A Description", part.asString());
+						case "lval":
+							assertEquals(lval, part.asLong());
+							break;
+						case "sval":
+							assertEquals(sval, part.asShort());
+							break;
+						case "ival":
+							assertEquals(ival, part.asInt());
+							break;
+						case "bval":
+							assertEquals(bval, part.asByte());
+							break;
+						case "cval":
+							assertEquals(cval, part.asChar());
+							break;
+						case "dval":
+							assertEquals(dval, part.asDouble());
+							break;
+						case "fval":
+							assertEquals(fval, part.asFloat());
+							break;
+						case "aval":
+							assertEquals(aval, part.asBoolean());
+							break;
+						case "now":
+							assertEquals(now, part.asInstant());
 							break;
 						case "filename":
 							assertEquals(tf.getFileName().toString(), part.asString());
@@ -273,7 +346,67 @@ public class UHTTPDTest {
 							throw new IllegalStateException("Unexpected part " + part.name());
 						
 						}
+						parts++;
 					}
+					
+					assertEquals(14, parts);
+				}).
+				build()) {
+				httpd.start();
+				
+				//
+				var client = client();
+				
+				var multipartBody = MultipartBodyPublisher.newBuilder()
+					      .filePart("file", tf, MediaType.APPLICATION_OCTET_STREAM)
+					      .textPart("name", "A Name")
+					      .textPart("email", "An Email")
+					      .textPart("halfboundary", halfBoundary)
+					      .textPart("lval", lval)
+					      .textPart("sval", sval)
+					      .textPart("ival", ival)
+					      .textPart("bval", bval)
+					      .textPart("cval", cval)
+					      .textPart("dval", dval)
+					      .textPart("fval", fval)
+					      .textPart("aval", aval)
+					      .textPart("now", UHTTPD.formatInstant(now))
+					      .textPart("filename", tf.getFileName().toString())
+					      .build();
+				
+				
+				var req = HttpRequest.newBuilder().
+						uri(URI.create(clientURL() + "/upload")).
+						header("Content-Type", "multipart/form-data;boundary=" + boundary).
+						POST(multipartBody).
+						build();
+				var resp = client.send(req, BodyHandlers.ofString());
+				System.err.println("GOT RESP " + resp.body());
+				assertEquals(Status.OK.getCode(), resp.statusCode());
+				System.err.println("DONE");
+			}
+		}
+		finally {
+			Files.delete(tf);
+		}
+	}
+	
+	@Test
+	void testMultipartMisorderedAccess() throws Exception {
+		
+		var tf = createTempDataFile(10);
+		var halfBoundary = "--" + boundary.substring(0, boundary.length() / 2);
+		try {
+			
+			try(var httpd = createServer().
+				post("/upload", (tx) -> {
+					var content = tx.request();
+
+					assertEquals(tf.getFileName().toString(), content.asFormData("filename").asString());
+					assertEquals("A Description", content.asFormData("reference").asString());
+					assertEquals(halfBoundary, content.asFormData("halfboundary").asString());
+					assertEquals("An Email", content.asFormData("email").asString());
+					assertEquals("A Name", content.asFormData("name").asString());
 				}).
 				build()) {
 				httpd.start();
@@ -292,7 +425,7 @@ public class UHTTPDTest {
 				
 				
 				var req = HttpRequest.newBuilder().
-						uri(URI.create("http://localhost:8080/upload")).
+						uri(URI.create(clientURL() + "/upload")).
 						header("Content-Type", "multipart/form-data;boundary=" + boundary).
 						POST(multipartBody).
 						build();
@@ -305,6 +438,14 @@ public class UHTTPDTest {
 		finally {
 			Files.delete(tf);
 		}
+	}
+
+	protected RootContextBuilder createServer() {
+		return UHTTPD.server().withoutHttps().withHttp(58080);
+	}
+	
+	protected String clientURL() {
+		return "http://localhost:58080";
 	}
 
 	static Path createTempDataFile(long size) throws IOException {

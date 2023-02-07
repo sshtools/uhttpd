@@ -32,6 +32,7 @@ import org.junit.jupiter.api.Test;
 
 import com.github.mizosoft.methanol.MediaType;
 import com.github.mizosoft.methanol.Methanol;
+import com.github.mizosoft.methanol.Methanol.Builder;
 import com.github.mizosoft.methanol.MultipartBodyPublisher;
 import com.github.mizosoft.methanol.MutableRequest;
 import com.sshtools.uhttpd.UHTTPD.FormData;
@@ -49,10 +50,17 @@ public class UHTTPDTest {
 	}
 	
 	Methanol client() {
-		return Methanol.newBuilder()
+		Builder bldr = Methanol.newBuilder()
         .version(Version.HTTP_1_1)
         .followRedirects(Redirect.NORMAL)
-        .connectTimeout(Duration.ofSeconds(20))
+        .connectTimeout(Duration.ofSeconds(20));
+		
+		if(System.getProperty("uhttpd.test.timeouts", "true").equals("false")) {
+		     bldr.connectTimeout(Duration.ofSeconds(30));
+		     bldr.readTimeout(Duration.ofSeconds(30));
+		}
+		
+		return bldr
 //        .proxy(ProxySelector.of(new InetSocketAddress("proxy.example.com", 80)))
 //        .authenticator(Authenticator.getDefault())
         .build();

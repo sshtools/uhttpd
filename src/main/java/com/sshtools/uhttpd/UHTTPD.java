@@ -17,13 +17,14 @@ package com.sshtools.uhttpd;
 
 import static java.net.URLDecoder.decode;
 
-import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.EOFException;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FilterInputStream;
+import java.io.FilterReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -50,7 +51,6 @@ import java.net.URL;
 import java.net.URLConnection;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
-import java.nio.ByteOrder;
 import java.nio.CharBuffer;
 import java.nio.channels.AsynchronousCloseException;
 import java.nio.channels.ByteChannel;
@@ -107,12 +107,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
-import java.util.zip.CRC32;
-import java.util.zip.DataFormatException;
-import java.util.zip.Deflater;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
-import java.util.zip.Inflater;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
@@ -121,7 +117,7 @@ import javax.net.ssl.SSLSession;
 
 /**
  * Simple HTTP/HTTPS server, configured using a fluent API.
- * 
+ *
  * <pre>
  * public class SimpleServer {
  *	   public static void main(String[] args) throws Exception {
@@ -137,8 +133,7 @@ import javax.net.ssl.SSLSession;
 public class UHTTPD {
 
 	/**
-	 * Selector that just matches everything. All handlers will
-	 * be executed.
+	 * Selector that just matches everything. All handlers will be executed.
 	 */
 	public final static class AllSelector implements HandlerSelector {
 		@Override
@@ -148,23 +143,23 @@ public class UHTTPD {
 	}
 
 	/**
-	 * Something that provides a way to authenticate a given
-	 * {@link Credential} and provide a {@link Principal}.
+	 * Something that provides a way to authenticate a given {@link Credential} and
+	 * provide a {@link Principal}.
 	 */
 	public interface Authenticator<C extends Credential> {
 		/**
-		 *  Authenticate.
+		 * Authenticate.
 		 *
 		 * @param credential the gather credentials.
 		 * @return principal or empty if authentication failed
 		 */
 		Optional<Principal> authenticate(C credential);
 	}
-	
+
 	/**
 	 * Various operations may need a pre-created buffer to be filled. This interface
-	 * will be expected. 
-	 * 
+	 * will be expected.
+	 *
 	 */
 	public interface BufferFiller extends Closeable {
 		@Override
@@ -172,13 +167,14 @@ public class UHTTPD {
 		}
 
 		/**
-		 * Supply some more data. Upon invocation, the
-		 * byte buffer will be reset. If there is content, before exit 
-		 * it should NOT be {@link ByteBuffer#flip()}ped so that {@link ByteBuffer#position()} is greater than zero.
+		 * Supply some more data. Upon invocation, the byte buffer will be reset. If
+		 * there is content, before exit it should NOT be {@link ByteBuffer#flip()}ped
+		 * so that {@link ByteBuffer#position()} is greater than zero.
 		 * <p>
-		 * If there is no more content, the {@link ByteBuffer#position()} should be zero. So
-		 * if you just don't write anything to the buffer this will be the case.
-		 *   
+		 * If there is no more content, the {@link ByteBuffer#position()} should be
+		 * zero. So if you just don't write anything to the buffer this will be the
+		 * case.
+		 *
 		 * @param buffer buffer to fill
 		 * @throws IOException on error
 		 */
@@ -186,13 +182,13 @@ public class UHTTPD {
 	}
 
 	/**
-	 * Encapsulates a single HTTP connection. For every {@link SocketChannel}
-	 * there will be a single instance of this client. The public
-	 * API exposes methods to get at some of the lower level details.
+	 * Encapsulates a single HTTP connection. For every {@link SocketChannel} there
+	 * will be a single instance of this client. The public API exposes methods to
+	 * get at some of the lower level details.
 	 * <p>
-	 * The details of the HTTP protocol in use (e.g. HTTP 1.1,
-	 * WebSocket etc) are delegated to the {@link WireProtocol}. For
-	 * example {@link HTTP11WireProtocol}.
+	 * The details of the HTTP protocol in use (e.g. HTTP 1.1, WebSocket etc) are
+	 * delegated to the {@link WireProtocol}. For example
+	 * {@link HTTP11WireProtocol}.
 	 */
 	public static final class Client implements Runnable, Closeable {
 
@@ -206,7 +202,6 @@ public class UHTTPD {
 		WireProtocol wireProtocol;
 		Charset charset = Charset.defaultCharset();
 		Selector selector;
-		
 
 		Client(int port, Scheme scheme, SocketChannel socket, RootContextImpl rootContext) throws IOException {
 			this.port = port;
@@ -218,16 +213,16 @@ public class UHTTPD {
 			wireProtocol = new HTTP11WireProtocol(this);
 
 			var uchannel = underlyingChannel();
-			if(!(uchannel instanceof SelectableChannel) || !((SelectableChannel)uchannel).isBlocking()) {
+			if (!(uchannel instanceof SelectableChannel) || !((SelectableChannel) uchannel).isBlocking()) {
 				selector = Selector.open();
-				var selectionKey = ((SelectableChannel)uchannel).register(selector, SelectionKey.OP_WRITE);
-				selectionKey.attach((SelectableChannel)uchannel);
+				var selectionKey = ((SelectableChannel) uchannel).register(selector, SelectionKey.OP_WRITE);
+				selectionKey.attach(uchannel);
 			}
 		}
 
 		/**
 		 * Get the active character set.
-		 * 
+		 *
 		 * @return character set
 		 */
 		public final Charset charset() {
@@ -241,7 +236,7 @@ public class UHTTPD {
 		public final void close() throws IOException {
 			if (!closed) {
 				closed = true;
-				if(selector != null)
+				if (selector != null)
 					selector.close();
 				try {
 					socket.close();
@@ -293,23 +288,23 @@ public class UHTTPD {
 
 		/**
 		 * Get the scheme this connection is using.
-		 * 
+		 *
 		 * @return scheme
 		 */
-		public final  Scheme scheme() {
+		public final Scheme scheme() {
 			return scheme;
 		}
 
 		/**
-		 * Get the underlying protocol currently active. This may change as the connection is
-		 * upgraded to a WebSocket.
-		 * 
+		 * Get the underlying protocol currently active. This may change as the
+		 * connection is upgraded to a WebSocket.
+		 *
 		 * @return current wire protocol
 		 */
 		public final WireProtocol wireProtocol() {
 			return wireProtocol;
 		}
-		
+
 		final ByteChannel channel() {
 			return socket;
 		}
@@ -317,11 +312,10 @@ public class UHTTPD {
 		final int port() {
 			try {
 				var addr = socket.getLocalAddress();
-				if(addr instanceof InetSocketAddress) {
-					return ((InetSocketAddress)addr).getPort();
+				if (addr instanceof InetSocketAddress) {
+					return ((InetSocketAddress) addr).getPort();
 				}
-			}
-			catch(Exception e) {
+			} catch (Exception e) {
 				LOG.log(Level.TRACE, "Failed to get socket address.", e);
 			}
 			return port;
@@ -329,16 +323,15 @@ public class UHTTPD {
 
 		final ByteChannel underlyingChannel() {
 			var ch = channel();
-			if(ch instanceof SSL.SSLSocketChannel) {
-				return ((SSL.SSLSocketChannel)ch).getWrappedSocketChannel();
-			}
-			else {
+			if (ch instanceof SSL.SSLSocketChannel) {
+				return ((SSL.SSLSocketChannel) ch).getWrappedSocketChannel();
+			} else {
 				return ch;
 			}
 		}
 
 		final void waitForWrite() {
-			if(selector == null)
+			if (selector == null)
 				return;
 			try {
 				selector.select();
@@ -350,8 +343,8 @@ public class UHTTPD {
 	}
 
 	/**
-	 * Selector that executes a {@link Handler} if all {@link HandlerSelector}s
-	 * it contains match.
+	 * Selector that executes a {@link Handler} if all {@link HandlerSelector}s it
+	 * contains match.
 	 *
 	 */
 	public static final class CompoundSelector implements HandlerSelector {
@@ -373,52 +366,53 @@ public class UHTTPD {
 	}
 
 	/**
-	 * Represents the content sent from the client, e.g.
-	 * a form submission. Content is made up of multiple {@link Part}s.
+	 * Represents the content sent from the client, e.g. a form submission. Content
+	 * is made up of multiple {@link Part}s.
 	 */
 	public interface Content extends Closeable {
 		/**
 		 * Get the entire content as a channel.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as a stream, parts
-		 * or name parts.
+		 * This cannot be used if the content has already been retrieved as a stream,
+		 * parts or name parts.
 		 *
 		 * @return as stream
 		 */
 		ReadableByteChannel asChannel();
+
 		/**
-		 * A convenience method to get a part that is a piece of {@link FormData} given it's name, throwing
-		 * an exception if there is no such part.
+		 * A convenience method to get a part that is a piece of {@link FormData} given
+		 * it's name, throwing an exception if there is no such part.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as a stream, channel
-		 * or parts.
+		 * This cannot be used if the content has already been retrieved as a stream,
+		 * channel or parts.
 		 *
 		 * @param name name
 		 * @return form data.
 		 */
 		default FormData asFormData(String name) {
-			return formData(name).orElseThrow();
+			return ofFormData(name).orElseThrow();
 		}
 
 		/**
-		 * A convenience method to get a part that is a {@link Named} given it's name, throwing
-		 * an exception if there is no such part.
+		 * A convenience method to get a part that is a {@link Named} given it's name,
+		 * throwing an exception if there is no such part.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as a stream, channel
-		 * or parts.
+		 * This cannot be used if the content has already been retrieved as a stream,
+		 * channel or parts.
 		 *
 		 * @param name name
 		 * @return named.
 		 */
 		default Named asNamed(String name) {
-			return named(name).orElseThrow();
+			return ofNamed(name).orElseThrow();
 		}
 
 		/**
 		 * Get all of the {@link Part}s that make up this content.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as a stream, channel
-		 * or a named part.
+		 * This cannot be used if the content has already been retrieved as a stream,
+		 * channel or a named part.
 		 *
 		 * @return parts
 		 */
@@ -429,8 +423,8 @@ public class UHTTPD {
 		/**
 		 * Get all of the {@link Part}s of a certain type that make up this content.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as a stream, channel
-		 * or a named part.
+		 * This cannot be used if the content has already been retrieved as a stream,
+		 * channel or a named part.
 		 *
 		 * @param partType type
 		 * @return parts
@@ -440,59 +434,60 @@ public class UHTTPD {
 		/**
 		 * Get the entire content as a stream.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as a channel, parts
-		 * or name parts.
+		 * This cannot be used if the content has already been retrieved as a channel,
+		 * parts or name parts.
 		 *
 		 * @return as stream
 		 */
 		InputStream asStream();
 
 		/**
-		 * Get the overall content type (i.e. <code>Content-Type</strong> header) of this
-		 * content. Individual parts will have different content types.
+		 * Get the overall content type (i.e. <code>Content-Type</strong> header) of
+		 * this content. Individual parts will have different content types.
 		 *
 		 * @return content type
 		 */
 		Optional<String> contentType();
 
 		/**
-		 * A convenience method to get a part that is a piece of {@link FormData} given it's name.
+		 * A convenience method to get a part that is a piece of {@link FormData} given
+		 * it's name.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as a stream
-		 * or parts.
+		 * This cannot be used if the content has already been retrieved as a stream or
+		 * parts.
 		 *
 		 * @param name name
 		 * @return form data.
 		 */
-		default Optional<FormData> formData(String name) {
-			return part(name, FormData.class);
+		default Optional<FormData> ofFormData(String name) {
+			return ofPart(name, FormData.class);
 		}
 
 		/**
 		 * A convenience method to get a part that is a {@link Named} given it's name.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as a stream
-		 * or parts.
+		 * This cannot be used if the content has already been retrieved as a stream or
+		 * parts.
 		 *
 		 * @param name name
 		 * @return form data.
 		 */
-		default Optional<Named> named(String name) {
-			return part(name, Named.class);
+		default Optional<Named> ofNamed(String name) {
+			return ofPart(name, Named.class);
 		}
 
 		/**
 		 * Get a part given it's name and class.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as a stream
-		 * or parts.
+		 * This cannot be used if the content has already been retrieved as a stream or
+		 * parts.
 		 *
-		 * @param <P> type of part
-		 * @param name part name
+		 * @param <P>   type of part
+		 * @param name  part name
 		 * @param clazz class of part
 		 * @return part
 		 */
-		<P extends Part> Optional<P> part(String name, Class<P> clazz);
+		<P extends Part> Optional<P> ofPart(String name, Class<P> clazz);
 
 		/**
 		 * Get the size of this content if known.
@@ -501,22 +496,23 @@ public class UHTTPD {
 		 */
 		Optional<Long> size();
 	}
-	
+
 	public interface Context extends Closeable, Handler {
 
 		String generateETag(Path resource);
-		
+
 		Path tmpDir();
 	}
-	
+
 	public final static class ContextBuilder extends AbstractWebContextBuilder<ContextBuilder, Context> {
-		
+
 		private final String pathExpression;
 
 		ContextBuilder(String pathExpression) {
 			this.pathExpression = pathExpression;
 		}
 
+		@Override
 		public Context build() throws UnknownHostException, IOException {
 			return new ContextImpl(this);
 		}
@@ -524,79 +520,79 @@ public class UHTTPD {
 
 	public interface Cookie {
 		/**
-	     * Domain of this cookie
-	     *
-	     * @return domain of this cookie
-	     */
-	    Optional<String> domain();
-	
-	    /**
+		 * Domain of this cookie
+		 *
+		 * @return domain of this cookie
+		 */
+		Optional<String> domain();
+
+		/**
 		 * Explicit date and time when this cookie expires.
-		 * 
+		 *
 		 * @return cookie expires
 		 */
 		Optional<Instant> expires();
 
 		/**
-	     * HTTP usage only.
-	     */
-	    boolean httpOnly();
+		 * HTTP usage only.
+		 */
+		boolean httpOnly();
 
 		/**
-	     * The maximum age of this cook in seconds.
-	     *
-	     * @return the maximum age of this cookie
-	     */
-	    Optional<Long> maxAge();
-	
-	    /**
-	     * Returns the name of this cookie.
-	     *
-	     * @return The name of this cookie
-	     */
-	    String name();
-	
-	    /**
-	     * Path of this cookie
-	     *
-	     * @return path of this cookie
-	     */
-	    Optional<String> path();
-	
-	    /**
-	     * Returns the value of "SameSite" for this cookie
-	     * 
-	     * @return same site of this cookie
-	     */
-	    Optional<SameSite> sameSite();
-	
-	    /**
-	     * Get if this cookie is secure.
-	     *
-	     * @return secure cookie
-	     */
-	    boolean secure();
-	
-	    /**
-	     * The value of this cookie.
-	     *
-	     * @return value of this cookie
-	     */
-	    String value();
-	
-	    /**
-	     * The version of cookie.
-	     */
-	    CookieVersion version();
-	
+		 * The maximum age of this cook in seconds.
+		 *
+		 * @return the maximum age of this cookie
+		 */
+		Optional<Long> maxAge();
+
+		/**
+		 * Returns the name of this cookie.
+		 *
+		 * @return The name of this cookie
+		 */
+		String name();
+
+		/**
+		 * Path of this cookie
+		 *
+		 * @return path of this cookie
+		 */
+		Optional<String> path();
+
+		/**
+		 * Returns the value of "SameSite" for this cookie
+		 *
+		 * @return same site of this cookie
+		 */
+		Optional<SameSite> sameSite();
+
+		/**
+		 * Get if this cookie is secure.
+		 *
+		 * @return secure cookie
+		 */
+		boolean secure();
+
+		/**
+		 * The value of this cookie.
+		 *
+		 * @return value of this cookie
+		 */
+		String value();
+
+		/**
+		 * The version of cookie.
+		 */
+		CookieVersion version();
+
 	}
-	
+
 	/**
 	 * Use to build {@link Cookie} instances for setting on responses.
 	 */
 
 	public final static class CookieBuilder {
-		
+
 		final String name;
 		CookieVersion version = CookieVersion.V1;
 		boolean secure;
@@ -606,145 +602,145 @@ public class UHTTPD {
 		Optional<String> domain = Optional.empty();
 		Optional<Long> maxAge = Optional.empty();
 		Optional<Instant> expires = Optional.empty();
-		Optional<SameSite> sameSite= Optional.empty();
-		
+		Optional<SameSite> sameSite = Optional.empty();
+
 		CookieBuilder(String name, String value) {
 			this.name = name;
 			this.value = value;
 		}
-		
+
 		public Cookie build() {
 			return new Cookie() {
-				
+
 				@Override
 				public Optional<String> domain() {
 					return domain;
 				}
-				
+
 				@Override
 				public Optional<Instant> expires() {
 					return expires;
 				}
-				
+
 				@Override
 				public boolean httpOnly() {
 					return httpOnly;
 				}
-				
+
 				@Override
 				public Optional<Long> maxAge() {
 					return maxAge;
 				}
-				
+
 				@Override
 				public String name() {
 					return name;
 				}
-				
+
 				@Override
 				public Optional<String> path() {
 					return path;
 				}
-				
+
 				@Override
 				public Optional<SameSite> sameSite() {
 					return sameSite;
 				}
-				
+
 				@Override
 				public boolean secure() {
 					return secure;
 				}
-				
+
 				@Override
 				public String toString() {
 					var b = new StringBuilder();
 					b.append(name);
 					b.append('=');
 					b.append(value);
-					path.ifPresent(p -> { 
+					path.ifPresent(p -> {
 						b.append("; Path=");
 						b.append(p);
 					});
-					domain.ifPresent(p -> { 
+					domain.ifPresent(p -> {
 						b.append("; Domain=");
 						b.append(p);
 					});
-					maxAge.ifPresent(p -> { 
+					maxAge.ifPresent(p -> {
 						b.append("; Max-Age=");
 						b.append(p);
 					});
-					expires.ifPresent(p -> { 
+					expires.ifPresent(p -> {
 						b.append("; Expires=");
 						var date = new Date(p.toEpochMilli());
 						b.append(formatDate(date));
 					});
-					if(secure) { 
+					if (secure) {
 						b.append("; Secure");
 					}
-					if(httpOnly) { 
+					if (httpOnly) {
 						b.append("; HttpOnly");
 					}
-					sameSite.ifPresent(p -> { 
+					sameSite.ifPresent(p -> {
 						b.append("; SameSite=");
 						b.append(Character.toUpperCase(p.name().charAt(0)) + p.name().substring(1).toLowerCase());
 					});
-					
+
 					return b.toString();
 				}
-				
+
 				@Override
 				public String value() {
 					return value;
 				}
-				
+
 				@Override
 				public CookieVersion version() {
 					return version;
 				}
 			};
 		}
-		
+
 		public CookieBuilder withDomain(String domain) {
 			this.domain = Optional.of(domain);
 			return this;
 		}
-		
+
 		public CookieBuilder withExpires(Date expires) {
 			this.expires = Optional.of(expires.toInstant());
 			return this;
 		}
-		
+
 		public CookieBuilder withExpires(Instant instant) {
 			this.expires = Optional.of(instant);
 			return this;
 		}
-		
+
 		public CookieBuilder withHttpOnly() {
 			this.httpOnly = true;
 			return this;
 		}
-		
+
 		public CookieBuilder withMaxAge(long maxAge) {
-			this.maxAge =  Optional.of(maxAge);
+			this.maxAge = Optional.of(maxAge);
 			return this;
 		}
-		
+
 		public CookieBuilder withPath(String path) {
 			this.path = Optional.of(path);
 			return this;
 		}
-		
+
 		public CookieBuilder withSameSite(SameSite sameSite) {
-			this.sameSite =  Optional.of(sameSite);
+			this.sameSite = Optional.of(sameSite);
 			return this;
 		}
-		
+
 		public CookieBuilder withSecure() {
 			this.secure = true;
 			return this;
 		}
-		
+
 		public CookieBuilder withVersion(CookieVersion version) {
 			this.version = version;
 			return this;
@@ -759,14 +755,12 @@ public class UHTTPD {
 	}
 
 	/**
-	 * Represents some piece of information that can be used to
-	 * authenticate a user.
+	 * Represents some piece of information that can be used to authenticate a user.
 	 */
 	public interface Credential {
 		/**
-		 * Turn this {@link Credential} into a {@link Principal}
-		 * if success its <code>true</code>, otherwise return an
-		 * empty {@link Optional}.
+		 * Turn this {@link Credential} into a {@link Principal} if success its
+		 * <code>true</code>, otherwise return an empty {@link Optional}.
 		 *
 		 * @param success whether authentication was successful or not
 		 * @return a principal or empty
@@ -775,8 +769,8 @@ public class UHTTPD {
 	}
 
 	/**
-	 * A {@link Part} that represents a piece form data, as
-	 * sent with a content type of <code>multipart/form-data</code>
+	 * A {@link Part} that represents a piece form data, as sent with a content type
+	 * of <code>multipart/form-data</code>
 	 */
 	public final static class FormData implements TextPart {
 
@@ -789,36 +783,13 @@ public class UHTTPD {
 		private FilterInputStream filter;
 
 		FormData(String contentType, Charset charset, String contentDisposition, MultipartBoundaryStream content) {
-			Map<String, Named> map = contentDisposition == null ? Collections.emptyMap() : Named.parseSeparatedStrings(contentDisposition);
+			Map<String, Named> map = contentDisposition == null ? Collections.emptyMap()
+					: Named.parseSeparatedStrings(contentDisposition);
 			this.name = map.get("name").asString();
 			this.charset = charset;
 			this.content = content;
 			this.contentType = Optional.ofNullable(contentType);
 			this.filename = Optional.ofNullable(map.get("filename")).map(n -> n.asString());
-		}
-		
-		@Override
-		public void close() {
-			if(storedContent != null) {
-				try {
-					Files.delete(storedContent);
-				} catch (IOException e) {
-					throw new UncheckedIOException(e);
-				} finally {
-					storedContent = null;
-				}
-			}
-		}
-
-		@Override
-		public void satisfy() throws IOException {
-			TextPart.super.satisfy();
-			asStream().transferTo(OutputStream.nullOutputStream());
-		}
-
-		@Override
-		public boolean satisfied() {
-			return content == null || content.state == com.sshtools.uhttpd.UHTTPD.MultipartBoundaryStream.State.END;
 		}
 
 		@Override
@@ -833,50 +804,46 @@ public class UHTTPD {
 
 		@Override
 		public InputStream asStream() {
-			if(storedContent == null) {
-				if(filter == null) {
+			if (storedContent == null) {
+				if (filter == null) {
 					try {
 						storedContent = Files.createTempFile("uhttpd", ".part");
 						var out = Files.newOutputStream(storedContent);
 						return filter = new FilterInputStream(content) {
 							@Override
+							public void close() throws IOException {
+								try {
+									super.close();
+								} finally {
+									out.close();
+								}
+							}
+
+							@Override
 							public int read() throws IOException {
 								var r = super.read();
-								if(r != -1) {
+								if (r != -1) {
 									out.write(r);
 								}
 								return r;
 							}
-		
+
 							@Override
 							public int read(byte[] b, int off, int len) throws IOException {
 								var r = super.read(b, off, len);
-								if(r != -1) {
+								if (r != -1) {
 									out.write(b, off, r);
 								}
 								return r;
 							}
-	
-							@Override
-							public void close() throws IOException {
-								try {
-									super.close();
-								}
-								finally {
-									out.close();
-								}
-							}
 						};
-					}
-					catch(IOException ioe) {
+					} catch (IOException ioe) {
 						throw new UncheckedIOException(ioe);
 					}
-				}
-				else {
+				} else {
 					return filter;
 				}
-			}
-			else {
+			} else {
 				try {
 					return Files.newInputStream(storedContent);
 				} catch (IOException e) {
@@ -889,9 +856,22 @@ public class UHTTPD {
 			return charset;
 		}
 
+		@Override
+		public void close() {
+			if (storedContent != null) {
+				try {
+					Files.delete(storedContent);
+				} catch (IOException e) {
+					throw new UncheckedIOException(e);
+				} finally {
+					storedContent = null;
+				}
+			}
+		}
+
 		/**
 		 * Get the content type of this part if known.
-		 * 
+		 *
 		 * @return content type
 		 */
 		public final Optional<String> contentType() {
@@ -899,9 +879,8 @@ public class UHTTPD {
 		}
 
 		/**
-		 * Get the filename of this part, if the part is a file
-		 * upload.
-		 * 
+		 * Get the filename of this part, if the part is a file upload.
+		 *
 		 * @return filename
 		 */
 		public final Optional<String> filename() {
@@ -914,36 +893,46 @@ public class UHTTPD {
 		}
 
 		@Override
-		public Optional<String> value() {
-			try(var stream = asStream()) {
+		public boolean satisfied() {
+			return content == null || content.state == com.sshtools.uhttpd.UHTTPD.MultipartBoundaryStream.State.END;
+		}
+
+		@Override
+		public void satisfy() throws IOException {
+			TextPart.super.satisfy();
+			asStream().transferTo(OutputStream.nullOutputStream());
+		}
+
+		@Override
+		public Optional<String> ofString() {
+			try (var stream = asStream()) {
 				return Optional.of(new String(stream.readAllBytes(), charset));
-			}
-			catch (IOException e) {
+			} catch (IOException e) {
 				throw new UncheckedIOException(e);
 			}
 		}
 	}
 
 	/**
-	 * Interface to be implemented to handle any request received
-	 * by the server. {@link Handler} is fundamental to UHTTPD.
+	 * Interface to be implemented to handle any request received by the server.
+	 * {@link Handler} is fundamental to UHTTPD.
 	 */
 	public interface Handler {
 		void get(Transaction req) throws Exception;
 	}
 
 	/**
-	 * A selector decides if a {@link Handler} applies
-	 * to a given {@link Transaction}, e.g. should a handler
-	 * handle a GET request for a certain URI.
+	 * A selector decides if a {@link Handler} applies to a given
+	 * {@link Transaction}, e.g. should a handler handle a GET request for a certain
+	 * URI.
 	 */
 	public interface HandlerSelector {
 		boolean matches(Transaction request);
 	}
 
 	/**
-	 * Builds a {@link Handler} to support HTTP Basic Authentication.
-	 * See {@link UHTTPD#httpBasicAuthentication(Authenticator)}.
+	 * Builds a {@link Handler} to support HTTP Basic Authentication. See
+	 * {@link UHTTPD#httpBasicAuthentication(Authenticator)}.
 	 */
 	public final static class HttpBasicAuthenticationBuilder {
 
@@ -956,7 +945,7 @@ public class UHTTPD {
 
 		/**
 		 * Builds the handler.
-		 * 
+		 *
 		 * @return handler
 		 * @throws UnknownHostException
 		 * @throws IOException
@@ -997,7 +986,7 @@ public class UHTTPD {
 
 		/**
 		 * Set the realm to use.
-		 * 
+		 *
 		 * @param realm realm
 		 * @return this for chaining
 		 */
@@ -1011,13 +1000,13 @@ public class UHTTPD {
 	 * Constants for HTTP methods.
 	 */
 	public enum Method {
-		CONNECT, DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT, TRACE, COPY,
-		LOCK, MKCOL, MOVE, PROPFIND, PROPPATCH, UNLOCK
+		CONNECT, DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT, TRACE, COPY, LOCK, MKCOL, MOVE, PROPFIND, PROPPATCH,
+		UNLOCK
 	}
 
 	/**
-	 * Select a handler based on its {@link Transaction#method()}. If the
-	 * method matches, the handler will be executed.
+	 * Select a handler based on its {@link Transaction#method()}. If the method
+	 * matches, the handler will be executed.
 	 *
 	 */
 	public static final class MethodSelector implements HandlerSelector {
@@ -1131,7 +1120,6 @@ public class UHTTPD {
 					l.add(value);
 				}
 			}
-			
 
 			var namedMap = new LinkedHashMap<String, Named>();
 			map.forEach((k, v) -> {
@@ -1177,22 +1165,22 @@ public class UHTTPD {
 		}
 
 		@Override
+		public boolean satisfied() {
+			return true;
+		}
+
+		@Override
 		public String toString() {
 			return "Named [name=" + name + ", values=" + values + "]";
 		}
 
 		@Override
-		public Optional<String> value() {
+		public Optional<String> ofString() {
 			return values.isEmpty() ? Optional.empty() : Optional.of(values.get(0));
 		}
 
 		public List<String> values() {
 			return Collections.unmodifiableList(values);
-		}
-
-		@Override
-		public boolean satisfied() {
-			return true;
 		}
 	}
 
@@ -1215,21 +1203,30 @@ public class UHTTPD {
 	public interface OnWebSocketText {
 		void receive(String text, WebSocket websocket);
 	}
-	
+
 	public interface Part extends Closeable {
-		String name();
-		
-		boolean satisfied();
-		
+		ReadableByteChannel asChannel();
+
+		Reader asReader();
+
+		InputStream asStream();
+
+		String asString();
+
+		@Override
 		default void close() {
 		}
-		
+
+		String name();
+
+		boolean satisfied();
+
 		default void satisfy() throws IOException {
-			if(satisfied())
+			if (satisfied())
 				throw new IllegalStateException("Already satisfied.");
 		}
 	}
-	
+
 	public enum Protocol {
 		HTTP_0, HTTP_1_0, HTTP_1_1, HTTP_2, HTTP_3;
 
@@ -1237,7 +1234,7 @@ public class UHTTPD {
 			return "HTTP/" + (name().substring(5).replace('_', '.'));
 		}
 	}
-	
+
 	/**
 	 * Select a {@link Handler} based on its {@link Transaction#path()}, i.e. URI.
 	 * If the URI matches, the handler will be executred.
@@ -1260,15 +1257,15 @@ public class UHTTPD {
 	}
 
 	public interface RootContext extends Context, Runnable {
-		
+
 		void join() throws InterruptedException;
-		
+
 		void start();
 	}
-	
+
 	/**
-	 * Builder to create a new instance of the main server,
-	 * an {@link UHTTPD} instance.
+	 * Builder to create a new instance of the main server, an {@link UHTTPD}
+	 * instance.
 	 */
 	public final static class RootContextBuilder extends AbstractWebContextBuilder<RootContextBuilder, RootContext> {
 		private int backlog = 10;
@@ -1290,19 +1287,19 @@ public class UHTTPD {
 		private Optional<Runner> runner = Optional.empty();
 		private Optional<Long> gzipMinSize = Optional.empty();
 		private int sendBufferSize = DEFAULT_BUFFER_SIZE;
-		private int recvBufferSize = DEFAULT_BUFFER_SIZE;
 		private Optional<KeyStore> keyStore = Optional.empty();
 		private int maxUnchunkedSize = 1024 * 512;
-		
+
 		public RootContextBuilder asDaemon() {
 			daemon = true;
 			return this;
 		}
 
+		@Override
 		public RootContext build() throws IOException {
 			return new RootContextImpl(this);
 		}
-		
+
 		public RootContextBuilder withBacklog(int backlog) {
 			this.backlog = backlog;
 			return this;
@@ -1327,7 +1324,7 @@ public class UHTTPD {
 			return this;
 		}
 
-		public RootContextBuilder withHttps() {			
+		public RootContextBuilder withHttps() {
 			return withHttps(8443);
 		}
 
@@ -1366,7 +1363,7 @@ public class UHTTPD {
 		}
 
 		public RootContextBuilder withKeyStore(KeyStore keyStore) {
-			this.keyStore  = Optional.of(keyStore);
+			this.keyStore = Optional.of(keyStore);
 			return this;
 		}
 
@@ -1385,8 +1382,13 @@ public class UHTTPD {
 			return this;
 		}
 
+		public RootContextBuilder withMaxUnchunkedSize(int maxUnchunkedSize) {
+			this.maxUnchunkedSize = maxUnchunkedSize;
+			return this;
+		}
+
 		public RootContextBuilder withMinCompressableSize(long gzipMinSize) {
-			this.gzipMinSize  = Optional.of(gzipMinSize);
+			this.gzipMinSize = Optional.of(gzipMinSize);
 			return this;
 		}
 
@@ -1415,23 +1417,13 @@ public class UHTTPD {
 			return this;
 		}
 
-		public RootContextBuilder withRecvBufferSize(int recvBufferSize) {
-			this.recvBufferSize = recvBufferSize;
-			return this;
-		}
-
 		public RootContextBuilder withRunner(Runner runner) {
 			this.runner = Optional.of(runner);
 			return this;
 		}
-		
+
 		public RootContextBuilder withSendBufferSize(int sendBufferSize) {
 			this.sendBufferSize = sendBufferSize;
-			return this;
-		}
-		
-		public RootContextBuilder withMaxUnchunkedSize(int maxUnchunkedSize) {
-			this.maxUnchunkedSize = maxUnchunkedSize;
 			return this;
 		}
 
@@ -1440,166 +1432,171 @@ public class UHTTPD {
 			return this;
 		}
 	}
-	
+
 	/**
-	 * The {@link Runner} interface provides access to the scheduler. Every 
-	 * HTTP connection access to at least one thread (a second thread may be
-	 * required for tunnelling). This action has been abstracted to allow
-	 * plugging in Fibres from project Loom when it is generally availabel. 
+	 * The {@link Runner} interface provides access to the scheduler. Every HTTP
+	 * connection access to at least one thread (a second thread may be required for
+	 * tunnelling). This action has been abstracted to allow plugging in Fibres from
+	 * project Loom when it is generally availabel.
 	 *
 	 */
 	public interface Runner extends Closeable {
-		
+
 		@Override
 		default void close() {
 		}
-		
+
 		/**
 		 * Run a task.
-		 * 
+		 *
 		 * @param runnable task
 		 * @throws Exception
 		 */
 		void run(Runnable runnable);
 	}
-	
+
 	/**
-	 * The "Same Site" attribute used by {@link Cookie} to 
-	 * mitigate CSRF attacks. Currently a draft. https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-07
+	 * The "Same Site" attribute used by {@link Cookie} to mitigate CSRF attacks.
+	 * Currently a draft.
+	 * https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-07
 	 */
 	public enum SameSite {
 		STRICT, LAX, NONE;
 	}
-	
+
 	public enum Scheme {
 		HTTP, HTTPS
 	}
-	
+
 	public enum Status {
-		CONTINUE(100, "Continue"), 
-		SWITCHING_PROTOCOLS(101, "Switching Protocols"), 
-		PROCESSING(102, "Processing"), 
-		OK(200, "OK"),  
-		CREATED(201, "Created"),  
-		ACCEPTED(202, "Accepted"),  
-		NON_AUTHORITATIVE_INFORMATION(203, "Non-Authoritative Information"),  
-		NO_CONTENT(204, "No Content"),
-		RESET_CONTENT(205, "Reset Content"),
-		PARTIAL_CONTENT(206, "Reset Content"),
-		MULTI_STATUS(207, "Multi-Status"),
-		MOVED_PERMANENTLY(301, "Moved Permanently"),
-		MOVED_TEMPORARILY(302, "Moved Temporarily"),
-		SEE_OTHER(303, "See Other"),
-		NOT_MODIFIED(304, "Not Modified"),
-		USE_PROXY(305, "Use Proxy"),
-		BAD_REQUEST(400, "Bad Request"),  
-		UNAUTHORIZED(401, "Unauthorized"),
-		PAYMENT_REQUIRED(402, "Payment Required"),
-		FORBIDDEN(403, "Forbidden"),
-		NOT_FOUND(404, "Not Found"),
-		METHOD_NOT_ALLOWED(405, "Method Not Allowed"),
-		NOT_ACCEPTABLE(406, "Not Acceptable"),
-		PROXY_AUTHENTICATION_REQUIRED(407, "Proxy Authentication Required"),
-		REQUEST_TIMEOUT(408, "Request Timeout"),
-		CONFLICT(409, "Conflict"),
-		GONE(410, "Gone"),
-		LEBNGTH_REQUIRED(411, "Length Required"),
-		PRECONDITION_FAILED(412, "Precondition Failed"),
-		REQUEST_ENTITY_TOO_LARGE(413, "Request Entity Too Large"),
-		REQUEST_URI_TOO_LONG(414, "Request-URI Too Long"),
-		UNSUPPORTED_MEDIA_TYPE(415, "Request-URI Too Long"),
-		UNPROCESSABLE_ENTITY(422, "Unprocessable Entity"),
-		LOCKED(423, "Locked"),
-		FAILED_DEPENDENCY(424, "Failed Dependency"),
-		INTERNAL_SERVER_ERROR(500, "Not Found"), 
-		NOT_IMPLEMENTED(501, "Not Implemented"),
-		BAD_GATEWAY(502, "Bad Gateway"),
-		SERVICE_UNAVAILABLE(503, "Service Unavailable"),
-		GATEWAY_TEIMOUT(504, "Gateway Timeout"),
+		CONTINUE(100, "Continue"), SWITCHING_PROTOCOLS(101, "Switching Protocols"), PROCESSING(102, "Processing"),
+		OK(200, "OK"), CREATED(201, "Created"), ACCEPTED(202, "Accepted"),
+		NON_AUTHORITATIVE_INFORMATION(203, "Non-Authoritative Information"), NO_CONTENT(204, "No Content"),
+		RESET_CONTENT(205, "Reset Content"), PARTIAL_CONTENT(206, "Reset Content"), MULTI_STATUS(207, "Multi-Status"),
+		MOVED_PERMANENTLY(301, "Moved Permanently"), MOVED_TEMPORARILY(302, "Moved Temporarily"),
+		SEE_OTHER(303, "See Other"), NOT_MODIFIED(304, "Not Modified"), USE_PROXY(305, "Use Proxy"),
+		BAD_REQUEST(400, "Bad Request"), UNAUTHORIZED(401, "Unauthorized"), PAYMENT_REQUIRED(402, "Payment Required"),
+		FORBIDDEN(403, "Forbidden"), NOT_FOUND(404, "Not Found"), METHOD_NOT_ALLOWED(405, "Method Not Allowed"),
+		NOT_ACCEPTABLE(406, "Not Acceptable"), PROXY_AUTHENTICATION_REQUIRED(407, "Proxy Authentication Required"),
+		REQUEST_TIMEOUT(408, "Request Timeout"), CONFLICT(409, "Conflict"), GONE(410, "Gone"),
+		LEBNGTH_REQUIRED(411, "Length Required"), PRECONDITION_FAILED(412, "Precondition Failed"),
+		REQUEST_ENTITY_TOO_LARGE(413, "Request Entity Too Large"), REQUEST_URI_TOO_LONG(414, "Request-URI Too Long"),
+		UNSUPPORTED_MEDIA_TYPE(415, "Request-URI Too Long"), UNPROCESSABLE_ENTITY(422, "Unprocessable Entity"),
+		LOCKED(423, "Locked"), FAILED_DEPENDENCY(424, "Failed Dependency"), INTERNAL_SERVER_ERROR(500, "Not Found"),
+		NOT_IMPLEMENTED(501, "Not Implemented"), BAD_GATEWAY(502, "Bad Gateway"),
+		SERVICE_UNAVAILABLE(503, "Service Unavailable"), GATEWAY_TEIMOUT(504, "Gateway Timeout"),
 		HTTP_VERSION_NOT_SUPPORTED(505, "HTTP Version Not Supported"),
 		INSUFFICIENT_STORAGE(507, "Insufficient Storage");
-	
+
 		private int code;
 		private String text;
-	
+
 		Status(int code, String text) {
 			this.code = code;
 			this.text = text;
 		}
-	
+
 		public int getCode() {
 			return code;
 		}
-	
+
 		public String getText() {
 			return text;
 		}
-	
+
 	}
 
 	public interface TextPart extends Part {
 
 		default BigDecimal asBigDecimal() {
-			return value().map(v -> new BigDecimal(v)).orElseThrow();
+			return ofString().map(v -> new BigDecimal(v)).orElseThrow();
 		}
 
 		default boolean asBoolean() {
-			return value().map(v -> Boolean.valueOf(v)).orElseThrow();
+			return ofString().map(v -> Boolean.valueOf(v)).orElseThrow();
 		}
 
 		default byte asByte() {
-			return value().map(v -> Byte.parseByte(v)).orElseThrow();
+			return ofString().map(v -> Byte.parseByte(v)).orElseThrow();
 		}
 
+		@Override
 		default ReadableByteChannel asChannel() {
 			return Channels.newChannel(asStream());
 		}
-
+		
 		default char asChar() {
-			return value().map(v -> v.charAt(0)).orElseThrow();
+			return ofChar().orElseThrow();
+		}
+		
+		default Optional<Character> ofChar() {
+			return ofString().map(v -> v.charAt(0));
 		}
 
 		default double asDouble() {
-			return value().map(v -> Double.parseDouble(v)).orElseThrow();
+			return ofDouble().orElseThrow();
+		}
+
+		default Optional<Double> ofDouble() {
+			return ofString().map(v -> Double.parseDouble(v));
 		}
 
 		default float asFloat() {
-			return value().map(v -> Float.parseFloat(v)).orElseThrow();
+			return ofFloat().orElseThrow();
+		}
+
+		default Optional<Float> ofFloat() {
+			return ofString().map(v -> Float.parseFloat(v));
 		}
 
 		default Instant asInstant() {
-			return value().map(v -> parseDate(v).toInstant()).orElseThrow();
+			return ofInstant().orElseThrow();
+		}
+
+		default Optional<Instant> ofInstant() {
+			return ofString().map(v -> parseDate(v).toInstant());
 		}
 
 		default int asInt() {
-			return value().map(v -> Integer.parseInt(v)).orElseThrow();
+			return ofInt().orElseThrow();
+		}
+
+		default Optional<Integer> ofInt() {
+			return ofString().map(v -> Integer.parseInt(v));
 		}
 
 		default long asLong() {
-			return value().map(v -> Long.parseLong(v)).orElseThrow();
+			return ofLong().orElseThrow();
 		}
 
+		default Optional<Long> ofLong() {
+			return ofString().map(v -> Long.parseLong(v));
+		}
+
+		@Override
 		default Reader asReader() {
 			return new StringReader(asString());
 		}
 
 		default short asShort() {
-			return value().map(v -> Short.parseShort(v)).orElseThrow();
+			return ofString().map(v -> Short.parseShort(v)).orElseThrow();
 		}
 
+		@Override
 		default InputStream asStream() {
 			return new ByteArrayInputStream(asString().getBytes());
 		}
 
+		@Override
 		default String asString() {
-			return value().orElseThrow();
-		}
-		
-		default boolean hasValue() {
-			return value().isPresent();
+			return ofString().orElseThrow();
 		}
 
-		Optional<String> value();
+		default boolean hasValue() {
+			return ofString().isPresent();
+		}
+
+		Optional<String> ofString();
 	}
 
 	public final static class ThreadPoolRunnerBuilder {
@@ -1608,7 +1605,7 @@ public class UHTTPD {
 		public Runner build() {
 			return new ThreadPoolRunner(threads);
 		}
-		
+
 		public ThreadPoolRunnerBuilder withThreads(int threads) {
 			this.threads = Optional.of(threads);
 			return this;
@@ -1649,7 +1646,8 @@ public class UHTTPD {
 		private final ByteChannel delegate;
 		private Content content;
 
-		Transaction(String pathSpec, Method method, Protocol protocol, Client client, Writer writer, ByteChannel delegate) {
+		Transaction(String pathSpec, Method method, Protocol protocol, Client client, Writer writer,
+				ByteChannel delegate) {
 			this.method = method;
 			this.delegate = delegate;
 			this.protocol = protocol;
@@ -1677,7 +1675,7 @@ public class UHTTPD {
 				queryString = Optional.of(pathSpec.substring(idx + 1));
 				parameters.putAll(Named.parseParameters(queryString.get()));
 			}
-			
+
 			fullContextPath = contextPath = Paths.get("/");
 			fullPath = contextPath.resolve(path);
 		}
@@ -1685,15 +1683,15 @@ public class UHTTPD {
 		public final void authenticate(Principal principal) {
 			this.principal = Optional.of(principal);
 		}
-		
+
 		public final boolean authenticated() {
 			return principal.isPresent();
 		}
-		
+
 		public final Client client() {
 			return client;
 		}
-		
+
 		public final Context context() {
 			return contexts.peek();
 		}
@@ -1713,20 +1711,20 @@ public class UHTTPD {
 		}
 
 		public final Transaction cookie(String name, String value) {
-			return cookie(UHTTPD.cookie(name,value).build());
+			return cookie(UHTTPD.cookie(name, value).build());
 		}
 
 		public final Optional<String> cookieOr(String name) {
 			return Optional.ofNullable(incomingCookies.get(name));
 		}
-		
+
 		public final Optional<Throwable> error() {
 			return error;
 		}
 
 		public final void error(Throwable ise) {
 			checkNotResponded();
-			this.error= Optional.of(ise);
+			this.error = Optional.of(ise);
 			responseCode(Status.INTERNAL_SERVER_ERROR);
 			if (ise.getMessage() != null)
 				responseText(ise.getMessage());
@@ -1755,15 +1753,15 @@ public class UHTTPD {
 		public final Path fullPath() {
 			return fullPath;
 		}
-		
+
 		public final boolean hasResponse() {
 			return responder.isPresent() || responseChannel != null;
 		}
-		
+
 		public final boolean hasResponseHeader(String name) {
 			return outgoingHeaders.containsKey(name);
 		}
-		
+
 		public final String header(String name) {
 			return headerOr(name).orElseThrow();
 		}
@@ -1775,7 +1773,7 @@ public class UHTTPD {
 		}
 
 		public final Optional<String> headerOr(String name) {
-			return headersOr(name).map(h -> h.value().get());
+			return headersOr(name).map(h -> h.ofString().get());
 		}
 
 		public final List<Named> headers() {
@@ -1801,13 +1799,13 @@ public class UHTTPD {
 			var idx = host.indexOf(':');
 			return idx == -1 ? host : host.substring(0, idx);
 		}
-		
+
 		public final int hostPort() {
 			var host = host();
 			var idx = host.indexOf(':');
 			return idx == -1 ? client.port() : Integer.parseInt(host.substring(idx + 1));
 		}
-		
+
 		public final List<String> matches() {
 			return Collections.unmodifiableList(matches);
 		}
@@ -1871,8 +1869,9 @@ public class UHTTPD {
 
 		public final Transaction redirect(Status status, String location) {
 			checkNotResponded();
-			if(status != Status.MOVED_PERMANENTLY && status != Status.MOVED_PERMANENTLY)
-				throw new IllegalArgumentException(MessageFormat.format("May only use {0} or {1}.", Status.MOVED_PERMANENTLY, Status.MOVED_PERMANENTLY ));
+			if (status != Status.MOVED_PERMANENTLY && status != Status.MOVED_PERMANENTLY)
+				throw new IllegalArgumentException(MessageFormat.format("May only use {0} or {1}.",
+						Status.MOVED_PERMANENTLY, Status.MOVED_PERMANENTLY));
 			responseCode(status);
 			header("Location", location == null ? "/" : location);
 			resetContent();
@@ -1881,28 +1880,39 @@ public class UHTTPD {
 
 		public final Content request() {
 			if (content == null) {
-				var chan =  delegate;
+				var chan = delegate;
 				var te = headerOr(HDR_TRANSFER_ENCODING);
 				var chunk = te.isPresent() && te.get().equals("chunked");
-				if(chunk) {
+				if (chunk) {
+					if (LOG.isLoggable(Level.DEBUG))
+						LOG.log(Level.DEBUG, "HTTP IN: Incoming content is chunked");
 					chan = new ChunkedChannel(client, chan, StandardOpenOption.READ);
-				}
-				else {
+				} else {
 					var cl = headersOr(HDR_CONTENT_LENGTH);
-					if(cl.isPresent()) {
+					if (cl.isPresent()) {
+						if (LOG.isLoggable(Level.DEBUG))
+							LOG.log(Level.DEBUG, "HTTP IN: Incoming content has content length of {0}",
+									cl.get().asLong());
+
 						chan = new LengthLimitedChannel(client, chan, cl.get().asLong(), StandardOpenOption.READ);
-					}
-					else {
+					} else {
 						var close = !client.rootContext.keepAlive || Protocol.HTTP_1_1.compareTo(protocol()) > 0
-								|| headersOr(HDR_CONNECTION).orElse(Named.EMPTY).expand(",").containsIgnoreCase("close");
-						if(!close) {
+								|| headersOr(HDR_CONNECTION).orElse(Named.EMPTY).expand(",")
+										.containsIgnoreCase("close");
+						if (!close) {
 							throw new IllegalStateException("Unable to determine end of stream.");
 						}
+
+						if (LOG.isLoggable(Level.DEBUG))
+							LOG.log(Level.DEBUG, "HTTP IN: Incoming content will end at end of stream");
 					}
 				}
 				var ce = headerOr(HDR_CONTENT_ENCODING);
 				var gzip = ce.isPresent() && ce.get().equals("gzip");
-				if(gzip) {
+				if (gzip) {
+					if (LOG.isLoggable(Level.DEBUG))
+						LOG.log(Level.DEBUG, "HTTP IN: Incoming content is gzipped");
+
 					try {
 						chan = (ByteChannel) Channels.newChannel(new GZIPInputStream(Channels.newInputStream(chan)));
 					} catch (IOException e) {
@@ -1923,7 +1933,7 @@ public class UHTTPD {
 		}
 
 		public final Transaction responder(BufferFiller responder) {
-			if(method().equals(Method.HEAD))
+			if (method().equals(Method.HEAD))
 				throw new IllegalStateException("No response is allowed for HEAD method.");
 			checkNotResponded();
 			this.responder = Optional.of(responder);
@@ -1931,7 +1941,7 @@ public class UHTTPD {
 		}
 
 		public final Transaction responder(String responseType, BufferFiller responder) {
-			if(method().equals(Method.HEAD))
+			if (method().equals(Method.HEAD))
 				throw new IllegalStateException("No response is allowed for HEAD method.");
 			checkNotResponded();
 			responseType(responseType);
@@ -1940,16 +1950,16 @@ public class UHTTPD {
 		}
 
 		/**
-		 * Respond with a generic object. This method supports a few basic
-		 * types, with everything else being converted to a string using {@link Object#toString()}.
+		 * Respond with a generic object. This method supports a few basic types, with
+		 * everything else being converted to a string using {@link Object#toString()}.
 		 * If the response is an {@link InputStream} or a {@link Reader}, it's contents
-		 * will be streamed. If it is a {@link ByteBuffer}, it will be transferred as is. All
-		 * other types will be converted.
+		 * will be streamed. If it is a {@link ByteBuffer}, it will be transferred as
+		 * is. All other types will be converted.
 		 * <p>
-		 * If there is no {@link #responseLength(long)} set, then attempts will
-		 * be made to set it from the content. This can be done up front with a {@link ByteBuffer}
-		 * or other non-streamed type.
-		 * 
+		 * If there is no {@link #responseLength(long)} set, then attempts will be made
+		 * to set it from the content. This can be done up front with a
+		 * {@link ByteBuffer} or other non-streamed type.
+		 *
 		 * @param response
 		 * @return this for chaining.
 		 */
@@ -1958,7 +1968,7 @@ public class UHTTPD {
 		}
 
 		public final Transaction response(String responseType, Object response) {
-			if(method().equals(Method.HEAD))
+			if (method().equals(Method.HEAD))
 				throw new IllegalStateException("No response is allowed for HEAD method.");
 			responseType(responseType);
 			return response(response);
@@ -1997,7 +2007,7 @@ public class UHTTPD {
 		}
 
 		public final WritableByteChannel responseWriter() {
-			if(responseChannel == null) {
+			if (responseChannel == null) {
 				responseChannel = new WritableByteChannel() {
 
 					private WritableByteChannel output;
@@ -2007,18 +2017,19 @@ public class UHTTPD {
 						output.close();
 					}
 
+					@Override
 					public boolean isOpen() {
 						return output.isOpen();
 					}
 
 					@Override
 					public int write(ByteBuffer src) throws IOException {
-						if(output == null)
+						if (output == null)
 							output = client.wireProtocol.responseWriter(Transaction.this);
-						responseStarted =true;
+						responseStarted = true;
 						return output.write(src);
 					}
-					
+
 				};
 			}
 			return responseChannel;
@@ -2054,9 +2065,9 @@ public class UHTTPD {
 		public final String uri() {
 			return uri;
 		}
-		
+
 		void checkNotResponded() {
-			if(responseStarted)
+			if (responseStarted)
 				throw new IllegalStateException("Response already started.");
 		}
 
@@ -2074,42 +2085,43 @@ public class UHTTPD {
 		private Optional<BufferFiller> writer = Optional.empty();
 		private Optional<Runnable> onClose = Optional.empty();
 		private Optional<Integer> bufferSize = Optional.empty();
-		
+
 		public TunnelHandler build() {
 			return new AbstractTunnelHandler() {
 				@Override
-				com.sshtools.uhttpd.UHTTPD.AbstractTunnelHandler.TunnelWireProtocol create(String host, int port, Client client)
-						throws IOException {
-					return new TunnelWireProtocol(bufferSize, reader.orElseThrow(), writer.orElseThrow(), onClose, client);
+				com.sshtools.uhttpd.UHTTPD.AbstractTunnelHandler.TunnelWireProtocol create(String host, int port,
+						Client client) throws IOException {
+					return new TunnelWireProtocol(bufferSize, reader.orElseThrow(), writer.orElseThrow(), onClose,
+							client);
 				}
 			};
 		}
-		
+
 		public TunnelBuilder onClose(Runnable onClose) {
-			this.onClose =Optional.of(onClose);
+			this.onClose = Optional.of(onClose);
 			return this;
 		}
-		
+
 		public TunnelBuilder withBufferSize(int bufferSize) {
 			this.bufferSize = Optional.of(bufferSize);
 			return this;
 		}
-		
+
 		public TunnelBuilder withReader(BufferFiller reader) {
-			this.reader =Optional.of(reader);
+			this.reader = Optional.of(reader);
 			return this;
 		}
-		
+
 		public TunnelBuilder withWriter(BufferFiller writer) {
-			this.writer =Optional.of(writer);
+			this.writer = Optional.of(writer);
 			return this;
 		}
 	}
 
 	public interface TunnelHandler extends Handler {
-		
+
 	}
-	
+
 	public interface UsernameAndPassword extends Credential {
 		char[] password();
 
@@ -2128,7 +2140,7 @@ public class UHTTPD {
 
 		String username();
 	}
-	
+
 	public interface WebContextBuilder<T extends WebContextBuilder<T, C>, C extends Context> {
 
 		C build() throws IOException;
@@ -2154,14 +2166,14 @@ public class UHTTPD {
 		T post(String regexp, Handler... handler);
 
 		T status(Status status, Handler handler);
-		
+
 		T tunnel(TunnelHandler handler);
 
 		T webSocket(String regexp, WebSocketHandler handler);
 
 		T withClasspathResources(String regexpWithGroups, Optional<ClassLoader> loader, String prefix,
 				Handler... handler);
-		
+
 		T withETagGenerator(Function<Path, String> etagCalculator);
 
 		T withTmpDir(Path tmpDir);
@@ -2182,7 +2194,7 @@ public class UHTTPD {
 
 		int version();
 	}
-	
+
 	public static final class WebSocketBuilder {
 		private Optional<OnWebSocketClose> onClose = Optional.empty();
 		private Optional<OnWebSocketData> onData = Optional.empty();
@@ -2232,7 +2244,7 @@ public class UHTTPD {
 		}
 
 	}
-	
+
 	public static final class WebSocketHandler implements Handler {
 
 		/**
@@ -2349,7 +2361,7 @@ public class UHTTPD {
 		private final class WebSocketFrame {
 
 			private static final long MAX_PAYLOAD_SIZE = Integer.MAX_VALUE - 8; // TODO make configurable and much
-				
+
 			ByteBuffer buffer = ByteBuffer.allocate(14); // enough for header
 			boolean fin, rsv1, rsv2, rsv3, mask;
 			byte[] key;
@@ -2586,7 +2598,7 @@ public class UHTTPD {
 					AbstractIncomingMessage lastMessage = null;
 					while (true) {
 						frame.read(channel);
-						if(closed)
+						if (closed)
 							throw new IllegalStateException("Got another message after a close message.");
 						if (LOG.isLoggable(Level.DEBUG))
 							LOG.log(Level.DEBUG, "Frame: {0}", frame);
@@ -2620,7 +2632,7 @@ public class UHTTPD {
 							lastMessage = null;
 					}
 				} finally {
-					if(!closed)
+					if (!closed)
 						onClose.ifPresent(h -> h.closed(1006, "Unexpected close.", ws));
 				}
 			}
@@ -2712,16 +2724,16 @@ public class UHTTPD {
 		}
 
 	}
-	
+
 	public interface WireProtocol {
 
 		default WritableByteChannel responseWriter(Transaction tx) throws IOException {
 			throw new UnsupportedOperationException();
 		}
-		
+
 		void transact() throws IOException;
 	}
-	
+
 	private abstract static class AbstractContext implements Context {
 		protected final Map<HandlerSelector, Handler> handlers = new LinkedHashMap<>();
 		protected final Map<Status, Handler> statusHandlers = new LinkedHashMap<>();
@@ -2729,15 +2741,15 @@ public class UHTTPD {
 		protected AbstractContext parent;
 		protected final Path tmpDir;
 		protected final boolean clearTmpDirOnClose;
-		
+
 		AbstractContext(AbstractWebContextBuilder<?, ?> b) {
 			handlers.putAll(b.handlers);
 			statusHandlers.putAll(b.statusHandlers);
 			etagGenerator = b.etagGenerator;
-			
-			handlers.forEach((k,v) -> {
-				if(v instanceof AbstractContext) {
-					((AbstractContext)v).parent = this;
+
+			handlers.forEach((k, v) -> {
+				if (v instanceof AbstractContext) {
+					((AbstractContext) v).parent = this;
 				}
 			});
 			clearTmpDirOnClose = b.tmpDir.isEmpty();
@@ -2750,11 +2762,9 @@ public class UHTTPD {
 
 		@Override
 		public void close() throws IOException {
-			if(clearTmpDirOnClose) {
+			if (clearTmpDirOnClose) {
 				try (var walk = Files.walk(tmpDir)) {
-				    walk.sorted(Comparator.reverseOrder())
-				        .map(Path::toFile)
-				        .forEach(File::delete);
+					walk.sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
 				}
 			}
 		}
@@ -2771,24 +2781,21 @@ public class UHTTPD {
 
 		String generateETag(AbstractContext ctx, Path resource) {
 			var o = ctx.etagGenerator;
-			if(o.isPresent())
+			if (o.isPresent())
 				return o.get().apply(resource);
 			else {
-				if(parent == null) {
+				if (parent == null) {
 					try {
 						long contentLength = Files.size(resource);
-	                    long lastModified = Files.getLastModifiedTime(resource).toMillis();
-	                    if ((contentLength >= 0) || (lastModified >= 0)) {
-	                        return "W/\"" + contentLength + "-" +
-	                                   lastModified + "\"";
-	                    }
-					}
-					catch(IOException ioe) {
+						long lastModified = Files.getLastModifiedTime(resource).toMillis();
+						if ((contentLength >= 0) || (lastModified >= 0)) {
+							return "W/\"" + contentLength + "-" + lastModified + "\"";
+						}
+					} catch (IOException ioe) {
 						LOG.log(Level.ERROR, "Failed to generate etag.", ioe);
 					}
 					return null;
-				}
-				else
+				} else
 					return generateETag(parent, resource);
 			}
 		}
@@ -2797,7 +2804,7 @@ public class UHTTPD {
 	private static abstract class AbstractTunnelHandler implements TunnelHandler {
 
 		class TunnelWireProtocol implements WireProtocol {
-			
+
 			private final ByteBuffer sndBuf;
 			private final ByteBuffer recvBuf;
 			private final Client client;
@@ -2805,8 +2812,9 @@ public class UHTTPD {
 			private final BufferFiller writer;
 			private final Optional<Runnable> close;
 			private AtomicBoolean closed = new AtomicBoolean();
-			
-			TunnelWireProtocol(Optional<Integer> bufferSize, BufferFiller reader, BufferFiller writer,  Optional<Runnable> close, Client client) {
+
+			TunnelWireProtocol(Optional<Integer> bufferSize, BufferFiller reader, BufferFiller writer,
+					Optional<Runnable> close, Client client) {
 				this.client = client;
 				this.reader = reader;
 				this.writer = writer;
@@ -2820,74 +2828,69 @@ public class UHTTPD {
 			public void transact() throws IOException {
 				client.rootContext.runner.run(() -> {
 					try {
-						while(true) {
-							if(LOG.isLoggable(Level.TRACE))
+						while (true) {
+							if (LOG.isLoggable(Level.TRACE))
 								LOG.log(Level.TRACE, "Tunnel HTTP receiving thread waiting data.");
 							client.socket.read(recvBuf);
-							if(recvBuf.position() == 0)
+							if (recvBuf.position() == 0)
 								break;
-							if(LOG.isLoggable(Level.TRACE))
+							if (LOG.isLoggable(Level.TRACE))
 								LOG.log(Level.TRACE, "Tunnel HTTP receiving thread got {0} bytes.", recvBuf.position());
 							recvBuf.flip();
 							writer.supply(recvBuf);
-							if(LOG.isLoggable(Level.TRACE))
+							if (LOG.isLoggable(Level.TRACE))
 								LOG.log(Level.TRACE, "Tunnel HTTP receiving passed on {0} bytes.", recvBuf.position());
 							recvBuf.flip();
 						}
-					}
-					catch(ClosedChannelException eof) {
-						if(LOG.isLoggable(Level.TRACE))
+					} catch (ClosedChannelException eof) {
+						if (LOG.isLoggable(Level.TRACE))
 							LOG.log(Level.TRACE, "Receiver closed.");
-					}
-					catch(IOException ioe) {
-						LOG.log(Level.ERROR, "HTTP Receiving thread failed.",ioe);
-					}
-					finally {
-						if(!closed.getAndSet(true)) {
+					} catch (IOException ioe) {
+						LOG.log(Level.ERROR, "HTTP Receiving thread failed.", ioe);
+					} finally {
+						if (!closed.getAndSet(true)) {
 							close.ifPresent(c -> c.run());
 						}
-						if(LOG.isLoggable(Level.DEBUG))
+						if (LOG.isLoggable(Level.DEBUG))
 							LOG.log(Level.DEBUG, "Tunnel HTTP receiving thread done");
 					}
 				});
 				try {
-					while(true) {
-						if(LOG.isLoggable(Level.TRACE))
+					while (true) {
+						if (LOG.isLoggable(Level.TRACE))
 							LOG.log(Level.TRACE, "Tunnel HTTP sending thread waiting data.");
 						reader.supply(sndBuf);
-						if(sndBuf.position() == 0)
+						if (sndBuf.position() == 0)
 							break;
-						if(LOG.isLoggable(Level.TRACE))
+						if (LOG.isLoggable(Level.TRACE))
 							LOG.log(Level.TRACE, "Tunnel HTTP sending thread got {0} bytes.", sndBuf.position());
 						sndBuf.flip();
 						client.socket.write(sndBuf);
-						if(LOG.isLoggable(Level.TRACE))
+						if (LOG.isLoggable(Level.TRACE))
 							LOG.log(Level.TRACE, "Tunnel HTTP sending passed on {0} bytes.", sndBuf.position());
 						sndBuf.flip();
 					}
-				}
-				catch(ClosedChannelException ace) {
-					if(LOG.isLoggable(Level.TRACE))
+				} catch (ClosedChannelException ace) {
+					if (LOG.isLoggable(Level.TRACE))
 						LOG.log(Level.TRACE, "Sender closed.");
-				}
-				finally {
-					if(!closed.getAndSet(true)) {
+				} finally {
+					if (!closed.getAndSet(true)) {
 						close.ifPresent(c -> c.run());
 					}
-					if(LOG.isLoggable(Level.DEBUG))
+					if (LOG.isLoggable(Level.DEBUG))
 						LOG.log(Level.DEBUG, "Tunnel HTTP sending thread done");
 				}
 				throw new EOFException();
 			}
 		}
-		
+
 		@Override
 		public final void get(Transaction tx) throws Exception {
 			// https://en.wikipedia.org/wiki/HTTP_tunnel
 			// TODO - proxy auth
 			tx.responseCode(Status.OK);
 			var target = tx.uri().split(":");
-			if(LOG.isLoggable(Level.DEBUG))
+			if (LOG.isLoggable(Level.DEBUG))
 				LOG.log(Level.DEBUG, "Opening tunnel to {0}", tx.uri());
 			tx.client.wireProtocol = create(target[0], Integer.parseInt(target[1]), tx.client());
 		}
@@ -2895,7 +2898,8 @@ public class UHTTPD {
 		abstract TunnelWireProtocol create(String host, int port, Client client) throws IOException;
 	}
 
-	private static abstract class AbstractWebContextBuilder<T extends AbstractWebContextBuilder<T, C>, C extends Context>  implements WebContextBuilder<T, C> {
+	private static abstract class AbstractWebContextBuilder<T extends AbstractWebContextBuilder<T, C>, C extends Context>
+			implements WebContextBuilder<T, C> {
 		Map<HandlerSelector, Handler> handlers = new LinkedHashMap<>();
 		Map<Status, Handler> statusHandlers = new LinkedHashMap<>();
 		Optional<Function<Path, String>> etagGenerator;
@@ -2903,12 +2907,14 @@ public class UHTTPD {
 
 		AbstractWebContextBuilder() {
 			statusHandlers.put(Status.INTERNAL_SERVER_ERROR, (tx) -> {
-				tx.response("text/html", "<html><body><h1>Internal Server Error</h1><p>__msg__</p><br/><pre>__trace__</pre></body></html>".
-					replace("__msg__", tx.error().map(e -> e.getMessage()).orElse("No message supplied.")).
-					replace("__trace__", tx.errorTrace().orElse("")));
+				tx.response("text/html",
+						"<html><body><h1>Internal Server Error</h1><p>__msg__</p><br/><pre>__trace__</pre></body></html>"
+								.replace("__msg__", tx.error().map(e -> e.getMessage()).orElse("No message supplied."))
+								.replace("__trace__", tx.errorTrace().orElse("")));
 			});
 		}
 
+		@Override
 		@SuppressWarnings("unchecked")
 		public T chain(Handler... handlers) {
 			handle(ALL_SELECTOR, (req) -> {
@@ -2921,29 +2927,35 @@ public class UHTTPD {
 			return (T) this;
 		}
 
+		@Override
 		public T classpathResources(String regexpWithGroups, Handler... handler) {
 			return classpathResources(regexpWithGroups, "", handler);
 		}
 
+		@Override
 		public T classpathResources(String regexpWithGroups, String prefix, Handler... handler) {
 			return withClasspathResources(regexpWithGroups,
 					Optional.ofNullable(Thread.currentThread().getContextClassLoader()), prefix, handler);
 		}
 
+		@Override
 		public T context(Handler... handlers) {
-			if(handlers.length == 0 || !(handlers[handlers.length -1] instanceof Context)) {
-				throw new IllegalArgumentException(MessageFormat.format("The last handler must be a {0}", Context.class.getName()));
+			if (handlers.length == 0 || !(handlers[handlers.length - 1] instanceof Context)) {
+				throw new IllegalArgumentException(
+						MessageFormat.format("The last handler must be a {0}", Context.class.getName()));
 			}
-			var ctx = (Context)handlers[handlers.length - 1];
-			return handle(new RegularExpressionSelector(((ContextImpl)ctx).pathExpression), handlers);
+			var ctx = (Context) handlers[handlers.length - 1];
+			return handle(new RegularExpressionSelector(((ContextImpl) ctx).pathExpression), handlers);
 		}
 
+		@Override
 		public T delete(String regexp, Handler... handler) {
-			return (T) handle(
+			return handle(
 					new CompoundSelector(new MethodSelector(Method.DELETE), new RegularExpressionSelector(regexp)),
 					handler);
 		}
 
+		@Override
 		@SuppressWarnings("unchecked")
 		public T fileResources(String regexpWithGroups, Path root, Handler... handler) {
 			var l = new ArrayList<Handler>();
@@ -2952,12 +2964,14 @@ public class UHTTPD {
 			handle(new RegularExpressionSelector(regexpWithGroups), l.toArray(new Handler[0]));
 			return (T) this;
 		}
-		
+
+		@Override
 		public T get(String regexp, Handler... handler) {
 			return handle(new CompoundSelector(new MethodSelector(Method.GET), new RegularExpressionSelector(regexp)),
 					handler);
 		}
 
+		@Override
 		@SuppressWarnings("unchecked")
 		public T handle(HandlerSelector selector, Handler... handler) {
 			if (handler.length == 0)
@@ -2976,33 +2990,39 @@ public class UHTTPD {
 			return (T) this;
 		}
 
+		@Override
 		public T handle(String regexp, Handler... handler) {
 			return handle(new RegularExpressionSelector(regexp), handler);
 		}
 
+		@Override
 		public T post(String regexp, Handler... handler) {
 			return handle(new CompoundSelector(new MethodSelector(Method.POST), new RegularExpressionSelector(regexp)),
 					handler);
 		}
 
+		@Override
 		@SuppressWarnings("unchecked")
 		public T status(Status status, Handler handler) {
 			statusHandlers.put(status, handler);
 			return (T) this;
 		}
 
+		@Override
 		public T tunnel(TunnelHandler handler) {
 			return handle(new MethodSelector(Method.CONNECT), handler);
 		}
 
+		@Override
 		public T webSocket(String regexp, WebSocketHandler handler) {
 			return handle(new CompoundSelector(new MethodSelector(Method.GET), new RegularExpressionSelector(regexp)),
 					handler);
 		}
 
+		@Override
 		@SuppressWarnings("unchecked")
-		public T withClasspathResources(String regexpWithGroups, Optional<ClassLoader> loader,
-				String prefix, Handler... handler) {
+		public T withClasspathResources(String regexpWithGroups, Optional<ClassLoader> loader, String prefix,
+				Handler... handler) {
 			var l = new ArrayList<Handler>();
 			l.add(UHTTPD.classpathResources(regexpWithGroups, loader, prefix));
 			l.addAll(Arrays.asList(handler));
@@ -3021,13 +3041,13 @@ public class UHTTPD {
 		@Override
 		public T withTmpDir(Path tmpDir) {
 			this.tmpDir = Optional.of(tmpDir);
-			return (T)this;
+			return (T) this;
 		}
 
 	}
-	
+
 	private final static class ChunkedChannel extends WebChannel {
-		
+
 		private long chunkRemain = -1;
 
 		public ChunkedChannel(Client client, ByteChannel delegate, OpenOption... options) {
@@ -3036,7 +3056,7 @@ public class UHTTPD {
 
 		@Override
 		public void close() throws IOException {
-			if(options.contains(StandardOpenOption.WRITE)) {
+			if (options.contains(StandardOpenOption.WRITE)) {
 				writer();
 				writer.println("0"); // terminating chunk
 				writer.println(); // end of chunking
@@ -3047,15 +3067,14 @@ public class UHTTPD {
 
 		@Override
 		public int read(ByteBuffer dst) throws IOException {
-			reader();
-			if(chunkRemain < 1) {
-				chunkRemain = Long.parseLong(reader.readLine(), 16);
-				if(chunkRemain == 0) 
-					reader.readLine();
+			if (chunkRemain < 1) {
+				chunkRemain = Long.parseLong(readLine(), 16);
+				if (chunkRemain == 0)
+					readLine();
 				return -1;
 			}
 			var read = delegate.read(dst);
-			if(read != -1) {
+			if (read != -1) {
 				chunkRemain -= read;
 			}
 			return read;
@@ -3063,7 +3082,7 @@ public class UHTTPD {
 
 		@Override
 		public int write(ByteBuffer src) throws IOException {
-			if(LOG.isLoggable(Level.DEBUG))
+			if (LOG.isLoggable(Level.DEBUG))
 				LOG.log(Level.DEBUG, "Writing chunk of {0} bytes.", src.limit());
 			var writer = writer();
 			writer.println(Integer.toHexString(src.limit()));
@@ -3073,7 +3092,7 @@ public class UHTTPD {
 			writer.flush();
 			return res;
 		}
-		
+
 	}
 
 	private final static class ClasspathResource implements Handler {
@@ -3094,7 +3113,7 @@ public class UHTTPD {
 			if (url == null)
 				throw new FileNotFoundException(fullPath);
 			else {
-				urlResource(url).get(req);;
+				urlResource(url).get(req);
 			}
 		}
 
@@ -3124,7 +3143,7 @@ public class UHTTPD {
 		}
 
 	}
-	
+
 	private final static class ContextImpl extends AbstractContext {
 		final String pathExpression;
 		final Pattern pathPattern;
@@ -3144,21 +3163,22 @@ public class UHTTPD {
 				var matchedPath = matcher.group(1);
 				var ctxPath = fullPath.substring(0, fullPath.length() - matchedPath.length() - 1);
 				var resPath = fullPath.substring(fullPath.length() - matchedPath.length() - 1);
-				if(LOG.isLoggable(Level.DEBUG))
-					LOG.log(Level.DEBUG, "Path reduced from {0} to context {1} with path {2}", tx.path, ctxPath, resPath);
-				
+				if (LOG.isLoggable(Level.DEBUG))
+					LOG.log(Level.DEBUG, "Path reduced from {0} to context {1} with path {2}", tx.path, ctxPath,
+							resPath);
+
 				tx.pushContext(this, ctxPath, resPath);
 			}
-				
+
 			for (var c : handlers.entrySet()) {
 				if (c.getKey().matches(tx)) {
 					tx.selector = Optional.of(c.getKey());
 					try {
 						c.getValue().get(tx);
-						if(!tx.responsed() && !tx.hasResponse())
-							tx.responseCode(Status.OK); 
+						if (!tx.responsed() && !tx.hasResponse())
+							tx.responseCode(Status.OK);
 					} catch (FileNotFoundException fnfe) {
-						if(LOG.isLoggable(Level.DEBUG))
+						if (LOG.isLoggable(Level.DEBUG))
 							LOG.log(Level.DEBUG, "File not found. {0}", fnfe.getMessage());
 						tx.notFound();
 					} catch (Exception ise) {
@@ -3176,51 +3196,47 @@ public class UHTTPD {
 			}
 		}
 	}
-	
+
 	/**
-     * A factory for {@link SimpleDateFormat}s. The instances are stored in a
-     * threadlocal way because SimpleDateFormat is not threadsafe as noted in
-     * {@link SimpleDateFormat its javadoc}.
-     *
-     */
-    private final static class DateFormatHolder {
+	 * A factory for {@link SimpleDateFormat}s. The instances are stored in a
+	 * threadlocal way because SimpleDateFormat is not threadsafe as noted in
+	 * {@link SimpleDateFormat its javadoc}.
+	 *
+	 */
+	private final static class DateFormatHolder {
 
-        private static final ThreadLocal<SoftReference<Map<String, SimpleDateFormat>>>
-            THREADLOCAL_FORMATS = new ThreadLocal<SoftReference<Map<String, SimpleDateFormat>>>();
+		private static final ThreadLocal<SoftReference<Map<String, SimpleDateFormat>>> THREADLOCAL_FORMATS = new ThreadLocal<>();
 
-        /**
-         * creates a {@link SimpleDateFormat} for the requested format string.
-         *
-         * @param pattern
-         *            a non-{@code null} format String according to
-         *            {@link SimpleDateFormat}. The format is not checked against
-         *            {@code null} since all paths go through
-         *            {@link DateUtils}.
-         * @return the requested format. This simple dateformat should not be used
-         *         to {@link SimpleDateFormat#applyPattern(String) apply} to a
-         *         different pattern.
-         */
-        public static SimpleDateFormat formatFor(final String pattern) {
-            final SoftReference<Map<String, SimpleDateFormat>> ref = THREADLOCAL_FORMATS.get();
-            Map<String, SimpleDateFormat> formats = ref == null ? null : ref.get();
-            if (formats == null) {
-                formats = new HashMap<String, SimpleDateFormat>();
-                THREADLOCAL_FORMATS.set(
-                        new SoftReference<Map<String, SimpleDateFormat>>(formats));
-            }
+		/**
+		 * creates a {@link SimpleDateFormat} for the requested format string.
+		 *
+		 * @param pattern a non-{@code null} format String according to
+		 *                {@link SimpleDateFormat}. The format is not checked against
+		 *                {@code null} since all paths go through {@link DateUtils}.
+		 * @return the requested format. This simple dateformat should not be used to
+		 *         {@link SimpleDateFormat#applyPattern(String) apply} to a different
+		 *         pattern.
+		 */
+		public static SimpleDateFormat formatFor(final String pattern) {
+			final SoftReference<Map<String, SimpleDateFormat>> ref = THREADLOCAL_FORMATS.get();
+			Map<String, SimpleDateFormat> formats = ref == null ? null : ref.get();
+			if (formats == null) {
+				formats = new HashMap<>();
+				THREADLOCAL_FORMATS.set(new SoftReference<>(formats));
+			}
 
-            SimpleDateFormat format = formats.get(pattern);
-            if (format == null) {
-                format = new SimpleDateFormat(pattern, Locale.US);
-                format.setTimeZone(TimeZone.getTimeZone("GMT"));
-                formats.put(pattern, format);
-            }
+			SimpleDateFormat format = formats.get(pattern);
+			if (format == null) {
+				format = new SimpleDateFormat(pattern, Locale.US);
+				format.setTimeZone(TimeZone.getTimeZone("GMT"));
+				formats.put(pattern, format);
+			}
 
-            return format;
-        }
+			return format;
+		}
 
-    }
-	
+	}
+
 	private final static class DefaultResponder implements BufferFiller {
 
 		private final Object response;
@@ -3234,52 +3250,48 @@ public class UHTTPD {
 			this.charset = tx.client.charset();
 			var needLength = tx.responseLength.isEmpty();
 			var needType = tx.responseType.isEmpty();
-			if(response instanceof Path) {
-				var path = (Path)response;
+			if (response instanceof Path) {
+				var path = (Path) response;
 				try {
-					//response = Files.newInputStream(path);
+					// response = Files.newInputStream(path);
 					response = Files.newByteChannel(path);
-					if(needLength) {
+					if (needLength) {
 						tx.responseLength(Files.size(path));
 						needLength = false;
 					}
-					if(needType)
+					if (needType)
 						tx.responseType = Optional.of(mimeType(path.toUri().toURL()));
-				}
-				catch(IOException ioe) {
+				} catch (IOException ioe) {
 					throw new UncheckedIOException("Failed to responsd with file.", ioe);
 				}
-			}
-			else if(response instanceof File) {
-				var path = (File)response;
+			} else if (response instanceof File) {
+				var path = (File) response;
 				try {
-					//response = new FileInputStream(path);
+					// response = new FileInputStream(path);
 					response = Files.newByteChannel(path.toPath());
-					if(needLength) {
+					if (needLength) {
 						tx.responseLength(path.length());
 						needLength = false;
 					}
-					if(needType)
+					if (needType)
 						tx.responseType = Optional.of(mimeType(path.toURI().toURL()));
-				}
-				catch(IOException ioe) {
+				} catch (IOException ioe) {
 					throw new UncheckedIOException("Failed to responsd with file.", ioe);
 				}
-			}
-			else if(response instanceof ByteBuffer) {
-				if(needLength) {
+			} else if (response instanceof ByteBuffer) {
+				if (needLength) {
 					needLength = false;
-					tx.responseLength(((ByteBuffer)response).remaining());
+					tx.responseLength(((ByteBuffer) response).remaining());
+				}
+			} else if (!(response instanceof InputStream) && !(response instanceof Reader)
+					&& !(response instanceof ReadableByteChannel)) {
+				response = ByteBuffer.wrap(String.valueOf(response).getBytes(charset));
+				if (needLength) {
+					needLength = false;
+					tx.responseLength = Optional.of((long) ((ByteBuffer) response).remaining());
 				}
 			}
-			else if(!(response instanceof InputStream) && !(response instanceof Reader) && !(response instanceof ReadableByteChannel)) {
-				response = ByteBuffer.wrap(String.valueOf(response).getBytes(charset));
-				if(needLength) {
-					needLength = false;
-					tx.responseLength = Optional.of((long)((ByteBuffer)response).remaining());
-				}				
-			}
-			
+
 			this.tx = tx;
 			this.response = response;
 			this.needLength = needLength;
@@ -3287,74 +3299,68 @@ public class UHTTPD {
 
 		@Override
 		public void close() throws IOException {
-			if(response instanceof Closeable) {
-				((Closeable)response).close();
+			if (response instanceof Closeable) {
+				((Closeable) response).close();
 			}
 		}
 
 		@Override
 		public void supply(ByteBuffer buf) throws IOException {
-			if(response instanceof ReadableByteChannel) {
-				var chan = (ReadableByteChannel)response;
+			if (response instanceof ReadableByteChannel) {
+				var chan = (ReadableByteChannel) response;
 				chan.read(buf);
-			}
-			else if(response instanceof ByteBuffer) {
-				var respBuff = (ByteBuffer)response;
-				if(respBuff.hasRemaining()) {
-					if(respBuff.remaining() > buf.remaining()) {
+			} else if (response instanceof ByteBuffer) {
+				var respBuff = (ByteBuffer) response;
+				if (respBuff.hasRemaining()) {
+					if (respBuff.remaining() > buf.remaining()) {
 						var waslimit = respBuff.limit();
 						respBuff.limit(respBuff.position() + buf.remaining());
 						buf.put(respBuff);
 						buf.limit(waslimit);
-						
+
 //						var p = respBuff.position();
 //						respBuff.position(p + buf.remaining());
 //						respBuff = respBuff.slice(p, buf.remaining());
-					}
-					else
+					} else
 						buf.put(respBuff);
 				}
-			}
-			else if(response instanceof Reader) {
-				if(enc == null) {
+			} else if (response instanceof Reader) {
+				if (enc == null) {
 					enc = charset.newEncoder();
 				}
-				if(charBuffer == null) {
+				if (charBuffer == null) {
 					charBuffer = CharBuffer.allocate(buf.remaining() * 2);
 				}
 				var encoded = enc.encode(charBuffer);
-				if(encoded.hasRemaining()) {
-					if(needLength) {
+				if (encoded.hasRemaining()) {
+					if (needLength) {
 						tx.responseLength = Optional.of(tx.responseLength.orElse(0l) + encoded.remaining());
 					}
 					buf.put(encoded);
 				}
-			}
-			else if(response instanceof InputStream) {
-				var in = (InputStream)response;
+			} else if (response instanceof InputStream) {
+				var in = (InputStream) response;
 				byte[] arr;
 				int off = 0;
-				if(buf.isDirect()) {
+				if (buf.isDirect()) {
 					arr = new byte[buf.remaining()];
-				}
-				else {
+				} else {
 					arr = buf.array();
 					off = buf.arrayOffset();
 				}
 				var read = in.read(arr, off, arr.length - off);
-				if(read != -1) {
-					if(needLength) {
+				if (read != -1) {
+					if (needLength) {
 						tx.responseLength = Optional.of(tx.responseLength.orElse(0l) + read);
 					}
-					if(buf.isDirect()) {
+					if (buf.isDirect()) {
 						buf.put(arr, 0, read);
 					}
 				}
-			}
-			else
+			} else
 				throw new UnsupportedOperationException();
 		}
-		
+
 	}
 
 	private final static class FileResource implements Handler {
@@ -3407,183 +3413,9 @@ public class UHTTPD {
 		}
 
 	}
-	
-	
-	private final static class GZIPChannel extends WebChannel {
-
-	    private static final int GZIP_MAGIC = 0x8b1f;
-	    private static final byte OS_UNKNOWN = (byte) 255;
-		private static final int TRAILER_SIZE = 8;
-	    
-	    private CRC32 crc = new CRC32();
-		private Deflater def;
-		private Inflater inf;
-		private ByteBuffer buf;
-
-		public GZIPChannel(Client client, ByteChannel out, OpenOption... options) {
-			super(client, out, options);
-			crc.reset();
-		}
-
-		@Override
-		public void close() throws IOException {
-
-	        if (def != null && !def.finished()) {
-                def.finish();
-                while (!def.finished()) {
-                    int len = def.deflate(buf);
-                    if (len > 0) {
-                    	buf.flip();
-                    	delegate.write(buf);
-                    	buf.flip();
-                    }
-                }
-                // if we can't fit the trailer at the end of the last
-                // deflater buffer, we write it separately
-                writeTrailer();
-                def.end();
-	        }
-	        
-//            writeTrailer();
-			super.close();
-		}
-
-		@Override
-		public int read(ByteBuffer dst) throws IOException {
-			if(inf == null) {
-				inf = new Inflater(true);
-			}
-			
-			if(buf == null) {
-				buf = ByteBuffer.allocateDirect(dst.capacity());
-			}
-			
-			if(buf.position() == 0) {
-				// Output buffer is empty and needs more decompressed data filling it
-				int r = delegate.read(buf);
-				if(r < 1)
-					return r;
-				buf.flip();
-			}
-
-	        if (!inf.finished()) {
-	        	inf.setInput(buf);
-	            while (!inf.needsInput()) {
-	            	try {
-						inf.inflate(dst);
-					} catch (DataFormatException e) {
-						throw new IllegalStateException("Failed to decompress.", e);
-					}
-	            }
-	        }
-//			buf.flip();
-			
-			throw new UnsupportedOperationException("TODO");
-		}
-
-		@Override
-		public int write(ByteBuffer data) throws IOException {
-
-	        crc.update(data);
-	        data.flip();
-	        
-			if(def == null) {
-				def = new Deflater(Deflater.BEST_SPEED, true);
-				writeHeader();
-			}
-			var outSize = data.remaining() + MIN_GZIP_BUFFER;
-			if(buf == null || buf.capacity() < outSize) {
-				buf = ByteBuffer.allocateDirect(outSize);
-			}
-			else {
-				buf.clear();
-			}
-			
-			var t = 0;
-	        if (!def.finished()) {
-				def.setInput(data);
-	            while (!def.needsInput()) {
-	                t += deflate();
-	            }
-	        }
-	        return t;
-		}
-
-		private int deflate() throws IOException {
-			var r = def.deflate(buf, Deflater.SYNC_FLUSH);
-			var t = 0;
-			if(r > 0) {
-				buf.flip();
-				t += this.delegate.write(buf);
-				buf.flip();
-			}
-			return t;
-		}
-
-	    /*
-	     * Writes GZIP member trailer to a byte array, starting at a given
-	     * offset.
-	     */
-	    private void writeTrailer() throws IOException {
-	    	var b = ByteBuffer.allocateDirect(TRAILER_SIZE);
-	    	b.order(ByteOrder.LITTLE_ENDIAN);
-	    	b.putInt((int)crc.getValue());
-	    	b.putInt((int)def.getTotalIn());
-	    	b.flip();
-			this.delegate.write(b);
-	    	
-//	    	var b  = new byte[TRAILER_SIZE];
-//	    	writeTrailer(b, 0);
-//			this.delegate.write(ByteBuffer.wrap(b));
-	    	
-	    }
-
-	    /*
-	     * Writes GZIP member trailer to a byte array, starting at a given
-	     * offset.
-	     */
-	    private void writeTrailer(byte[] buf, int offset) throws IOException {
-	        writeInt((int)crc.getValue(), buf, offset); // CRC-32 of uncompr. data
-	        writeInt(def.getTotalIn(), buf, offset + 4); // Number of uncompr. bytes
-	    }
-
-	    /*
-	     * Writes integer in Intel byte order to a byte array, starting at a
-	     * given offset.
-	     */
-	    private void writeInt(int i, byte[] buf, int offset) throws IOException {
-	        writeShort(i & 0xffff, buf, offset);
-	        writeShort((i >> 16) & 0xffff, buf, offset + 2);
-	    }
-
-	    /*
-	     * Writes short integer in Intel byte order to a byte array, starting
-	     * at a given offset
-	     */
-	    private void writeShort(int s, byte[] buf, int offset) throws IOException {
-	        buf[offset] = (byte)(s & 0xff);
-	        buf[offset + 1] = (byte)((s >> 8) & 0xff);
-	    }
-		
-		private void writeHeader() throws IOException {
-			this.delegate.write(ByteBuffer.wrap(
-		        new byte[] {
-		                      (byte) GZIP_MAGIC,        // Magic number (short)
-		                      (byte)(GZIP_MAGIC >> 8),  // Magic number (short)
-		                      Deflater.DEFLATED,        // Compression method (CM)
-		                      0,                        // Flags (FLG)
-		                      0,                        // Modification time MTIME (int)
-		                      0,                        // Modification time MTIME (int)
-		                      0,                        // Modification time MTIME (int)
-		                      0,                        // Modification time MTIME (int)
-		                      0,                        // Extra flags (XFLG)
-		                      OS_UNKNOWN                // Operating system (OS)
-		                  }));
-		 }
-	}
 
 	private static final class HTTP11WireProtocol extends WebChannel implements WireProtocol {
-		
+
 		private boolean close;
 		private boolean chunk;
 		private boolean gzip;
@@ -3597,10 +3429,11 @@ public class UHTTPD {
 			super(client, client.channel(), StandardOpenOption.READ, StandardOpenOption.WRITE);
 			reset();
 		}
-		
+
+		@SuppressWarnings("resource")
 		@Override
 		public WritableByteChannel responseWriter(Transaction tx) throws IOException {
-			if(responseWriter == null) {
+			if (responseWriter == null) {
 				calcResponseLengthAndType(tx);
 				var out = client.channel();
 				WritableByteChannel nioChan = new PsuedoCloseByteChannel() {
@@ -3610,23 +3443,18 @@ public class UHTTPD {
 						client.waitForWrite();
 						return r;
 					}
-				}; 
-				
-				if(haveLength && responseLength < client.rootContext.maxUnchunkedSize) {
-					if(gzip) {
-						var buf = ByteBuffer.allocateDirect((int)(responseLength + MIN_GZIP_BUFFER));
+				};
+
+				if (haveLength && responseLength < client.rootContext.maxUnchunkedSize) {
+					if (gzip) {
+						var buf = ByteBuffer.allocateDirect((int) (responseLength + MIN_GZIP_BUFFER));
 						WritableByteChannel bufchan = new ByteChannel() {
-	
+
 							boolean closed;
-							
-							@Override
-							public boolean isOpen() {
-								return !closed;
-							}
-							
+
 							@Override
 							public void close() throws IOException {
-								if(isOpen())  {
+								if (isOpen()) {
 									closed = true;
 									useLength = true;
 									responseLength = buf.position();
@@ -3637,67 +3465,67 @@ public class UHTTPD {
 									nioChan.close();
 								}
 							}
-							
+
+							@Override
+							public boolean isOpen() {
+								return !closed;
+							}
+
+							@Override
+							public int read(ByteBuffer dst) throws IOException {
+								throw new UnsupportedOperationException();
+							}
+
 							@Override
 							public int write(ByteBuffer src) throws IOException {
 								var r = src.remaining();
 								buf.put(src);
 								return r;
 							}
-	
-							@Override
-							public int read(ByteBuffer dst) throws IOException {
-								throw new UnsupportedOperationException();
-							}
 						};
-						if(gzip) {
-							//bufchan = new GZIPChannel(client, bufchan, StandardOpenOption.WRITE);
-							bufchan = Channels.newChannel(new GZIPOutputStream(Channels.newOutputStream(bufchan), true));
+						if (gzip) {
+							// bufchan = new GZIPChannel(client, bufchan, StandardOpenOption.WRITE);
+							bufchan = Channels
+									.newChannel(new GZIPOutputStream(Channels.newOutputStream(bufchan), true));
 						}
 						return bufchan;
-					}
-					else {
+					} else {
 						calcChunkingAndClose(tx);
 						respondWithHeaders(tx);
 						return nioChan;
 					}
-				}
-				else {
+				} else {
 					calcChunkingAndClose(tx);
 					respondWithHeaders(tx);
 					var chan = nioChan;
-					if(chunk) {
-						chan = new ChunkedChannel(client, (ByteChannel)chan, StandardOpenOption.WRITE);
+					if (chunk) {
+						chan = new ChunkedChannel(client, (ByteChannel) chan, StandardOpenOption.WRITE);
 					}
-					if(gzip) {
+					if (gzip) {
 						chan = Channels.newChannel(new GZIPOutputStream(Channels.newOutputStream(chan), true));
 //						chan = new GZIPChannel(client, chan, StandardOpenOption.WRITE);
 					}
 					return chan;
 				}
-			}
-			else {
+			} else {
 				return responseWriter;
 			}
-			
-			
+
 		}
 
 		@Override
 		public void transact() throws IOException {
 			reset();
-			
+
 			if (LOG.isLoggable(Level.DEBUG))
 				LOG.log(Level.DEBUG, "Awaiting HTTP start");
-			
-			reader();
-			
-			var line = reader.readLine();
+
+			var line = readLine();
 			if (line == null)
 				throw new EOFException();
 			if (LOG.isLoggable(Level.DEBUG))
 				LOG.log(Level.DEBUG, "HTTP IN: {0}", line);
-			
+
 			var tkns = new StringTokenizer(line);
 			var firstToken = tkns.nextToken();
 			var method = Method.GET;
@@ -3718,45 +3546,56 @@ public class UHTTPD {
 			var tx = new Transaction(uri, method, proto, client, writer(), delegate);
 			try {
 				try {
-		
+
 					/* Read headers up to content */
-					while ((line = reader.readLine()) != null && !line.equals("")) {
+					while ((line = readLine()) != null && !line.equals("")) {
 						if (LOG.isLoggable(Level.TRACE))
 							LOG.log(Level.TRACE, "HTTP IN: {0}", line);
 						var nvp = Named.parseHeader(line);
 						tx.incomingHeaders.put(nvp.name, nvp);
 					}
-		
+
 					close = !client.rootContext.keepAlive || Protocol.HTTP_1_1.compareTo(proto) > 0
 							|| tx.headersOr(HDR_CONNECTION).orElse(Named.EMPTY).expand(",").containsIgnoreCase("close");
-		
+
 					if (proto.compareTo(Protocol.HTTP_1_0) > 0) {
 						tx.headerOr(HDR_HOST).orElseThrow();
 					}
-					
+
 					tx.headersOr(HDR_COOKIE).ifPresent(c -> {
-						for(var val : c.values()) {
+						for (var val : c.values()) {
 							var spec = Named.parseSeparatedStrings(val);
-							for(var cookie : spec.values()) {
+							for (var cookie : spec.values()) {
 								tx.incomingCookies.put(cookie.name(), cookie.asString());
 							}
 						}
 					});
-		
+
+					/* Now pass on to user code via the context */
 					client.rootContext.get(tx);
-					
-				}
-				catch(Exception e) {
+
+				} catch (Exception e) {
 					LOG.log(Level.ERROR, "Failed HTTP transaction.", e);
 					tx.error(e);
 				}
-				
-				while(true) {
-					var statusHandler = client.rootContext.statusHandlers.get(tx.code.orElse(Status.OK));
-					if(statusHandler == null) {
-						break;
+
+				/*
+				 * Make sure all request content is read (user code might not have read any
+				 * parts)
+				 */
+				for (var part : tx.request().asParts()) {
+					if (!part.satisfied()) {
+						if (LOG.isLoggable(Level.DEBUG))
+							LOG.log(Level.DEBUG, "HTTP IN: Reading unsatisifed part {0}", part);
+						part.satisfy();
 					}
-					else {
+				}
+
+				while (true) {
+					var statusHandler = client.rootContext.statusHandlers.get(tx.code.orElse(Status.OK));
+					if (statusHandler == null) {
+						break;
+					} else {
 						try {
 							statusHandler.get(tx);
 							break;
@@ -3766,22 +3605,52 @@ public class UHTTPD {
 						}
 					}
 				}
-				
-				if(tx.responseChannel == null) {
+
+				if (tx.responseChannel == null) {
 					responseContent(tx);
 				}
-				
+
 				writer().flush();
 				if (close)
 					throw new EOFException();
-	
+
 				if (LOG.isLoggable(Level.DEBUG))
-					LOG.log(Level.DEBUG, "Exited transaction normally, setting socket timeout to {0}s", client.rootContext.keepAliveTimeoutSecs);
+					LOG.log(Level.DEBUG, "Exited transaction normally, setting socket timeout to {0}s",
+							client.rootContext.keepAliveTimeoutSecs);
 				client.socket.socket().setSoTimeout(client.rootContext.keepAliveTimeoutSecs * 1000);
-			}
-			finally {
-				if(tx.content != null)
+			} finally {
+				if (tx.content != null)
 					tx.content.close();
+			}
+		}
+
+		private void calcChunkingAndClose(Transaction tx) {
+			if (!useLength) {
+				if (tx.protocol.compareTo(Protocol.HTTP_1_0) > 0 && tx.protocol.compareTo(Protocol.HTTP_2) < 0) {
+					chunk = true;
+				} else
+					close = true;
+			}
+		}
+
+		private void calcResponseLengthAndType(Transaction tx) {
+			chunk = false;
+			haveLength = useLength = tx.responseLength.isPresent();
+			responseLength = useLength ? tx.responseLength.get() : -1;
+			responseBigEnoughToCompress = (!useLength || (responseLength >= client.rootContext.minGzipSize));
+
+			// TODO gzip header might contain parameters for compression
+			gzip = responseBigEnoughToCompress && client.rootContext.gzip && tx.hasResponse()
+					&& tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING)
+					&& tx.outgoingHeaders.get(HDR_CONTENT_ENCODING).containsIgnoreCase("gzip");
+
+			if (responseBigEnoughToCompress && client.rootContext.gzip
+					&& !tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) && tx.hasResponse()) {
+				var ae = tx.headersOr(HDR_ACCEPT_ENCODING);
+				if (ae.isPresent() && ae.get().expand(",").containsIgnoreCase("gzip")) {
+					gzip = true;
+					useLength = false;
+				}
 			}
 		}
 
@@ -3794,40 +3663,11 @@ public class UHTTPD {
 			haveLength = false;
 			responseLength = -1;
 		}
-		
-		private void calcResponseLengthAndType(Transaction tx) {
-			chunk = false;
-			haveLength = useLength = tx.responseLength.isPresent();
-			responseLength = useLength ? tx.responseLength.get() : -1;
-			responseBigEnoughToCompress = (!useLength || (responseLength >= client.rootContext.minGzipSize) ) ;
-			
-			// TODO gzip header might contain parameters for compression
-			gzip = responseBigEnoughToCompress && client.rootContext.gzip && tx.hasResponse() && tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) &&
-					tx.outgoingHeaders.get(HDR_CONTENT_ENCODING).containsIgnoreCase("gzip");
-			
-			if(responseBigEnoughToCompress && client.rootContext.gzip && !tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) && tx.hasResponse()) {
-				var ae = tx.headersOr(HDR_ACCEPT_ENCODING); 
-				if(ae.isPresent() && ae.get().expand(",").containsIgnoreCase("gzip")) {
-					gzip = true;
-					useLength = false;
-				}
-			} 
-		}
-		
-		private void calcChunkingAndClose(Transaction tx) {
-			if (!useLength) {
-				if(tx.protocol.compareTo(Protocol.HTTP_1_0) > 0 && tx.protocol.compareTo(Protocol.HTTP_2) < 0) {
-					chunk = true;
-				}
-				else
-					close = true;
-			}
-		}
 
 		private void respondWithHeaders(Transaction tx) throws IOException {
-			
+
 			var status = tx.code.orElse(Status.OK);
-			
+
 // HTTP/1.1 says even errors keep the connection alive
 //			if (status.getCode() >= 300)
 //				close = true;
@@ -3843,15 +3683,16 @@ public class UHTTPD {
 			if (LOG.isLoggable(Level.DEBUG) && !LOG.isLoggable(Level.TRACE))
 				LOG.log(Level.DEBUG, "HTTP OUT: {0} {1} {2}", tx.protocol().text(), status.code,
 						tx.responseText.orElse(status.getText()));
-			
-			if(responseBigEnoughToCompress && client.rootContext.gzip && !tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) && tx.hasResponse()) {
-				var ae = tx.headersOr(HDR_ACCEPT_ENCODING); 
-				if(ae.isPresent() && ae.get().expand(",").containsIgnoreCase("gzip")) {
+
+			if (responseBigEnoughToCompress && client.rootContext.gzip
+					&& !tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) && tx.hasResponse()) {
+				var ae = tx.headersOr(HDR_ACCEPT_ENCODING);
+				if (ae.isPresent() && ae.get().expand(",").containsIgnoreCase("gzip")) {
 					w.print(HDR_CONTENT_ENCODING);
 					w.println(": gzip");
 				}
-			} 
-			
+			}
+
 			if (useLength) {
 				w.print(HDR_CONTENT_LENGTH);
 				w.print(": ");
@@ -3859,22 +3700,21 @@ public class UHTTPD {
 				w.println();
 			}
 
-			if(chunk) {
+			if (chunk) {
 				w.print(HDR_TRANSFER_ENCODING);
 				w.println(": chunked");
 				chunk = true;
 			}
-			
+
 			/*
-				 * else { close = true; }
-				 */
+			 * else { close = true; }
+			 */
 
 			if (!tx.hasResponseHeader(HDR_CONNECTION)) {
 				if (close && tx.protocol.compareTo(Protocol.HTTP_2) < 0) {
 					w.print(HDR_CONNECTION);
 					w.println(": close");
-				} else if (tx.protocol.compareTo(Protocol.HTTP_1_0) > 0
-						&& tx.protocol.compareTo(Protocol.HTTP_2) < 0) {
+				} else if (tx.protocol.compareTo(Protocol.HTTP_1_0) > 0 && tx.protocol.compareTo(Protocol.HTTP_2) < 0) {
 					w.print(HDR_CONNECTION);
 					w.println(": keep-alive");
 				}
@@ -3886,45 +3726,44 @@ public class UHTTPD {
 				w.print(tx.responseType.get());
 				w.println();
 			}
-			
+
 			for (var nvp : tx.outgoingHeaders.values()) {
 				w.print(nvp.name());
 				w.print(": ");
-				w.print(nvp.value().orElse(""));
+				w.print(nvp.ofString().orElse(""));
 				w.println();
 			}
-			
-			for(var cookie : tx.outgoingCookies.values()) {
+
+			for (var cookie : tx.outgoingCookies.values()) {
 				w.print(HDR_SET_COOKIE);
 				w.print(": ");
 				w.print(cookie);
 				w.println();
 			}
-			
+
 			if (!client.rootContext.cache) {
 				w.print(HDR_CACHE_CONTROL);
 				w.println(": no-cache");
 			}
-			
+
 			w.println();
 			w.flush();
 		}
 
 		private void responseContent(Transaction tx) throws IOException {
-			try(var  out = responseWriter(tx)) {
+			try (var out = responseWriter(tx)) {
 				if (tx.responder.isPresent()) {
 					var buffer = ByteBuffer.allocateDirect(client.rootContext.sendBufferSize);
 					try {
 						do {
 							buffer.clear();
 							tx.responder.get().supply(buffer);
-							if(buffer.position() > 0) {
+							if (buffer.position() > 0) {
 								buffer.flip();
 								out.write(buffer);
 							}
-						} while(buffer.position() > 0);
-					}
-					finally {
+						} while (buffer.position() > 0);
+					} finally {
 						tx.responder.get().close();
 					}
 				}
@@ -3932,11 +3771,12 @@ public class UHTTPD {
 		}
 
 	}
-	
+
 	private static final class HTTPContent implements Content {
+
 		private final Transaction tx;
 		private final ReadableByteChannel input;
-		
+
 		private boolean asNamedParts;
 		private boolean asParts;
 		private boolean asStream;
@@ -3960,10 +3800,10 @@ public class UHTTPD {
 		@Override
 		public <P extends Part> Iterable<P> asParts(Class<P> partType) {
 			if (asStream || asNamedParts || asChannel) {
-				throw new IllegalStateException("Already have content as stream or named parts.");
+				return Collections.emptyList();
 			}
 			asParts = true;
-			return (Iterable<P>) asPartsImpl(partType);
+			return asPartsImpl(partType);
 		}
 
 		@Override
@@ -3975,29 +3815,38 @@ public class UHTTPD {
 		}
 
 		@Override
+		public void close() {
+			if (parts != null) {
+				parts.forEach(p -> p.close());
+			}
+		}
+
+		@Override
 		public Optional<String> contentType() {
 			return tx.headerOr(HDR_CONTENT_TYPE);
 		}
 
 		@Override
-		public <P extends Part> Optional<P> part(String name, Class<P> clazz) {
+		public <P extends Part> Optional<P> ofPart(String name, Class<P> clazz) {
 			if (asStream || asParts) {
-				throw new IllegalStateException(
-						"Already have content as stream or iterated parts.");
+				throw new IllegalStateException("Already have content as stream or iterated parts.");
 			}
-//			var wasUninitialised = parts ==  null;
-//			P foundPart = null;
+
+			if (LOG.isLoggable(Level.TRACE))
+				LOG.log(Level.TRACE, "Looking for part named {0} of type {1}", name, clazz);
+
 			for (var part : asPartsImpl(clazz)) {
 				if (part.name().equals(name)) {
-//					if(!wasUninitialised)
-//						return (Optional<P>) Optional.of(part);
-//					else if(foundPart == null)
-//						foundPart = (P)part;
+					if (LOG.isLoggable(Level.TRACE))
+						LOG.log(Level.TRACE, "Found part named {0} of type {1}", name, clazz);
+					
 					return Optional.of(part);
 				}
 			}
 
-//			return Optional.ofNullable(foundPart);
+			if (LOG.isLoggable(Level.TRACE))
+				LOG.log(Level.TRACE, "Did not find part named {0} of type {1}", name, clazz);
+
 			return Optional.empty();
 		}
 
@@ -4006,50 +3855,71 @@ public class UHTTPD {
 			return tx.headersOr(HDR_CONTENT_LENGTH).map(o -> o.asLong());
 		}
 
-		@Override
-		public void close() {
-			if(parts != null) {
-				parts.forEach(p -> p.close());
-			}
-		}
-
 		@SuppressWarnings("unchecked")
 		<P extends Part> Iterable<P> asPartsImpl(Class<P> partType) {
 			if (parts == null) {
 				/* If we have not started iterating yet */
 				parts = new ArrayList<>();
-				return (Iterable<P>) createIterable(partType);
-			}
-			else if(partIterator == null) {
+				return createIterable(partType);
+			} else if (partIterator == null) {
 				/* If we have finished iterating */
 				return (Iterable<P>) parts;
-			}
-			else {
+			} else {
 				/* We are part way through iterating */
-				return (Iterable<P>) new Iterable<P>() {
+				return new Iterable<>() {
 					@Override
 					public Iterator<P> iterator() {
-						return (Iterator<P>) partIterator;
+						/* In this state, if we get to the end of the streamed parts then iterate through
+						 * the stored parts too
+						 */
+						return new Iterator<P>() {
+							
+							P item = null;
+							Iterator<P> storedIt;
+
+							@Override
+							public boolean hasNext() {
+								checkNext();
+								return item != null;
+							}
+
+							@Override
+							public P next() {
+								try {
+									checkNext();
+									if(item == null)
+										throw new NoSuchElementException();
+									return item;
+								}
+								finally {
+									item = null;
+								}
+							}
+							
+							private void checkNext() {
+								if(item == null) {
+									while(true) {
+										if(storedIt == null) {
+											if(partIterator.hasNext()) {
+												item = (P)partIterator.next();
+												break;
+											}
+											else {
+												storedIt = (Iterator<P>) parts.iterator();
+											}
+										}
+										else {
+											if(storedIt.hasNext()) {
+												item = storedIt.next();
+											}
+											break;
+										}
+									}
+								}
+							}
+						};
 					}
 				};
-			}
-		}
-
-		Iterator<Part> iteratorImpl(ByteChannel input) {
-			var content = Named.parseSeparatedStrings(contentType().get());
-			var type = content.values().iterator().next();
-			switch (type.name()) {
-			case "multipart/form-data":
-				return new MultipartFormDataPartIterator(tx.client, input,
-						content.containsKey("boundary")
-								? content.get("boundary").asString()
-								: null,
-						size().orElse(Long.MAX_VALUE));
-			case "application/x-www-form-urlencoded":
-				return new URLEncodedFormDataPartIterator(tx.client, input,
-						size().orElse(Long.MAX_VALUE));
-			default:
-				throw new UnsupportedOperationException("Unknown content encoding.");
 			}
 		}
 
@@ -4064,17 +3934,35 @@ public class UHTTPD {
 						protected int readImpl(ByteBuffer dst) throws IOException {
 							return input.read(dst);
 						}
-						
+
 					});
 					partIterator = (Iterator<Part>) partCapturingIterator(partType, it);
-					return (Iterator<P>)partIterator;
+					return (Iterator<P>) partIterator;
 				}
 			};
 		}
 
+		Iterator<Part> iteratorImpl(ByteChannel input) {
+			if (contentType().isPresent()) {
+				var content = Named.parseSeparatedStrings(contentType().get());
+				var type = content.values().iterator().next();
+				switch (type.name()) {
+				case "multipart/form-data":
+					return new MultipartFormDataPartIterator(tx.client, input,
+							content.containsKey("boundary") ? content.get("boundary").asString() : null);
+				case "application/x-www-form-urlencoded":
+					return new URLEncodedFormDataPartIterator(tx.client, input);
+				default:
+					return new SinglePartIterator(tx.client, input);
+				}
+			} else {
+				return new SinglePartIterator(tx.client, input);
+			}
+		}
+
 		<P extends Part> Iterator<P> partCapturingIterator(Class<P> partType, Iterator<Part> it) {
 			return new Iterator<>() {
-				
+
 				private P item;
 				private P previousItem;
 
@@ -4083,14 +3971,14 @@ public class UHTTPD {
 					checkNext();
 					return item != null;
 				}
-				
+
 				@Override
 				public P next() {
 					checkNext();
-					if(item == null)
+					if (item == null)
 						throw new NoSuchElementException();
 					try {
-						if(LOG.isLoggable(Level.DEBUG))
+						if (LOG.isLoggable(Level.DEBUG))
 							LOG.log(Level.DEBUG, "Parsed part. {0}", item.name());
 						parts.add(item);
 						return item;
@@ -4103,16 +3991,14 @@ public class UHTTPD {
 				@SuppressWarnings("unchecked")
 				private void checkNext() {
 					if (item == null) {
-						/* TODO If the previous item did not read it's content,
-						 * then drain the content.
-						 * 
-						 * TODO Store it in memory (or disk) until all request handlers
-						 * are done with the part(s)
-						 * 
-						 * TODO will also need to drain content if no parts are iterated
-						 * over at all
+						/*
+						 * TODO will also need to drain content if no parts are iterated over at all
 						 */
-						if(previousItem != null && !previousItem.satisfied()) {
+						if (previousItem != null && !previousItem.satisfied()) {
+
+							if (LOG.isLoggable(Level.DEBUG))
+								LOG.log(Level.DEBUG, "Satisfying previous part.");
+
 							try {
 								previousItem.satisfy();
 							} catch (IOException e) {
@@ -4121,19 +4007,25 @@ public class UHTTPD {
 								previousItem = null;
 							}
 						}
-						
-						
-						while(it.hasNext()) {
+
+						if (LOG.isLoggable(Level.DEBUG))
+							LOG.log(Level.DEBUG, "Waiting for next part of type {0}", partType);
+
+						while (it.hasNext()) {
 							Part i = it.next();
-							if(i.getClass().isAssignableFrom(partType)) {
-								item = (P)i;
+							if (partType.isAssignableFrom(i.getClass())) {
+								item = (P) i;
 								break;
 							}
 						}
-						
+
 						// After this point, take parts from the gathered list
-						if(item == null)
-							partIterator = null;  
+						if (item == null)
+							partIterator = null;
+						else  {
+							if (LOG.isLoggable(Level.DEBUG))
+								LOG.log(Level.DEBUG, "Found part");
+						}
 					}
 				}
 			};
@@ -4150,7 +4042,7 @@ public class UHTTPD {
 	}
 
 	private final static class LengthLimitedChannel extends WebChannel {
-		
+
 		private final long length;
 		private long read;
 
@@ -4161,28 +4053,36 @@ public class UHTTPD {
 
 		@Override
 		public int read(ByteBuffer dst) throws IOException {
-			if(read >= length) {
+			if (read >= length) {
 				return -1;
 			}
-			if(read + dst.remaining() > length) {
-				var over = (int)((read + dst.remaining()) - length);
+			if (read + dst.remaining() > length) {
+//				dst = ByteBuffer.allocate((int)length);
+
+//				dst = dst.slice(0, (int)length);
+
+				var over = (int) ((read + dst.remaining()) - length);
 				dst.limit(dst.limit() - over);
 			}
 			var r = delegate.read(dst);
-			if(r == -1)
+			if (r == -1)
 				return r;
 			read += r;
+			if (read > length) {
+				throw new IllegalStateException("Read more than expected.");
+			}
 			return r;
 		}
-		
+
 	}
 
 	private static final class MultipartBoundaryStream extends InputStream {
 		enum State {
 			WAIT_BOUNDARY, WAIT_NEWLINE, WAIT_END, END
 		}
+
 		static byte[] newlineBytes = "\r\n".getBytes(HTTP_CHARSET_ENCODING);
-		
+
 		static byte[] endBytes = "--".getBytes(HTTP_CHARSET_ENCODING);
 		private final InputStream chin;
 		private byte[] boundaryBytes;
@@ -4197,67 +4097,63 @@ public class UHTTPD {
 			this.chin = chin;
 			this.iterator = iterator;
 			boundaryBytes = ("\r\n--" + boundary).getBytes(HTTP_CHARSET_ENCODING);
-			
+
 			backBuffer = ByteBuffer.allocate(boundaryBytes.length);
 		}
 
 		@Override
 		public int read() throws IOException {
-			if(state == State.END) 
+			if (state == State.END)
 				return -1;
-			
-			while(true) {
-			
+
+			while (true) {
+
 				int r;
-				if(readBuffer == null) {
+				if (readBuffer == null) {
 					r = chin.read();
-					if(r == - 1) {
+					if (r == -1) {
 						state = State.END;
 						return r;
 					}
-				}
-				else {
-					if(readBuffer.hasRemaining())
+				} else {
+					if (readBuffer.hasRemaining())
 						return readBuffer.get();
 					readBuffer = null;
 					continue;
 				}
-				
-				switch(state) {
+
+				switch (state) {
 				case WAIT_NEWLINE:
-					if(r == newlineBytes[matchIndex]) {
+					if (r == newlineBytes[matchIndex]) {
 						matchIndex++;
-						if(matchIndex == newlineBytes.length) {
+						if (matchIndex == newlineBytes.length) {
 							matchIndex = 0;
 							state = State.END;
 							return -1;
 						}
-					}
-					else {
+					} else {
 						state = State.WAIT_BOUNDARY;
 						matchIndex = 0;
 						return r;
 					}
 					break;
 				case WAIT_END:
-					if(r == endBytes[matchIndex]) {
+					if (r == endBytes[matchIndex]) {
 						matchIndex++;
-						if(matchIndex == endBytes.length) {
+						if (matchIndex == endBytes.length) {
 							matchIndex = 0;
 							iterator.end = true;
 							state = State.WAIT_NEWLINE;
 						}
-					}
-					else {
-						if(r == newlineBytes[matchIndex]) {
+					} else {
+						if (r == newlineBytes[matchIndex]) {
 							matchIndex++;
-							if(matchIndex == newlineBytes.length) {
+							if (matchIndex == newlineBytes.length) {
 								matchIndex = 0;
 								state = State.END;
 								return -1;
 							}
-						}
-						else {
+						} else {
 							state = State.WAIT_BOUNDARY;
 							matchIndex = 0;
 							return r;
@@ -4265,23 +4161,20 @@ public class UHTTPD {
 					}
 					break;
 				case WAIT_BOUNDARY:
-					if(r == boundaryBytes[matchIndex]) {
+					if (r == boundaryBytes[matchIndex]) {
 						matchIndex++;
-						if(matchIndex == boundaryBytes.length) {
+						if (matchIndex == boundaryBytes.length) {
 							backBuffer.clear();
 							state = State.WAIT_END;
 							matchIndex = 0;
+						} else {
+							backBuffer.put((byte) r);
 						}
-						else {
-							backBuffer.put((byte)r);
-						}
-					}
-					else {
-						if(backBuffer.position() == 0) {
+					} else {
+						if (backBuffer.position() == 0) {
 							matchIndex = 0;
 							return r;
-						}
-						else {
+						} else {
 							backBuffer.flip();
 							readBuffer = backBuffer;
 						}
@@ -4293,10 +4186,8 @@ public class UHTTPD {
 			}
 		}
 	}
-	
-	private final static class MultipartFormDataPartIterator extends WebChannel implements Iterator<Part> {
 
-		
+	private final static class MultipartFormDataPartIterator extends WebChannel implements Iterator<Part> {
 
 		String boundary;
 		StringBuilder buffer = new StringBuilder(256);
@@ -4307,12 +4198,8 @@ public class UHTTPD {
 		boolean pastFirstBoundary;
 		FormData next;
 
-		long multipartRead;
-		final long size;
-
-		MultipartFormDataPartIterator(Client client, ByteChannel chan, String boundary, long size) {
+		MultipartFormDataPartIterator(Client client, ByteChannel chan, String boundary) {
 			super(client, chan, StandardOpenOption.READ);
-			this.size = size;
 			this.boundary = boundary;
 		}
 
@@ -4335,22 +4222,20 @@ public class UHTTPD {
 		}
 
 		void checkNext() {
-			if(end)
+			if (end)
 				return;
-			
+
 			if (next == null) {
 				char ch;
 				buffer.setLength(0);
 				try {
-					
+
 					MultipartBoundaryStream content = null;
-					
+
 					var charset = client.charset();
 					var chin = Channels.newInputStream(delegate);
-					
-					while (!end && multipartRead < size && (ch = (char) chin.read()) != -1) {
 
-						multipartRead++;
+					while (!end && (ch = (char) chin.read()) != -1) {
 						if (ch == '\n') {
 							continue;
 						}
@@ -4365,13 +4250,12 @@ public class UHTTPD {
 							if (line.startsWith("--" + boundary)) {
 								// Next part
 								end = line.endsWith("--");
-								if(end)
+								if (end)
 									break;
 								else {
-									if(pastFirstBoundary) {
+									if (pastFirstBoundary) {
 										break;
-									}
-									else {
+									} else {
 										pastFirstBoundary = true;
 									}
 								}
@@ -4381,7 +4265,7 @@ public class UHTTPD {
 								contentDisposition = Named.parseHeader(line).asString();
 							} else if (line.equals("")) {
 								// content will start after a NL (CR was terminated the readLine())
-								if(chin.read() != 10) 
+								if (chin.read() != 10)
 									throw new IOException("Excepted newline.");
 								content = new MultipartBoundaryStream(chin, boundary, this);
 								break;
@@ -4393,11 +4277,10 @@ public class UHTTPD {
 							buffer.append(ch);
 						}
 					}
-					if(end) {
-						if(LOG.isLoggable(Level.DEBUG))
+					if (end) {
+						if (LOG.isLoggable(Level.DEBUG))
 							LOG.log(Level.DEBUG, "Multipart stream ended.");
-					}
-					else {
+					} else {
 						try {
 							next = new FormData(contentType, charset, contentDisposition, content);
 						} finally {
@@ -4411,9 +4294,9 @@ public class UHTTPD {
 			}
 		}
 	}
-	
+
 	private static abstract class PsuedoCloseByteChannel implements ByteChannel {
-		
+
 		private boolean closed;
 
 		@Override
@@ -4428,30 +4311,29 @@ public class UHTTPD {
 
 		@Override
 		public final int read(ByteBuffer dst) throws IOException {
-			if(closed)
+			if (closed)
 				throw new IOException("Closed.");
 			return readImpl(dst);
 		}
 
 		@Override
 		public final int write(ByteBuffer src) throws IOException {
-			if(closed)
+			if (closed)
 				throw new IOException("Closed.");
 			return writeImpl(src);
 		}
 
 		protected int readImpl(ByteBuffer dst) throws IOException {
-			throw new UnsupportedOperationException(); 
+			throw new UnsupportedOperationException();
 		}
-		
+
 		protected int writeImpl(ByteBuffer src) throws IOException {
 			throw new UnsupportedOperationException();
 		}
-		
+
 	}
 
 	private final static class RootContextImpl extends AbstractContext implements RootContext {
-
 
 		private final int backlog;
 		private final boolean cache;
@@ -4464,7 +4346,6 @@ public class UHTTPD {
 		private final int keepAliveTimeoutSecs;
 		private final boolean gzip;
 		private final int sendBufferSize;
-		private final int recvBufferSize;
 		private final int maxUnchunkedSize;
 		private final long minGzipSize;
 		private boolean open = true;
@@ -4473,19 +4354,18 @@ public class UHTTPD {
 		private final ServerSocketChannel sslServerSocket;
 		private final String threadName;
 		private final boolean daemon;
-		private final Set<Client> clients = Collections.synchronizedSet(new HashSet<>()); 
+		private final Set<Client> clients = Collections.synchronizedSet(new HashSet<>());
 
 		private Thread otherThread;
 		private Thread serverThread;
-		
-		
+
 		private RootContextImpl(RootContextBuilder builder) throws UnknownHostException, IOException {
 			super(builder);
-			
+
 			threadName = builder.threadName;
 			daemon = builder.daemon;
 			maxUnchunkedSize = builder.maxUnchunkedSize;
-			
+
 			httpPort = builder.httpPort;
 			httpsPort = builder.httpsPort;
 			httpAddress = builder.httpAddress;
@@ -4495,83 +4375,79 @@ public class UHTTPD {
 			keepAlive = builder.keepAlive;
 			gzip = builder.gzip;
 			sendBufferSize = builder.sendBufferSize;
-			recvBufferSize = builder.recvBufferSize;
 			keepAliveTimeoutSecs = builder.keepAliveTimeoutSecs;
 			keepAliveMax = builder.keepAliveMax;
 			runner = builder.runner.orElse(threadPoolRunner().build());
 			minGzipSize = builder.gzipMinSize.orElse(300l);
-	
+
 			if (httpPort.isPresent()) {
 				LOG.log(Level.INFO, "Starting HTTP server on port {0}", httpPort.get());
 				serverSocket = ServerSocketChannel.open().setOption(StandardSocketOptions.SO_REUSEADDR, true)
 						.bind(new InetSocketAddress(httpAddress.orElse(InetAddress.getByName("127.0.0.1")),
 								httpPort.orElse(8080)), backlog);
-			}
-			else {
+			} else {
 				serverSocket = null;
 			}
-	
+
 			if (httpsPort.isPresent()) {
 				LOG.log(Level.INFO, "Start HTTPS server on port {0}", httpsPort.get());
-	
+
 				SSLContext sc = null;
 				try {
 					KeyStore ks = null;
 					KeyManagerFactory kmf = null;
-	
-					if(builder.keyStore.isPresent()) {
+
+					if (builder.keyStore.isPresent()) {
 						LOG.log(Level.INFO, "Using provided keystore");
 						ks = builder.keyStore.get();
-					}
-					else if (builder.keyStoreFile.isPresent() && Files.exists(builder.keyStoreFile.get())) {
+					} else if (builder.keyStoreFile.isPresent() && Files.exists(builder.keyStoreFile.get())) {
 						LOG.log(Level.INFO, "Using keystore {0}", builder.keyStoreFile.get());
 						try (var in = Files.newInputStream(builder.keyStoreFile.get())) {
 							ks = KeyStore.getInstance(builder.keyStoreType.orElse(KeyStore.getDefaultType()));
 							ks.load(in, builder.keyStorePassword.orElse(new char[0]));
 						}
-					}
-					else {
+					} else {
 						var p = Paths.get(System.getProperty("user.home"), ".keystore");
-						if(Files.exists(p)) {
+						if (Files.exists(p)) {
 							try (var in = Files.newInputStream(p)) {
 								ks = KeyStore.getInstance(builder.keyStoreType.orElse(KeyStore.getDefaultType()));
 								ks.load(in, builder.keyStorePassword.orElse("changeit".toCharArray()));
 								LOG.log(Level.INFO, "Using user default keystore");
-							}
-							catch(Exception e) {
+							} catch (Exception e) {
 								LOG.log(Level.WARNING, "Could not load user keystore at {0}.", p, e);
 							}
 						}
-						
-						if(ks == null) {
+
+						if (ks == null) {
 							LOG.log(Level.INFO, "Using system default keystore");
 							sc = SSLContext.getDefault();
 						}
 					}
-					
-					if(sc == null) {
+
+					if (sc == null) {
 						kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-						kmf.init(ks, builder.keyPassword.orElse(builder.keyStorePassword.orElse("changeit".toCharArray())));
+						kmf.init(ks,
+								builder.keyPassword.orElse(builder.keyStorePassword.orElse("changeit".toCharArray())));
 						sc = SSLContext.getInstance("TLS");
 						sc.init(kmf.getKeyManagers(), null, null);
 					}
-					
+
 				} catch (Exception e) {
 					throw new IOException("Failed to configure SSL.", e);
 				}
-	
-				var plainSslServerSocket = ServerSocketChannel.open().setOption(StandardSocketOptions.SO_REUSEADDR, true)
+
+				var plainSslServerSocket = ServerSocketChannel.open()
+						.setOption(StandardSocketOptions.SO_REUSEADDR, true)
 						.bind(new InetSocketAddress(httpsAddress.orElse(InetAddress.getByName("127.0.0.1")),
 								httpsPort.orElse(8443)), backlog);
-				
+
 				sslServerSocket = new SSL.SSLServerSocketChannel(plainSslServerSocket, sc, runner);
-			}
-			else {
+			} else {
 				sslServerSocket = null;
 			}
-				
+
 		}
-	
+
 		@Override
 		public void close() throws IOException {
 			if (!open)
@@ -4579,16 +4455,16 @@ public class UHTTPD {
 			LOG.log(Level.INFO, "Closing root HTTP context.");
 			open = false;
 			try {
-				try { 
-					if(serverSocket != null)
+				try {
+					if (serverSocket != null)
 						serverSocket.close();
 				} finally {
 					try {
-						if(sslServerSocket != null)
+						if (sslServerSocket != null)
 							sslServerSocket.close();
 					} finally {
-						synchronized(clients) {
-							while(!clients.isEmpty())
+						synchronized (clients) {
+							while (!clients.isEmpty())
 								clients.iterator().next().close();
 						}
 						try {
@@ -4605,27 +4481,27 @@ public class UHTTPD {
 						runner.close();
 					}
 				}
-			}
-			finally {
+			} finally {
 				super.close();
 			}
 		}
-	
+
 		@Override
 		public void get(Transaction tx) throws Exception {
-				
+
 			for (var c : handlers.entrySet()) {
 				if (c.getKey().matches(tx)) {
 					tx.selector = Optional.of(c.getKey());
 					try {
 						c.getValue().get(tx);
-						if(!tx.responsed() && !tx.hasResponse())
-							tx.responseCode(Status.OK); 
+						if (!tx.responsed() && !tx.hasResponse())
+							tx.responseCode(Status.OK);
 					} catch (FileNotFoundException fnfe) {
-						if(LOG.isLoggable(Level.DEBUG))
+						if (LOG.isLoggable(Level.DEBUG))
 							LOG.log(Level.DEBUG, "File not found. {0}", fnfe.getMessage());
 						tx.notFound();
 					} catch (Exception ise) {
+						ise.printStackTrace();
 						LOG.log(Level.ERROR, "Request handling failed.", ise);
 						tx.error(ise);
 					}
@@ -4638,13 +4514,12 @@ public class UHTTPD {
 			if (tx.code.isEmpty() && !tx.hasResponse()) {
 				tx.notFound();
 			}
-			
+
 		}
-	
-	
+
 		@Override
 		public void join() throws InterruptedException {
-			if(serverThread == null)
+			if (serverThread == null)
 				throw new IllegalStateException("Not started.");
 			serverThread.join();
 		}
@@ -4652,9 +4527,9 @@ public class UHTTPD {
 		@Override
 		public void run() {
 			serverThread = Thread.currentThread();
-			
+
 			/* Run, keeping number of thread used to minimum required for configuration */
-	
+
 			if (serverSocket == null) {
 				/* HTTPS only */
 				runOn(sslServerSocket, Scheme.HTTPS, httpsPort.get());
@@ -4682,14 +4557,13 @@ public class UHTTPD {
 
 		@Override
 		public void start() {
-			if(serverThread == null) {
+			if (serverThread == null) {
 				serverThread = new Thread(this, threadName);
 				serverThread.setDaemon(daemon);
 				serverThread.start();
-			}
-			else
+			} else
 				throw new IllegalStateException("Already started.");
-			
+
 		}
 
 		private void runOn(ServerSocketChannel so, Scheme scheme, int port) {
@@ -4697,25 +4571,150 @@ public class UHTTPD {
 				LOG.log(Level.DEBUG, "Waiting for connection");
 				try {
 					runner.run(new Client(port, scheme, so.accept(), this));
-				} catch(AsynchronousCloseException ace) {
+				} catch (AsynchronousCloseException ace) {
 				} catch (Exception e) {
 					LOG.log(Level.ERROR, "Failed waiting for connection.", e);
 				}
 			}
 		}
 	}
-	
+
+	private static final class SinglePartIterator implements Iterator<Part> {
+		final ByteChannel input;
+		final Client client;
+
+		Part next;
+		int parts = 0;
+
+		SinglePartIterator(Client client, ByteChannel input) {
+			this.input = input;
+			this.client = client;
+		}
+
+		@Override
+		public boolean hasNext() {
+			checkNext();
+			return next != null;
+		}
+
+		@Override
+		public Part next() {
+			try {
+				checkNext();
+				if (next == null)
+					throw new NoSuchElementException();
+				return next;
+			} finally {
+				next = null;
+			}
+		}
+
+		void checkNext() {
+			if (next == null) {
+				if (parts == 0) {
+					next = new Part() {
+						private boolean satisfied;
+
+						@Override
+						public ReadableByteChannel asChannel() {
+							return new ReadableByteChannel() {
+
+								@Override
+								public void close() throws IOException {
+									try {
+										input.close();
+									} finally {
+										satisfied = true;
+									}
+								}
+
+								@Override
+								public boolean isOpen() {
+									return input.isOpen();
+								}
+
+								@Override
+								public int read(ByteBuffer dst) throws IOException {
+									return input.read(dst);
+								}
+							};
+						}
+
+						@Override
+						public Reader asReader() {
+							var rdr = Channels.newReader(input, client.charset);
+							return new FilterReader(rdr) {
+								@Override
+								public void close() throws IOException {
+									try {
+										super.close();
+									} finally {
+										satisfied = true;
+									}
+								}
+							};
+						}
+
+						@Override
+						public InputStream asStream() {
+							var in = Channels.newInputStream(input);
+							return new FilterInputStream(in) {
+								@Override
+								public void close() throws IOException {
+									try {
+										super.close();
+									} finally {
+										satisfied = true;
+									}
+								}
+							};
+						}
+
+						@Override
+						public String asString() {
+							var out = new ByteArrayOutputStream();
+							try (var in = asStream()) {
+								in.transferTo(out);
+							} catch (IOException ioe) {
+								throw new UncheckedIOException(ioe);
+							}
+							return new String(out.toByteArray(), client.charset);
+						}
+
+						@Override
+						public String name() {
+							return "default";
+						}
+
+						@Override
+						public boolean satisfied() {
+							return satisfied;
+						}
+
+						@Override
+						public void satisfy() throws IOException {
+							Part.super.satisfy();
+							asStream().transferTo(OutputStream.nullOutputStream());
+						}
+					};
+					parts++;
+				}
+			}
+		}
+	}
+
 	private static final class SocketTunnelHandler extends AbstractTunnelHandler {
 
 		@Override
 		TunnelWireProtocol create(String host, int port, Client client) throws IOException {
 			var sckt = SocketChannel.open(new InetSocketAddress(host, port));
-			return new TunnelWireProtocol(Optional.of(client.rootContext.sendBufferSize), sckt::read, sckt::write, Optional.of(() -> { 
-				try {
-					sckt.close();
-				} catch (IOException e) {
-				} 
-			}), client);
+			return new TunnelWireProtocol(Optional.of(client.rootContext.sendBufferSize), sckt::read, sckt::write,
+					Optional.of(() -> {
+						try {
+							sckt.close();
+						} catch (IOException e) {
+						}
+					}), client);
 		}
 
 	}
@@ -4725,7 +4724,7 @@ public class UHTTPD {
 	 * <strong>NioSSL</strong> project (https://github.com/baswerc/niossl). We use
 	 * this because we need a {@link SocketChnannel} implementation, but with SSL
 	 * support. The JDK does not provide this.
-	 * 
+	 *
 	 * Copyright 2015 Corey Baswell
 	 *
 	 * Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -4743,61 +4742,61 @@ public class UHTTPD {
 	private final static class SSL {
 		private final static class SSLEngineBuffer {
 			private final SocketChannel socketChannel;
-	
+
 			private final SSLEngine sslEngine;
-	
+
 			private final Runner executorService;
-	
+
 			private final ByteBuffer networkInboundBuffer;
-	
+
 			private final ByteBuffer networkOutboundBuffer;
-	
+
 			private final int minimumApplicationBufferSize;
-	
+
 			private final ByteBuffer unwrapBuffer;
-	
+
 			private final ByteBuffer wrapBuffer;
-	
+
 			public SSLEngineBuffer(SocketChannel socketChannel, SSLEngine sslEngine, Runner executorService) {
 				this.socketChannel = socketChannel;
 				this.sslEngine = sslEngine;
 				this.executorService = executorService;
-	
+
 				var session = sslEngine.getSession();
 				int networkBufferSize = session.getPacketBufferSize();
-	
+
 				networkInboundBuffer = ByteBuffer.allocateDirect(networkBufferSize);
-	
+
 				networkOutboundBuffer = ByteBuffer.allocateDirect(networkBufferSize);
 				networkOutboundBuffer.flip();
-	
+
 				minimumApplicationBufferSize = session.getApplicationBufferSize();
 				unwrapBuffer = ByteBuffer.allocateDirect(minimumApplicationBufferSize);
 				wrapBuffer = ByteBuffer.allocateDirect(minimumApplicationBufferSize);
 				wrapBuffer.flip();
 			}
-	
+
 			void close() {
 				try {
 					sslEngine.closeInbound();
 				} catch (Exception e) {
 				}
-	
+
 				try {
 					sslEngine.closeOutbound();
 				} catch (Exception e) {
 				}
 			}
-	
+
 			int flushNetworkOutbound() throws IOException {
 				return send(socketChannel, networkOutboundBuffer);
 			}
-	
+
 			int send(SocketChannel channel, ByteBuffer buffer) throws IOException {
 				int totalWritten = 0;
 				while (buffer.hasRemaining()) {
 					int written = channel.write(buffer);
-	
+
 					if (written == 0) {
 						break;
 					} else if (written < 0) {
@@ -4810,13 +4809,13 @@ public class UHTTPD {
 				}
 				return totalWritten;
 			}
-	
+
 			int unwrap(ByteBuffer applicationInputBuffer) throws IOException {
 				if (applicationInputBuffer.capacity() < minimumApplicationBufferSize) {
 					throw new IllegalArgumentException(
 							"Application buffer size must be at least: " + minimumApplicationBufferSize);
 				}
-	
+
 				if (unwrapBuffer.position() != 0) {
 					unwrapBuffer.flip();
 					while (unwrapBuffer.hasRemaining() && applicationInputBuffer.hasRemaining()) {
@@ -4824,43 +4823,44 @@ public class UHTTPD {
 					}
 					unwrapBuffer.compact();
 				}
-	
+
 				int totalUnwrapped = 0;
 				int unwrapped, wrapped;
-	
+
 				do {
 					totalUnwrapped += unwrapped = doUnwrap(applicationInputBuffer);
 					wrapped = doWrap(wrapBuffer);
-				} while (unwrapped > 0
-						|| wrapped > 0 && (networkOutboundBuffer.hasRemaining() && networkInboundBuffer.hasRemaining()));
-	
+				} while (unwrapped > 0 || wrapped > 0
+						&& (networkOutboundBuffer.hasRemaining() && networkInboundBuffer.hasRemaining()));
+
 				return totalUnwrapped;
 			}
-	
+
 			int wrap(ByteBuffer applicationOutboundBuffer) throws IOException {
 				int wrapped = doWrap(applicationOutboundBuffer);
 				doUnwrap(unwrapBuffer);
 				return wrapped;
 			}
-	
+
 			private int doUnwrap(ByteBuffer applicationInputBuffer) throws IOException {
-	
+
 				if (SSL_LOG.isLoggable(Level.TRACE)) {
 					SSL_LOG.log(Level.TRACE, "unwrap:");
 				}
-	
+
 				int totalReadFromChannel = 0;
-	
+
 				// Keep looping until peer has no more data ready or the
 				// applicationInboundBuffer is full
 				UNWRAP: do {
 					// 1. Pull data from peer into networkInboundBuffer
-	
+
 					int readFromChannel = 0;
 					while (networkInboundBuffer.hasRemaining()) {
 						int read = socketChannel.read(networkInboundBuffer);
 						if (SSL_LOG.isLoggable(Level.TRACE)) {
-							SSL_LOG.log(Level.TRACE, "unwrap: socket read {0} ({1})", read,  + readFromChannel, totalReadFromChannel);
+							SSL_LOG.log(Level.TRACE, "unwrap: socket read {0} ({1})", read, +readFromChannel,
+									totalReadFromChannel);
 						}
 						if (read <= 0) {
 							if ((read < 0) && (readFromChannel == 0) && (totalReadFromChannel == 0)) {
@@ -4875,54 +4875,54 @@ public class UHTTPD {
 							readFromChannel += read;
 						}
 					}
-	
+
 					networkInboundBuffer.flip();
 					if (!networkInboundBuffer.hasRemaining()) {
 						networkInboundBuffer.compact();
 						// wrap(applicationOutputBuffer, applicationInputBuffer, false);
 						return totalReadFromChannel;
 					}
-	
+
 					totalReadFromChannel += readFromChannel;
-	
+
 					try {
 						var result = sslEngine.unwrap(networkInboundBuffer, applicationInputBuffer);
 						if (SSL_LOG.isLoggable(Level.TRACE)) {
 							SSL_LOG.log(Level.TRACE, "unwrap: result: {0}", result);
 						}
-	
+
 						switch (result.getStatus()) {
 						case OK:
 							var handshakeStatus = result.getHandshakeStatus();
 							switch (handshakeStatus) {
 							case NEED_UNWRAP:
 								break;
-	
+
 							case NEED_WRAP:
 								break UNWRAP;
-	
+
 							case NEED_TASK:
 								runHandshakeTasks();
 								break;
-	
+
 							case NOT_HANDSHAKING:
 							default:
 								break;
 							}
 							break;
-	
+
 						case BUFFER_OVERFLOW:
 							if (SSL_LOG.isLoggable(Level.TRACE)) {
 								SSL_LOG.log(Level.TRACE, "unwrap: buffer overflow");
 							}
 							break UNWRAP;
-	
+
 						case CLOSED:
 							if (SSL_LOG.isLoggable(Level.TRACE)) {
 								SSL_LOG.log(Level.TRACE, "unwrap: exit: ssl closed");
 							}
 							return totalReadFromChannel == 0 ? -1 : totalReadFromChannel;
-	
+
 						case BUFFER_UNDERFLOW:
 							if (SSL_LOG.isLoggable(Level.TRACE)) {
 								SSL_LOG.log(Level.TRACE, "unwrap: buffer underflow");
@@ -4933,34 +4933,34 @@ public class UHTTPD {
 						networkInboundBuffer.compact();
 					}
 				} while (applicationInputBuffer.hasRemaining());
-	
+
 				return totalReadFromChannel;
 			}
-	
+
 			private int doWrap(ByteBuffer applicationOutboundBuffer) throws IOException {
 				if (SSL_LOG.isLoggable(Level.TRACE)) {
 					SSL_LOG.log(Level.TRACE, "wrap:");
 				}
 				int totalWritten = 0;
-	
+
 				// 1. Send any data already wrapped out channel
-	
+
 				if (networkOutboundBuffer.hasRemaining()) {
 					totalWritten = send(socketChannel, networkOutboundBuffer);
 					if (totalWritten < 0) {
 						return totalWritten;
 					}
 				}
-	
+
 				// 2. Any data in application buffer ? Wrap that and send it to peer.
-	
+
 				WRAP: while (true) {
 					networkOutboundBuffer.compact();
 					var result = sslEngine.wrap(applicationOutboundBuffer, networkOutboundBuffer);
 					if (SSL_LOG.isLoggable(Level.TRACE)) {
 						SSL_LOG.log(Level.TRACE, "wrap: result: {0}", result);
 					}
-	
+
 					networkOutboundBuffer.flip();
 					if (networkOutboundBuffer.hasRemaining()) {
 						int written = send(socketChannel, networkOutboundBuffer);
@@ -4970,23 +4970,23 @@ public class UHTTPD {
 							totalWritten += written;
 						}
 					}
-	
+
 					switch (result.getStatus()) {
 					case OK:
 						switch (result.getHandshakeStatus()) {
 						case NEED_WRAP:
 							break;
-	
+
 						case NEED_UNWRAP:
 							break WRAP;
-	
+
 						case NEED_TASK:
 							runHandshakeTasks();
 							if (SSL_LOG.isLoggable(Level.TRACE)) {
 								SSL_LOG.log(Level.TRACE, "wrap: exit: need tasks");
 							}
 							break;
-	
+
 						case NOT_HANDSHAKING:
 							if (applicationOutboundBuffer.hasRemaining()) {
 								break;
@@ -4997,19 +4997,19 @@ public class UHTTPD {
 							break;
 						}
 						break;
-	
+
 					case BUFFER_OVERFLOW:
 						if (SSL_LOG.isLoggable(Level.TRACE)) {
 							SSL_LOG.log(Level.TRACE, "wrap: exit: buffer overflow");
 						}
 						break WRAP;
-	
+
 					case CLOSED:
 						if (SSL_LOG.isLoggable(Level.TRACE)) {
 							SSL_LOG.log(Level.TRACE, "wrap: exit: closed");
 						}
 						break WRAP;
-	
+
 					case BUFFER_UNDERFLOW:
 						if (SSL_LOG.isLoggable(Level.TRACE)) {
 							SSL_LOG.log(Level.TRACE, "wrap: exit: buffer underflow");
@@ -5017,13 +5017,13 @@ public class UHTTPD {
 						break WRAP;
 					}
 				}
-	
+
 				if (SSL_LOG.isLoggable(Level.TRACE)) {
 					SSL_LOG.log(Level.TRACE, "wrap: return: " + totalWritten);
 				}
 				return totalWritten;
 			}
-	
+
 			private void runHandshakeTasks() {
 				while (true) {
 					final Runnable runnable = sslEngine.getDelegatedTask();
@@ -5035,7 +5035,7 @@ public class UHTTPD {
 				}
 			}
 		}
-	
+
 		/**
 		 * <p>
 		 * A wrapper around a real {@link ServerSocketChannel} that produces
@@ -5047,21 +5047,21 @@ public class UHTTPD {
 		 */
 		private final static class SSLServerSocketChannel extends ServerSocketChannel {
 			static String[] filterArray(String[] items, List<String> includedItems, List<String> excludedItems) {
-				List<String> filteredItems = items == null ? new ArrayList<String>() : Arrays.asList(items);
+				List<String> filteredItems = items == null ? new ArrayList<>() : Arrays.asList(items);
 				if (includedItems != null) {
 					for (int i = filteredItems.size() - 1; i >= 0; i--) {
 						if (!includedItems.contains(filteredItems.get(i))) {
 							filteredItems.remove(i);
 						}
 					}
-	
+
 					for (String includedProtocol : includedItems) {
 						if (!filteredItems.contains(includedProtocol)) {
 							filteredItems.add(includedProtocol);
 						}
 					}
 				}
-	
+
 				if (excludedItems != null) {
 					for (int i = filteredItems.size() - 1; i >= 0; i--) {
 						if (excludedItems.contains(filteredItems.get(i))) {
@@ -5069,57 +5069,57 @@ public class UHTTPD {
 						}
 					}
 				}
-	
+
 				return filteredItems.toArray(new String[filteredItems.size()]);
 			}
-	
+
 			/**
 			 * Should the SSLSocketChannels created from the accept method be put in
 			 * blocking mode. Default is {@code false}.
 			 */
 			public boolean blockingMode;
-	
+
 			/**
 			 * Should the SS server ask for client certificate authentication? Default is
 			 * {@code false}.
 			 */
 			public boolean wantClientAuthentication;
-	
+
 			/**
 			 * Should the SSL server require client certificate authentication? Default is
 			 * {@code false}.
 			 */
 			public boolean needClientAuthentication;
-	
+
 			/**
 			 * The list of SSL protocols (TLSv1, TLSv1.1, etc.) supported for the SSL
 			 * exchange. Default is the JVM default.
 			 */
 			public List<String> includedProtocols;
-	
+
 			/**
 			 * A list of SSL protocols (SSLv2, SSLv3, etc.) to explicitly exclude for the
 			 * SSL exchange. Default is none.
 			 */
 			public List<String> excludedProtocols;
-	
+
 			/**
 			 * The list of ciphers allowed for the SSL exchange. Default is the JVM default.
 			 */
 			public List<String> includedCipherSuites;
-	
+
 			/**
 			 * A list of ciphers to explicitly exclude for the SSL exchange. Default is
 			 * none.
 			 */
 			public List<String> excludedCipherSuites;
-	
+
 			private final ServerSocketChannel serverSocketChannel;
-	
+
 			private final SSLContext sslContext;
-	
+
 			private final Runner threadPool;
-	
+
 			/**
 			 *
 			 * @param serverSocketChannel The real server socket channel that accepts
@@ -5140,7 +5140,7 @@ public class UHTTPD {
 				this.sslContext = sslContext;
 				this.threadPool = threadPool;
 			}
-	
+
 			/**
 			 * <p>
 			 * Accepts a connection made to this channel's socket.
@@ -5194,69 +5194,69 @@ public class UHTTPD {
 					return null;
 				} else {
 					channel.configureBlocking(blockingMode);
-	
+
 					var sslEngine = sslContext.createSSLEngine();
 					sslEngine.setUseClientMode(false);
 					sslEngine.setWantClientAuth(wantClientAuthentication);
 					sslEngine.setNeedClientAuth(needClientAuthentication);
 					sslEngine.setEnabledProtocols(
 							filterArray(sslEngine.getEnabledProtocols(), includedProtocols, excludedProtocols));
-					sslEngine.setEnabledCipherSuites(
-							filterArray(sslEngine.getEnabledCipherSuites(), includedCipherSuites, excludedCipherSuites));
-	
+					sslEngine.setEnabledCipherSuites(filterArray(sslEngine.getEnabledCipherSuites(),
+							includedCipherSuites, excludedCipherSuites));
+
 					return new SSLSocketChannel(channel, sslEngine, threadPool);
 				}
 			}
-	
+
 			@Override
 			public ServerSocketChannel bind(SocketAddress local, int backlog) throws IOException {
 				return serverSocketChannel.bind(local, backlog);
 			}
-	
+
 			@Override
 			public SocketAddress getLocalAddress() throws IOException {
 				return serverSocketChannel.getLocalAddress();
 			}
-	
+
 			@Override
 			public <T> T getOption(SocketOption<T> name) throws IOException {
 				return serverSocketChannel.getOption(name);
 			}
-	
+
 			@Override
 			public <T> ServerSocketChannel setOption(SocketOption<T> name, T value) throws IOException {
 				return serverSocketChannel.setOption(name, value);
 			}
-	
+
 			@Override
 			public ServerSocket socket() {
 				return serverSocketChannel.socket();
 			}
-	
+
 			@Override
 			public Set<SocketOption<?>> supportedOptions() {
 				return serverSocketChannel.supportedOptions();
 			}
-	
+
 			@Override
 			protected void implCloseSelectableChannel() throws IOException {
 				serverSocketChannel.close();
 			}
-	
+
 			@Override
 			protected void implConfigureBlocking(boolean b) throws IOException {
 				serverSocketChannel.configureBlocking(b);
 			}
 		}
-	
+
 		/**
 		 * A wrapper around a real {@link SocketChannel} that adds SSL support.
 		 */
 		private final static class SSLSocketChannel extends SocketChannel {
 			private final SocketChannel socketChannel;
-	
+
 			private final SSLEngineBuffer sslEngineBuffer;
-	
+
 			/**
 			 *
 			 * @param socketChannel   The real SocketChannel.
@@ -5269,12 +5269,12 @@ public class UHTTPD {
 			 */
 			public SSLSocketChannel(SocketChannel socketChannel, final SSLEngine sslEngine, Runner executorService) {
 				super(socketChannel.provider());
-	
+
 				this.socketChannel = socketChannel;
-	
+
 				sslEngineBuffer = new SSLEngineBuffer(socketChannel, sslEngine, executorService);
 			}
-	
+
 			@Override
 			public SocketChannel bind(SocketAddress local) throws IOException {
 				socketChannel.bind(local);
@@ -5285,41 +5285,41 @@ public class UHTTPD {
 			public boolean connect(SocketAddress socketAddress) throws IOException {
 				return socketChannel.connect(socketAddress);
 			}
-	
+
 			@Override
 			public boolean finishConnect() throws IOException {
 				return socketChannel.finishConnect();
 			}
-	
+
 			@Override
 			public SocketAddress getLocalAddress() throws IOException {
 				return socketChannel.getLocalAddress();
 			}
-	
+
 			@Override
 			public <T> T getOption(SocketOption<T> name) throws IOException {
 				return socketChannel.getOption(name);
 			}
-	
+
 			@Override
 			public SocketAddress getRemoteAddress() throws IOException {
 				return socketChannel.getRemoteAddress();
 			}
-	
+
 			public final SocketChannel getWrappedSocketChannel() {
 				return socketChannel;
 			}
-	
+
 			@Override
 			public boolean isConnected() {
 				return socketChannel.isConnected();
 			}
-	
+
 			@Override
 			public boolean isConnectionPending() {
 				return socketChannel.isConnectionPending();
 			}
-	
+
 			/**
 			 * <p>
 			 * Reads a sequence of bytes from this channel into the given buffer.
@@ -5397,12 +5397,12 @@ public class UHTTPD {
 					SSL_LOG.log(Level.TRACE, "read: {0} {1}", applicationBuffer.position(), applicationBuffer.limit());
 				}
 				int intialPosition = applicationBuffer.position();
-	
+
 				int readFromChannel = sslEngineBuffer.unwrap(applicationBuffer);
 				if (SSL_LOG.isLoggable(Level.TRACE)) {
 					SSL_LOG.log(Level.TRACE, "read: from channel: {0}", readFromChannel);
 				}
-	
+
 				if (readFromChannel < 0) {
 					if (SSL_LOG.isLoggable(Level.TRACE)) {
 						SSL_LOG.log(Level.TRACE, "read: channel closed.");
@@ -5416,7 +5416,7 @@ public class UHTTPD {
 					return totalRead;
 				}
 			}
-	
+
 			/**
 			 * <p>
 			 * Reads a sequence of bytes from this channel into a subsequence of the given
@@ -5427,7 +5427,7 @@ public class UHTTPD {
 			 * An invocation of this method attempts to read up to r bytes from this
 			 * channel, where r is the total number of bytes remaining the specified
 			 * subsequence of the given buffer array, that is,
-			 * 
+			 *
 			 * <pre>
 			 * {@code
 			 * dsts[offset].remaining()
@@ -5522,32 +5522,32 @@ public class UHTTPD {
 				}
 				return totalRead;
 			}
-	
+
 			@Override
 			public <T> SocketChannel setOption(SocketOption<T> name, T value) throws IOException {
 				return socketChannel.setOption(name, value);
 			}
-	
+
 			@Override
 			public SocketChannel shutdownInput() throws IOException {
 				return socketChannel.shutdownInput();
 			}
-	
+
 			@Override
 			public SocketChannel shutdownOutput() throws IOException {
 				return socketChannel.shutdownOutput();
 			}
-	
+
 			@Override
 			public Socket socket() {
 				return socketChannel.socket();
 			}
-	
+
 			@Override
 			public Set<SocketOption<?>> supportedOptions() {
 				return socketChannel.supportedOptions();
 			}
-	
+
 			/**
 			 * <p>
 			 * Writes a sequence of bytes to this channel from the given buffer.
@@ -5620,10 +5620,10 @@ public class UHTTPD {
 				if (SSL_LOG.isLoggable(Level.TRACE)) {
 					SSL_LOG.log(Level.TRACE, "write:");
 				}
-	
+
 				int intialPosition = applicationBuffer.position();
 				int writtenToChannel = sslEngineBuffer.wrap(applicationBuffer);
-	
+
 				if (writtenToChannel < 0) {
 					if (SSL_LOG.isLoggable(Level.TRACE)) {
 						SSL_LOG.log(Level.TRACE, "write: channel closed");
@@ -5632,13 +5632,13 @@ public class UHTTPD {
 				} else {
 					int totalWritten = applicationBuffer.position() - intialPosition;
 					if (SSL_LOG.isLoggable(Level.TRACE)) {
-						SSL_LOG.log(Level.TRACE, "write: total written: {0} amount available in network outbound: {1}", totalWritten, 
-								applicationBuffer.remaining());
+						SSL_LOG.log(Level.TRACE, "write: total written: {0} amount available in network outbound: {1}",
+								totalWritten, applicationBuffer.remaining());
 					}
 					return totalWritten;
 				}
 			}
-	
+
 			/**
 			 * <p>
 			 * Writes a sequence of bytes to this channel from a subsequence of the given
@@ -5650,7 +5650,7 @@ public class UHTTPD {
 			 * total number of bytes remaining in the specified subsequence of the given
 			 * buffer array, that is,
 			 * </p>
-			 * 
+			 *
 			 * <pre>
 			 * {@code
 			 * srcs[offset].remaining()
@@ -5751,32 +5751,32 @@ public class UHTTPD {
 				}
 				return totalWritten;
 			}
-	
+
 			@Override
 			protected void implCloseSelectableChannel() throws IOException {
 				try {
 					sslEngineBuffer.flushNetworkOutbound();
 				} catch (Exception e) {
 				}
-	
+
 				socketChannel.close();
 				sslEngineBuffer.close();
 			}
-	
+
 			@Override
 			protected void implConfigureBlocking(boolean b) throws IOException {
 				socketChannel.configureBlocking(b);
 			}
 		}
+
 		final static Logger SSL_LOG = System.getLogger("UHTTPD-SSL");
-	}																// smaller
-	
+	} // smaller
+
 	private final static class ThreadPoolRunner implements Runner {
 		private ExecutorService pool;
-		
+
 		ThreadPoolRunner(Optional<Integer> threads) {
-			pool = threads.isPresent() ? Executors.newFixedThreadPool(threads.get())
-					: Executors.newCachedThreadPool();
+			pool = threads.isPresent() ? Executors.newFixedThreadPool(threads.get()) : Executors.newCachedThreadPool();
 		}
 
 		@Override
@@ -5788,19 +5788,16 @@ public class UHTTPD {
 		public void run(Runnable runnable) {
 			pool.execute(runnable);
 		}
-		
+
 	}
-	
+
 	private final static class URLEncodedFormDataPartIterator extends WebChannel implements Iterator<Part> {
 
 		StringBuilder buffer = new StringBuilder(256);
 		Part next;
-		long read;
-		long size;
 
-		URLEncodedFormDataPartIterator(Client client, ByteChannel input, long size) {
+		URLEncodedFormDataPartIterator(Client client, ByteChannel input) {
 			super(client, input, StandardOpenOption.READ);
-			this.size = size;
 		}
 
 		@Override
@@ -5822,18 +5819,19 @@ public class UHTTPD {
 		void checkNext() {
 			if (next == null) {
 				char ch;
+				int r;
 				buffer.setLength(0);
 
 				try {
-					while (read < size && (ch = (char) reader().read()) != -1) {
-						read++;
+					while ((r= readASCIIChar()) != -1) {
+						ch = (char)r;
 						if (ch == '&') {
 							// Next parameter
 							break;
 						} else
 							buffer.append(ch);
 					}
-					if(buffer.length() > 0)
+					if (buffer.length() > 0)
 						next = Named.parseParameter(buffer.toString());
 				} catch (IOException ioe) {
 					throw new IllegalStateException("I/O error while reading URL encoded form parameters.");
@@ -5841,7 +5839,7 @@ public class UHTTPD {
 			}
 		}
 	}
-	
+
 	private final static class URLResource implements Handler {
 
 		private URL url;
@@ -5860,41 +5858,78 @@ public class UHTTPD {
 		}
 
 	}
-	
+
 	private static abstract class WebChannel implements ByteChannel {
-		
+
 		protected final Client client;
 		protected final ByteChannel delegate;
 		protected final List<OpenOption> options;
-		
+
 		protected PrintWriter writer;
-		protected BufferedReader reader;
-		
+		protected ByteBuffer readBuffer;
+		protected StringBuilder stringBuffer;
+
 		WebChannel(Client client, ByteChannel delegate, OpenOption... options) {
 			this.client = client;
 			this.delegate = delegate;
-			for(var o : options) {
-				if(o != StandardOpenOption.READ && o != StandardOpenOption.WRITE) {
-					throw new IllegalArgumentException(MessageFormat.format("OpenOption may only be either {0} or {1}", StandardOpenOption.READ, StandardOpenOption.WRITE));
+			for (var o : options) {
+				if (o != StandardOpenOption.READ && o != StandardOpenOption.WRITE) {
+					throw new IllegalArgumentException(MessageFormat.format("OpenOption may only be either {0} or {1}",
+							StandardOpenOption.READ, StandardOpenOption.WRITE));
 				}
 			}
 			this.options = Arrays.asList(options);
+
+			readBuffer = ByteBuffer.allocate(1);
+			stringBuffer = new StringBuilder(256);
 		}
-		
+
 		@Override
 		public void close() throws IOException {
 			delegate.close();
 		}
-		
+
 		@Override
 		public boolean isOpen() {
 			return delegate.isOpen();
 		}
-		
 
 		@Override
 		public int read(ByteBuffer dst) throws IOException {
 			return delegate.read(dst);
+		}
+
+		public int readASCIIChar() throws IOException {
+			readBuffer.clear();
+			var r = delegate.read(readBuffer);
+			if (r == -1)
+				return -1;
+			return Byte.toUnsignedInt(readBuffer.get(0));
+		}
+
+		public String readLine() throws IOException {
+			try {
+				char ch;
+				int r;
+				boolean cr = false;
+				while ((r = readASCIIChar()) != -1) {
+					ch = (char)r;
+					if (ch == '\r') {
+						if (cr) {
+							cr = false;
+							stringBuffer.append("\r\r");
+						} else
+							cr = true;
+					} else if (ch == '\n' && cr) {
+						break;
+					} else {
+						stringBuffer.append(ch);
+					}
+				}
+				return stringBuffer.toString();
+			} finally {
+				stringBuffer.setLength(0);
+			}
 		}
 
 		@Override
@@ -5902,52 +5937,41 @@ public class UHTTPD {
 			return delegate.write(src);
 		}
 
-		BufferedReader reader() throws IOException {
-			if(reader == null) {
-				if(options.contains(StandardOpenOption.READ))
-					reader = new BufferedReader(Channels.newReader(delegate, HTTP_CHARSET_ENCODING), client.rootContext.recvBufferSize);
-				else
-					throw new IllegalStateException("Channel is not for reading.");
-			}
-			return reader;
-		}
-
 		PrintWriter writer() throws IOException {
-			if(writer == null) {
+			if (writer == null) {
 
-				if(options.contains(StandardOpenOption.WRITE))
+				if (options.contains(StandardOpenOption.WRITE))
 					writer = new PrintWriter(Channels.newWriter(delegate, HTTP_CHARSET_ENCODING)) {
-					@Override
-				    public void println() {
-						print("\r\n");
-				    }
-
-					@Override
-					public void write(String s) {
-						if(LOG.isLoggable(Level.DEBUG)) {
-							LOG.log(Level.DEBUG, "OUT: " + s.replace("\r", "<cr>").replace("\n", "<nl>"));
+						@Override
+						public void println() {
+							print("\r\n");
 						}
-						super.write(s);
-					}
-				};
+
+						@Override
+						public void write(String s) {
+							if (LOG.isLoggable(Level.DEBUG)) {
+								LOG.log(Level.DEBUG, "OUT: " + s.replace("\r", "<cr>").replace("\n", "<nl>"));
+							}
+							super.write(s);
+						}
+					};
 				else
 					throw new IllegalStateException("Channel is not for writing.");
-				
-				 
+
 			}
 			return writer;
 		}
 	}
-	
+
 	static final int DEFAULT_BUFFER_SIZE = 32768;
 	public static final Charset HTTP_CHARSET_ENCODING;
 
 	static {
 		HTTP_CHARSET_ENCODING = Charset.forName("ISO-8859-1");
 	}
-	 
+
 	public static final String HDR_CACHE_CONTROL = "cache-control";
-	
+
 	public static final String HDR_ACCEPT_ENCODING = "accept-encoding";
 	public static final String HDR_CONTENT_ENCODING = "content-encoding";
 	public static final String HDR_CONNECTION = "connection";
@@ -5969,46 +5993,41 @@ public class UHTTPD {
 	private static final String WEBSOCKET_UUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 	/**
-     * Date format pattern used to parse HTTP date headers in RFC 1123 format.
-     */
-    public static final String PATTERN_RFC1123 = "EEE, dd MMM yyyy HH:mm:ss zzz";
-	
-	/**
-     * Simple date format for the creation date ISO representation (partial).
-     */
-    protected static final String PATTERN_ISO = "yyyy-MM-dd'T'HH:mm:ss'Z'";
-
-
-    /**
-     * Date format pattern used to parse HTTP date headers in RFC 1036 format.
-     */
-    public static final String PATTERN_RFC1036 = "EEE, dd-MMM-yy HH:mm:ss zzz";
+	 * Date format pattern used to parse HTTP date headers in RFC 1123 format.
+	 */
+	public static final String PATTERN_RFC1123 = "EEE, dd MMM yyyy HH:mm:ss zzz";
 
 	/**
-     * Date format pattern used to parse HTTP date headers in ANSI C
-     * {@code asctime()} format.
-     */
-    public static final String PATTERN_ASCTIME = "EEE MMM d HH:mm:ss yyyy";
+	 * Simple date format for the creation date ISO representation (partial).
+	 */
+	protected static final String PATTERN_ISO = "yyyy-MM-dd'T'HH:mm:ss'Z'";
 
-	private static final String[] DEFAULT_PATTERNS = new String[] {
-        PATTERN_RFC1123,
-        PATTERN_RFC1036,
-        PATTERN_ASCTIME
-    };
+	/**
+	 * Date format pattern used to parse HTTP date headers in RFC 1036 format.
+	 */
+	public static final String PATTERN_RFC1036 = "EEE, dd-MMM-yy HH:mm:ss zzz";
+
+	/**
+	 * Date format pattern used to parse HTTP date headers in ANSI C
+	 * {@code asctime()} format.
+	 */
+	public static final String PATTERN_ASCTIME = "EEE MMM d HH:mm:ss yyyy";
+
+	private static final String[] DEFAULT_PATTERNS = new String[] { PATTERN_RFC1123, PATTERN_RFC1036, PATTERN_ASCTIME };
 
 	private static final Date DEFAULT_TWO_DIGIT_YEAR_START;
-	
+
 	private static final int MIN_GZIP_BUFFER = 1024;
 
 	public static final TimeZone GMT = TimeZone.getTimeZone("GMT");
 
 	static {
-        final Calendar calendar = Calendar.getInstance();
-        calendar.setTimeZone(GMT);
-        calendar.set(2000, Calendar.JANUARY, 1, 0, 0, 0);
-        calendar.set(Calendar.MILLISECOND, 0);
-        DEFAULT_TWO_DIGIT_YEAR_START = calendar.getTime();
-    }
+		final Calendar calendar = Calendar.getInstance();
+		calendar.setTimeZone(GMT);
+		calendar.set(2000, Calendar.JANUARY, 1, 0, 0, 0);
+		calendar.set(Calendar.MILLISECOND, 0);
+		DEFAULT_TWO_DIGIT_YEAR_START = calendar.getTime();
+	}
 
 	public static Handler classpathResource(Optional<ClassLoader> classLoader, String path) {
 		return new ClasspathResource(classLoader, path);
@@ -6018,7 +6037,8 @@ public class UHTTPD {
 		return classpathResource(Optional.empty(), path);
 	}
 
-	public static Handler classpathResources(String regexpPatternWithGroups, Optional<ClassLoader> classLoader, String prefix) {
+	public static Handler classpathResources(String regexpPatternWithGroups, Optional<ClassLoader> classLoader,
+			String prefix) {
 		return new ClasspathResources(regexpPatternWithGroups, classLoader, prefix);
 	}
 
@@ -6029,45 +6049,46 @@ public class UHTTPD {
 	public static CookieBuilder cookie(String name, String version) {
 		return new CookieBuilder(name, version);
 	}
-	
+
 	public static Handler fileResource(Path path) {
 		return new FileResource(path);
 	}
-	
+
 	public static Handler fileResources(String regexpPatternWithGroups, Path root) {
 		return new FileResources(regexpPatternWithGroups, root);
 	}
-	
+
 	//
 	// The following code comes from Apache Http client DateUtils under
 	// the same license as this project.
 	//
 
-    public static String formatDate(Date date) {
+	public static String formatDate(Date date) {
 		return DateFormatHolder.formatFor(PATTERN_RFC1123).format(date);
 	}
 
-    public static String formatInstant(Instant instant) {
+	public static String formatInstant(Instant instant) {
 		return formatDate(new Date(instant.toEpochMilli()));
 	}
 
-    public static String formatISODate(Date date) {
+	public static String formatISODate(Date date) {
 		return DateFormatHolder.formatFor(PATTERN_ISO).format(date);
 	}
 
-    public static String formatISOInstant(Instant instant) {
+	public static String formatISOInstant(Instant instant) {
 		return formatISODate(new Date(instant.toEpochMilli()));
 	}
 
-    public static HttpBasicAuthenticationBuilder httpBasicAuthentication(Authenticator<UsernameAndPassword> authenticator) {
+	public static HttpBasicAuthenticationBuilder httpBasicAuthentication(
+			Authenticator<UsernameAndPassword> authenticator) {
 		return new HttpBasicAuthenticationBuilder(authenticator);
 	}
 
-    public static String mimeType(String fileName) {
+	public static String mimeType(String fileName) {
 		return URLConnection.guessContentTypeFromName(fileName);
 	}
 
-    public static String mimeType(URL url) {
+	public static String mimeType(URL url) {
 		try {
 			URLConnection conx = url.openConnection();
 			try {
@@ -6105,53 +6126,49 @@ public class UHTTPD {
 	}
 
 	/**
-     * Parses the date value using the given date formats.
-     *
-     * @param dateValue the date value to parse
-     *
-     * @return the parsed date or null if input could not be parsed
-     */
-    static Date parseDate(
-            final String dateValue) {
-    	return parseDate(dateValue, DEFAULT_PATTERNS, null);
-    }
-    
-    /**
-     * Parses the date value using the given date formats.
-     *
-     * @param dateValue the date value to parse
-     * @param dateFormats the date formats to use
-     * @param startDate During parsing, two digit years will be placed in the range
-     * {@code startDate} to {@code startDate + 100 years}. This value may
-     * be {@code null}. When {@code null} is given as a parameter, year
-     * {@code 2000} will be used.
-     *
-     * @return the parsed date or null if input could not be parsed
-     */
-    static Date parseDate(
-            final String dateValue,
-            final String[] dateFormats,
-            final Date startDate) {
-        final String[] localDateFormats = dateFormats != null ? dateFormats : DEFAULT_PATTERNS;
-        final Date localStartDate = startDate != null ? startDate : DEFAULT_TWO_DIGIT_YEAR_START;
-        String v = dateValue;
-        // trim single quotes around date if present
-        // see issue #5279
-        if (v.length() > 1 && v.startsWith("'") && v.endsWith("'")) {
-            v = v.substring (1, v.length() - 1);
-        }
+	 * Parses the date value using the given date formats.
+	 *
+	 * @param dateValue the date value to parse
+	 *
+	 * @return the parsed date or null if input could not be parsed
+	 */
+	static Date parseDate(final String dateValue) {
+		return parseDate(dateValue, DEFAULT_PATTERNS, null);
+	}
 
-        for (final String dateFormat : localDateFormats) {
-            final SimpleDateFormat dateParser = DateFormatHolder.formatFor(dateFormat);
-            dateParser.set2DigitYearStart(localStartDate);
-            final ParsePosition pos = new ParsePosition(0);
-            final Date result = dateParser.parse(v, pos);
-            if (pos.getIndex() != 0) {
-                return result;
-            }
-        }
-        return null;
-    }
+	/**
+	 * Parses the date value using the given date formats.
+	 *
+	 * @param dateValue   the date value to parse
+	 * @param dateFormats the date formats to use
+	 * @param startDate   During parsing, two digit years will be placed in the
+	 *                    range {@code startDate} to {@code startDate + 100 years}.
+	 *                    This value may be {@code null}. When {@code null} is given
+	 *                    as a parameter, year {@code 2000} will be used.
+	 *
+	 * @return the parsed date or null if input could not be parsed
+	 */
+	static Date parseDate(final String dateValue, final String[] dateFormats, final Date startDate) {
+		final String[] localDateFormats = dateFormats != null ? dateFormats : DEFAULT_PATTERNS;
+		final Date localStartDate = startDate != null ? startDate : DEFAULT_TWO_DIGIT_YEAR_START;
+		String v = dateValue;
+		// trim single quotes around date if present
+		// see issue #5279
+		if (v.length() > 1 && v.startsWith("'") && v.endsWith("'")) {
+			v = v.substring(1, v.length() - 1);
+		}
+
+		for (final String dateFormat : localDateFormats) {
+			final SimpleDateFormat dateParser = DateFormatHolder.formatFor(dateFormat);
+			dateParser.set2DigitYearStart(localStartDate);
+			final ParsePosition pos = new ParsePosition(0);
+			final Date result = dateParser.parse(v, pos);
+			if (pos.getIndex() != 0) {
+				return result;
+			}
+		}
+		return null;
+	}
 
 	private static byte[] makeKey() {
 		// TODO optimise

@@ -19,7 +19,7 @@
 	<modelVersion>4.0.0</modelVersion>
 	<groupId>com.sshtools</groupId>
 	<artifactId>uhttpd</artifactId>
-	<version>0.0.2-SNAPSHOT</version>
+	<version>0.0.2</version>
 	<name>µTTPD - A very small HTTP/HTTPS server</name>
 	<properties>
 		<maven.compiler.target>17</maven.compiler.target>

@@ -67,7 +67,7 @@ Now in Maven Central, so to add to your project just include this single depende
 <dependency>
 	<groupId>com.sshtools</groupId>
 	<artifactId>uhttpd</artifactId>
-	<version>0.0.1</version>
+	<version>0.0.2</version>
 </dependency>
 ```
 

@@ -1900,7 +1900,7 @@ public class UHTTPD {
 								|| headersOr(HDR_CONNECTION).orElse(Named.EMPTY).expand(",")
 										.containsIgnoreCase("close");
 						if (!close) {
-							throw new IllegalStateException("Unable to determine end of stream.");
+							chan = new LengthLimitedChannel(client, chan, 0, StandardOpenOption.READ);
 						}
 
 						if (LOG.isLoggable(Level.DEBUG))

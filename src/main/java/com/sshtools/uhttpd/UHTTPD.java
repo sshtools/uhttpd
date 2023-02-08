@@ -46,6 +46,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketAddress;
 import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.net.StandardSocketOptions;
 import java.net.URL;
 import java.net.URLConnection;
@@ -325,6 +326,8 @@ public class UHTTPD {
 						} while (times < rootContext.keepAliveMax);
 					} catch (ClosedChannelException | EOFException e) {
 						LOG.log(Level.TRACE, "EOF.", e);
+					} catch(SocketTimeoutException ste) {
+						LOG.log(Level.TRACE, "Timeout.", ste);
 					} catch (Exception e) {
 						e.printStackTrace();
 						LOG.log(Level.ERROR, "Failed handling connection.", e);

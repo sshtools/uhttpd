@@ -173,6 +173,7 @@ public class UHTTPDTest {
 			var outf = Files.createTempFile("http", "data");
 			try {
 				var resp = client.send(req, BodyHandlers.ofFile(outf));
+				// TODO Methanol seems to strip these headers (i presume because content returned to client code wont be compressed). Not sure how we'd test this
 //				assertEquals("gzip", resp.headers().firstValue(UHTTPD.HDR_CONTENT_ENCODING).get());
 				assertTrue(isEqual(tf, outf));
 			}
@@ -204,6 +205,8 @@ public class UHTTPDTest {
 			var outf = Files.createTempFile("http", "data");
 			try {
 				var resp = client.send(req, BodyHandlers.ofFile(outf));
+
+				// TODO Methanol seems to strip these headers (i presume because content returned to client code wont be compressed). Not sure how we'd test this
 //				assertEquals("gzip", resp.headers().firstValue(UHTTPD.HDR_CONTENT_ENCODING).get());
 				assertTrue(isEqual(tf, outf));
 			}

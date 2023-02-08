@@ -43,7 +43,7 @@ This will run a server in the foreground on `localhost:8080`. Point your browser
 ### WIP
 
  * Full JavaDoc.
- * WebSOcket compression.
+ * WebSocket compression.
  * Tests
  
 ### TODO
@@ -68,7 +68,7 @@ Now in Maven Central, so to add to your project just include this single depende
 <dependency>
 	<groupId>com.sshtools</groupId>
 	<artifactId>uhttpd</artifactId>
-	<version>0.0.2</version>
+	<version>0.0.5</version>
 </dependency>
 ```
 

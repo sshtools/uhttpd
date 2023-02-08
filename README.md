@@ -34,6 +34,8 @@ This will run a server in the foreground on `localhost:8080`. Point your browser
  * Single source file. Can be just dropped into your project with ease.
  * Cookies.
  * CONNECT tunnels.
+ * Chunked output and input
+ * Compressed output and input
  * Multiple contexts.
  * Can work with [fibers](https://www.infoworld.com/article/3652596/project-loom-understand-the-new-java-concurrency-model.html).
  * Great for unit / integration testing.
@@ -41,8 +43,7 @@ This will run a server in the foreground on `localhost:8080`. Point your browser
 ### WIP
 
  * Full JavaDoc.
- * Compression (content and websocket extension).
- * Chunking (output done).
+ * WebSOcket compression.
  * Tests
  
 ### TODO

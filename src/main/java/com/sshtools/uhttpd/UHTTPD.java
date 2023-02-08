@@ -45,7 +45,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketAddress;
-import java.net.SocketOption;
+import java.net.SocketException;
 import java.net.StandardSocketOptions;
 import java.net.URL;
 import java.net.URLConnection;
@@ -57,9 +57,6 @@ import java.nio.channels.ByteChannel;
 import java.nio.channels.Channels;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.ReadableByteChannel;
-import java.nio.channels.SelectableChannel;
-import java.nio.channels.SelectionKey;
-import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.channels.WritableByteChannel;
@@ -104,6 +101,7 @@ import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -112,8 +110,6 @@ import java.util.zip.GZIPOutputStream;
 
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLEngine;
-import javax.net.ssl.SSLSession;
 
 /**
  * Simple HTTP/HTTPS server, configured using a fluent API.
@@ -193,31 +189,92 @@ public class UHTTPD {
 	public static final class Client implements Runnable, Closeable {
 
 		final RootContextImpl rootContext;
-		final SocketChannel socket;
+		final ByteChannel channel;
 		final Scheme scheme;
 		final int port;
+		final boolean secure;
+		final SocketAddress localAddress;
+		final SocketAddress remoteAddress;
+		final Consumer<Integer> timeoutSetter;
 
 		boolean closed = false;
 		int times = 0;
 		WireProtocol wireProtocol;
 		Charset charset = Charset.defaultCharset();
-		Selector selector;
 
-		Client(int port, Scheme scheme, SocketChannel socket, RootContextImpl rootContext) throws IOException {
+		Client(boolean secure, int port, Scheme scheme, SocketChannel socket, RootContextImpl rootContext) throws IOException {
 			this.port = port;
+			this.secure = secure;
 			this.scheme = scheme;
-			this.socket = socket;
+			this.channel = socket;
+			this.rootContext = rootContext;
+			this.rootContext.clients.add(this);
+			this.localAddress = socket.getLocalAddress();
+			this.remoteAddress = socket.getRemoteAddress();
+
+			wireProtocol = new HTTP11WireProtocol(this);
+			timeoutSetter = new Consumer<Integer>() {
+				@Override
+				public void accept(Integer t) {
+					try {
+						socket.socket().setSoTimeout(t);
+					} catch (SocketException e) {
+						throw new UncheckedIOException(e);
+					}
+				}
+			};
+		}
+		
+		Client(boolean secure, int port, Scheme scheme, Socket socket, RootContextImpl rootContext) throws IOException {
+			this.port = port;
+			this.secure = secure;
+			this.scheme = scheme;
+			this.localAddress = socket.getLocalSocketAddress();
+			this.remoteAddress = socket.getRemoteSocketAddress();
+			
+			var in = Channels.newChannel(socket.getInputStream());
+			var out = Channels.newChannel(socket.getOutputStream());
+			this.channel = new ByteChannel() {
+				
+				@Override
+				public int write(ByteBuffer src) throws IOException {
+					return out.write(src);
+				}
+				
+				@Override
+				public boolean isOpen() {
+					return in.isOpen() && out.isOpen();
+				}
+				
+				@Override
+				public void close() throws IOException {
+					try {
+						in.close();
+					}
+					finally {
+						out.close();
+					}	
+				}
+				
+				@Override
+				public int read(ByteBuffer dst) throws IOException {
+					return in.read(dst);
+				}
+			};
 			this.rootContext = rootContext;
 			this.rootContext.clients.add(this);
 
 			wireProtocol = new HTTP11WireProtocol(this);
-
-			var uchannel = underlyingChannel();
-			if (!(uchannel instanceof SelectableChannel) || !((SelectableChannel) uchannel).isBlocking()) {
-				selector = Selector.open();
-				var selectionKey = ((SelectableChannel) uchannel).register(selector, SelectionKey.OP_WRITE);
-				selectionKey.attach(uchannel);
-			}
+			timeoutSetter = new Consumer<Integer>() {
+				@Override
+				public void accept(Integer t) {
+					try {
+						socket.setSoTimeout(t);
+					} catch (SocketException e) {
+						throw new UncheckedIOException(e);
+					}
+				}
+			};
 		}
 
 		/**
@@ -236,10 +293,8 @@ public class UHTTPD {
 		public final void close() throws IOException {
 			if (!closed) {
 				closed = true;
-				if (selector != null)
-					selector.close();
 				try {
-					socket.close();
+					channel.close();
 				} catch (IOException ioe) {
 				}
 				rootContext.clients.remove(this);
@@ -252,7 +307,7 @@ public class UHTTPD {
 		@Override
 		public final void run() {
 			try {
-				var client = socket.getLocalAddress();
+				var client = localAddress();
 				if (client == null) {
 					LOG.log(Level.ERROR, "Socket was lost between accepting it and starting to handle it. "
 							+ "This can be caused by the system socket factory being swapped out for another "
@@ -263,7 +318,7 @@ public class UHTTPD {
 					}
 				} else {
 					try {
-						LOG.log(Level.DEBUG, "{0} connected to server", socket.getRemoteAddress());
+						LOG.log(Level.DEBUG, "{0} connected to server", remoteAddress());
 						do {
 							wireProtocol.transact();
 							times++;
@@ -276,6 +331,7 @@ public class UHTTPD {
 					}
 				}
 			} catch (Exception e) {
+				e.printStackTrace();
 				if (LOG.isLoggable(Level.DEBUG))
 					LOG.log(Level.DEBUG, "Failed processing connection.", e);
 			} finally {
@@ -305,13 +361,37 @@ public class UHTTPD {
 			return wireProtocol;
 		}
 
-		final ByteChannel channel() {
-			return socket;
+		/**
+		 * Get the local address this client is connected to, most likely an {@link InetSocketAdddress}.
+		 *
+		 * @return local address
+		 */
+		public final SocketAddress localAddress() {
+			return localAddress;
 		}
 
-		final int port() {
+		/**
+		 * Get the remote address this client is connected to, most likely an {@link InetSocketAdddress}.
+		 *
+		 * @return local address
+		 */
+		public final SocketAddress remoteAddress() {
+			return remoteAddress;
+		}
+
+		final ByteChannel channel() {
+			return channel;
+		}
+
+		/**
+		 * Get the local port this client is connected to. If this is not a TCP connection, zero
+		 * will be returned.
+		 *  
+		 * @return port
+		 */
+		public final int port() {
 			try {
-				var addr = socket.getLocalAddress();
+				var addr = localAddress();
 				if (addr instanceof InetSocketAddress) {
 					return ((InetSocketAddress) addr).getPort();
 				}
@@ -321,23 +401,12 @@ public class UHTTPD {
 			return port;
 		}
 
-		final ByteChannel underlyingChannel() {
-			var ch = channel();
-			if (ch instanceof SSL.SSLSocketChannel) {
-				return ((SSL.SSLSocketChannel) ch).getWrappedSocketChannel();
-			} else {
-				return ch;
-			}
+		public final boolean secure() {
+			return secure;
 		}
 
-		final void waitForWrite() {
-			if (selector == null)
-				return;
-			try {
-				selector.select();
-			} catch (IOException e) {
-				throw new UncheckedIOException(e);
-			}
+		void timeout(int ms) {
+			timeoutSetter.accept(ms);
 		}
 
 	}
@@ -1287,6 +1356,7 @@ public class UHTTPD {
 		private Optional<Runner> runner = Optional.empty();
 		private Optional<Long> gzipMinSize = Optional.empty();
 		private int sendBufferSize = DEFAULT_BUFFER_SIZE;
+		private int recvBufferSize = DEFAULT_BUFFER_SIZE;
 		private Optional<KeyStore> keyStore = Optional.empty();
 		private int maxUnchunkedSize = 1024 * 512;
 
@@ -1424,6 +1494,11 @@ public class UHTTPD {
 
 		public RootContextBuilder withSendBufferSize(int sendBufferSize) {
 			this.sendBufferSize = sendBufferSize;
+			return this;
+		}
+
+		public RootContextBuilder withRecvBufferSize(int recvBufferSize) {
+			this.recvBufferSize = recvBufferSize;
 			return this;
 		}
 
@@ -2537,7 +2612,6 @@ public class UHTTPD {
 				var frame = new WebSocketFrame(OpCode.BINARY, data, finalPacket);
 				try {
 					frame.write(client.channel());
-					client.waitForWrite();
 				} catch (IOException e) {
 					throw new UncheckedIOException("Failed to send websocket text.", e);
 				}
@@ -2563,7 +2637,6 @@ public class UHTTPD {
 						var frame = new WebSocketFrame(OpCode.TEXT, payload, fin);
 						try {
 							frame.write(client.channel());
-							client.waitForWrite();
 						} catch (IOException e) {
 							throw new UncheckedIOException("Failed to send websocket text.", e);
 						}
@@ -2831,7 +2904,7 @@ public class UHTTPD {
 						while (true) {
 							if (LOG.isLoggable(Level.TRACE))
 								LOG.log(Level.TRACE, "Tunnel HTTP receiving thread waiting data.");
-							client.socket.read(recvBuf);
+							client.channel.read(recvBuf);
 							if (recvBuf.position() == 0)
 								break;
 							if (LOG.isLoggable(Level.TRACE))
@@ -2865,7 +2938,7 @@ public class UHTTPD {
 						if (LOG.isLoggable(Level.TRACE))
 							LOG.log(Level.TRACE, "Tunnel HTTP sending thread got {0} bytes.", sndBuf.position());
 						sndBuf.flip();
-						client.socket.write(sndBuf);
+						client.channel.write(sndBuf);
 						if (LOG.isLoggable(Level.TRACE))
 							LOG.log(Level.TRACE, "Tunnel HTTP sending passed on {0} bytes.", sndBuf.position());
 						sndBuf.flip();
@@ -3440,7 +3513,6 @@ public class UHTTPD {
 					@Override
 					protected int writeImpl(ByteBuffer src) throws IOException {
 						var r = out.write(src);
-						client.waitForWrite();
 						return r;
 					}
 				};
@@ -3617,7 +3689,8 @@ public class UHTTPD {
 				if (LOG.isLoggable(Level.DEBUG))
 					LOG.log(Level.DEBUG, "Exited transaction normally, setting socket timeout to {0}s",
 							client.rootContext.keepAliveTimeoutSecs);
-				client.socket.socket().setSoTimeout(client.rootContext.keepAliveTimeoutSecs * 1000);
+				
+				client.timeout(client.rootContext.keepAliveTimeoutSecs * 1000);
 			} finally {
 				if (tx.content != null)
 					tx.content.close();
@@ -4346,12 +4419,13 @@ public class UHTTPD {
 		private final int keepAliveTimeoutSecs;
 		private final boolean gzip;
 		private final int sendBufferSize;
+		private final int recvBufferSize;
 		private final int maxUnchunkedSize;
 		private final long minGzipSize;
 		private boolean open = true;
 		private final Runner runner;
-		private final ServerSocketChannel serverSocket;
-		private final ServerSocketChannel sslServerSocket;
+		private final ServerSocketChannel serverSocketChannel;
+		private final ServerSocket sslServerSocket;
 		private final String threadName;
 		private final boolean daemon;
 		private final Set<Client> clients = Collections.synchronizedSet(new HashSet<>());
@@ -4375,6 +4449,7 @@ public class UHTTPD {
 			keepAlive = builder.keepAlive;
 			gzip = builder.gzip;
 			sendBufferSize = builder.sendBufferSize;
+			recvBufferSize = builder.recvBufferSize;
 			keepAliveTimeoutSecs = builder.keepAliveTimeoutSecs;
 			keepAliveMax = builder.keepAliveMax;
 			runner = builder.runner.orElse(threadPoolRunner().build());
@@ -4382,11 +4457,11 @@ public class UHTTPD {
 
 			if (httpPort.isPresent()) {
 				LOG.log(Level.INFO, "Starting HTTP server on port {0}", httpPort.get());
-				serverSocket = ServerSocketChannel.open().setOption(StandardSocketOptions.SO_REUSEADDR, true)
+				serverSocketChannel = ServerSocketChannel.open().setOption(StandardSocketOptions.SO_REUSEADDR, true)
 						.bind(new InetSocketAddress(httpAddress.orElse(InetAddress.getByName("127.0.0.1")),
 								httpPort.orElse(8080)), backlog);
 			} else {
-				serverSocket = null;
+				serverSocketChannel = null;
 			}
 
 			if (httpsPort.isPresent()) {
@@ -4435,13 +4510,9 @@ public class UHTTPD {
 				} catch (Exception e) {
 					throw new IOException("Failed to configure SSL.", e);
 				}
+				
+				sslServerSocket = sc.getServerSocketFactory().createServerSocket(httpsPort.orElse(8443), backlog, httpsAddress.orElse(InetAddress.getByName("127.0.0.1")));
 
-				var plainSslServerSocket = ServerSocketChannel.open()
-						.setOption(StandardSocketOptions.SO_REUSEADDR, true)
-						.bind(new InetSocketAddress(httpsAddress.orElse(InetAddress.getByName("127.0.0.1")),
-								httpsPort.orElse(8443)), backlog);
-
-				sslServerSocket = new SSL.SSLServerSocketChannel(plainSslServerSocket, sc, runner);
 			} else {
 				sslServerSocket = null;
 			}
@@ -4456,8 +4527,8 @@ public class UHTTPD {
 			open = false;
 			try {
 				try {
-					if (serverSocket != null)
-						serverSocket.close();
+					if (serverSocketChannel != null)
+						serverSocketChannel.close();
 				} finally {
 					try {
 						if (sslServerSocket != null)
@@ -4530,23 +4601,23 @@ public class UHTTPD {
 
 			/* Run, keeping number of thread used to minimum required for configuration */
 
-			if (serverSocket == null) {
+			if (serverSocketChannel == null) {
 				/* HTTPS only */
-				runOn(sslServerSocket, Scheme.HTTPS, httpsPort.get());
+				runOn(true, sslServerSocket, Scheme.HTTPS, httpsPort.get());
 			} else if (sslServerSocket == null) {
 				/* HTTP only */
-				runOn(serverSocket, Scheme.HTTP, httpPort.get());
-			} else if (serverSocket != null && sslServerSocket != null) {
+				runOn(false, serverSocketChannel, Scheme.HTTP, httpPort.get());
+			} else if (serverSocketChannel != null && sslServerSocket != null) {
 				/* Both */
 				otherThread = new Thread(threadName + "SSL") {
 					@Override
 					public void run() {
-						runOn(serverSocket, Scheme.HTTPS, httpsPort.get());
+						runOn(true, sslServerSocket, Scheme.HTTPS, httpsPort.get());
 					}
 				};
 				otherThread.setDaemon(true);
 				otherThread.start();
-				runOn(sslServerSocket, Scheme.HTTP, httpPort.get());
+				runOn(false, serverSocketChannel, Scheme.HTTP, httpPort.get());
 				try {
 					otherThread.join();
 				} catch (InterruptedException e) {
@@ -4566,12 +4637,28 @@ public class UHTTPD {
 
 		}
 
-		private void runOn(ServerSocketChannel so, Scheme scheme, int port) {
+		private void runOn(boolean secure, ServerSocketChannel so, Scheme scheme, int port) {
 			while (open) {
-				LOG.log(Level.DEBUG, "Waiting for connection");
+				LOG.log(Level.DEBUG, "Waiting for connection (using channels)");
 				try {
-					runner.run(new Client(port, scheme, so.accept(), this));
+					runner.run(new Client(secure, port, scheme, so.accept(), this));
 				} catch (AsynchronousCloseException ace) {
+					if(open)
+						LOG.log(Level.ERROR, "Failed waiting for connection.", ace);
+				} catch (Exception e) {
+					LOG.log(Level.ERROR, "Failed waiting for connection.", e);
+				}
+			}
+		}
+
+		private void runOn(boolean secure, ServerSocket so, Scheme scheme, int port) {
+			while (open) {
+				LOG.log(Level.DEBUG, "Waiting for connection (using streams)");
+				try {
+					runner.run(new Client(secure, port, scheme, so.accept(), this));
+				} catch (SocketException ace) {
+					if(open)
+						LOG.log(Level.ERROR, "Failed waiting for connection.", ace);
 				} catch (Exception e) {
 					LOG.log(Level.ERROR, "Failed waiting for connection.", e);
 				}
@@ -4719,1059 +4806,6 @@ public class UHTTPD {
 
 	}
 
-	/**
-	 * This is the support for SSL, and it is adapted from the
-	 * <strong>NioSSL</strong> project (https://github.com/baswerc/niossl). We use
-	 * this because we need a {@link SocketChnannel} implementation, but with SSL
-	 * support. The JDK does not provide this.
-	 *
-	 * Copyright 2015 Corey Baswell
-	 *
-	 * Licensed under the Apache License, Version 2.0 (the "License"); you may not
-	 * use this file except in compliance with the License. You may obtain a copy of
-	 * the License at
-	 *
-	 * http://www.apache.org/licenses/LICENSE-2.0
-	 *
-	 * Unless required by applicable law or agreed to in writing, software
-	 * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-	 * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-	 * License for the specific language governing permissions and limitations under
-	 * the License.
-	 */
-	private final static class SSL {
-		private final static class SSLEngineBuffer {
-			private final SocketChannel socketChannel;
-
-			private final SSLEngine sslEngine;
-
-			private final Runner executorService;
-
-			private final ByteBuffer networkInboundBuffer;
-
-			private final ByteBuffer networkOutboundBuffer;
-
-			private final int minimumApplicationBufferSize;
-
-			private final ByteBuffer unwrapBuffer;
-
-			private final ByteBuffer wrapBuffer;
-
-			public SSLEngineBuffer(SocketChannel socketChannel, SSLEngine sslEngine, Runner executorService) {
-				this.socketChannel = socketChannel;
-				this.sslEngine = sslEngine;
-				this.executorService = executorService;
-
-				var session = sslEngine.getSession();
-				int networkBufferSize = session.getPacketBufferSize();
-
-				networkInboundBuffer = ByteBuffer.allocateDirect(networkBufferSize);
-
-				networkOutboundBuffer = ByteBuffer.allocateDirect(networkBufferSize);
-				networkOutboundBuffer.flip();
-
-				minimumApplicationBufferSize = session.getApplicationBufferSize();
-				unwrapBuffer = ByteBuffer.allocateDirect(minimumApplicationBufferSize);
-				wrapBuffer = ByteBuffer.allocateDirect(minimumApplicationBufferSize);
-				wrapBuffer.flip();
-			}
-
-			void close() {
-				try {
-					sslEngine.closeInbound();
-				} catch (Exception e) {
-				}
-
-				try {
-					sslEngine.closeOutbound();
-				} catch (Exception e) {
-				}
-			}
-
-			int flushNetworkOutbound() throws IOException {
-				return send(socketChannel, networkOutboundBuffer);
-			}
-
-			int send(SocketChannel channel, ByteBuffer buffer) throws IOException {
-				int totalWritten = 0;
-				while (buffer.hasRemaining()) {
-					int written = channel.write(buffer);
-
-					if (written == 0) {
-						break;
-					} else if (written < 0) {
-						return (totalWritten == 0) ? written : totalWritten;
-					}
-					totalWritten += written;
-				}
-				if (SSL_LOG.isLoggable(Level.TRACE)) {
-					SSL_LOG.log(Level.TRACE, "sent: {0} out to socket", totalWritten);
-				}
-				return totalWritten;
-			}
-
-			int unwrap(ByteBuffer applicationInputBuffer) throws IOException {
-				if (applicationInputBuffer.capacity() < minimumApplicationBufferSize) {
-					throw new IllegalArgumentException(
-							"Application buffer size must be at least: " + minimumApplicationBufferSize);
-				}
-
-				if (unwrapBuffer.position() != 0) {
-					unwrapBuffer.flip();
-					while (unwrapBuffer.hasRemaining() && applicationInputBuffer.hasRemaining()) {
-						applicationInputBuffer.put(unwrapBuffer.get());
-					}
-					unwrapBuffer.compact();
-				}
-
-				int totalUnwrapped = 0;
-				int unwrapped, wrapped;
-
-				do {
-					totalUnwrapped += unwrapped = doUnwrap(applicationInputBuffer);
-					wrapped = doWrap(wrapBuffer);
-				} while (unwrapped > 0 || wrapped > 0
-						&& (networkOutboundBuffer.hasRemaining() && networkInboundBuffer.hasRemaining()));
-
-				return totalUnwrapped;
-			}
-
-			int wrap(ByteBuffer applicationOutboundBuffer) throws IOException {
-				int wrapped = doWrap(applicationOutboundBuffer);
-				doUnwrap(unwrapBuffer);
-				return wrapped;
-			}
-
-			private int doUnwrap(ByteBuffer applicationInputBuffer) throws IOException {
-
-				if (SSL_LOG.isLoggable(Level.TRACE)) {
-					SSL_LOG.log(Level.TRACE, "unwrap:");
-				}
-
-				int totalReadFromChannel = 0;
-
-				// Keep looping until peer has no more data ready or the
-				// applicationInboundBuffer is full
-				UNWRAP: do {
-					// 1. Pull data from peer into networkInboundBuffer
-
-					int readFromChannel = 0;
-					while (networkInboundBuffer.hasRemaining()) {
-						int read = socketChannel.read(networkInboundBuffer);
-						if (SSL_LOG.isLoggable(Level.TRACE)) {
-							SSL_LOG.log(Level.TRACE, "unwrap: socket read {0} ({1})", read, +readFromChannel,
-									totalReadFromChannel);
-						}
-						if (read <= 0) {
-							if ((read < 0) && (readFromChannel == 0) && (totalReadFromChannel == 0)) {
-								// No work done and we've reached the end of the channel from peer
-								if (SSL_LOG.isLoggable(Level.TRACE)) {
-									SSL_LOG.log(Level.TRACE, "unwrap: exit: end of channel");
-								}
-								return read;
-							}
-							break;
-						} else {
-							readFromChannel += read;
-						}
-					}
-
-					networkInboundBuffer.flip();
-					if (!networkInboundBuffer.hasRemaining()) {
-						networkInboundBuffer.compact();
-						// wrap(applicationOutputBuffer, applicationInputBuffer, false);
-						return totalReadFromChannel;
-					}
-
-					totalReadFromChannel += readFromChannel;
-
-					try {
-						var result = sslEngine.unwrap(networkInboundBuffer, applicationInputBuffer);
-						if (SSL_LOG.isLoggable(Level.TRACE)) {
-							SSL_LOG.log(Level.TRACE, "unwrap: result: {0}", result);
-						}
-
-						switch (result.getStatus()) {
-						case OK:
-							var handshakeStatus = result.getHandshakeStatus();
-							switch (handshakeStatus) {
-							case NEED_UNWRAP:
-								break;
-
-							case NEED_WRAP:
-								break UNWRAP;
-
-							case NEED_TASK:
-								runHandshakeTasks();
-								break;
-
-							case NOT_HANDSHAKING:
-							default:
-								break;
-							}
-							break;
-
-						case BUFFER_OVERFLOW:
-							if (SSL_LOG.isLoggable(Level.TRACE)) {
-								SSL_LOG.log(Level.TRACE, "unwrap: buffer overflow");
-							}
-							break UNWRAP;
-
-						case CLOSED:
-							if (SSL_LOG.isLoggable(Level.TRACE)) {
-								SSL_LOG.log(Level.TRACE, "unwrap: exit: ssl closed");
-							}
-							return totalReadFromChannel == 0 ? -1 : totalReadFromChannel;
-
-						case BUFFER_UNDERFLOW:
-							if (SSL_LOG.isLoggable(Level.TRACE)) {
-								SSL_LOG.log(Level.TRACE, "unwrap: buffer underflow");
-							}
-							break;
-						}
-					} finally {
-						networkInboundBuffer.compact();
-					}
-				} while (applicationInputBuffer.hasRemaining());
-
-				return totalReadFromChannel;
-			}
-
-			private int doWrap(ByteBuffer applicationOutboundBuffer) throws IOException {
-				if (SSL_LOG.isLoggable(Level.TRACE)) {
-					SSL_LOG.log(Level.TRACE, "wrap:");
-				}
-				int totalWritten = 0;
-
-				// 1. Send any data already wrapped out channel
-
-				if (networkOutboundBuffer.hasRemaining()) {
-					totalWritten = send(socketChannel, networkOutboundBuffer);
-					if (totalWritten < 0) {
-						return totalWritten;
-					}
-				}
-
-				// 2. Any data in application buffer ? Wrap that and send it to peer.
-
-				WRAP: while (true) {
-					networkOutboundBuffer.compact();
-					var result = sslEngine.wrap(applicationOutboundBuffer, networkOutboundBuffer);
-					if (SSL_LOG.isLoggable(Level.TRACE)) {
-						SSL_LOG.log(Level.TRACE, "wrap: result: {0}", result);
-					}
-
-					networkOutboundBuffer.flip();
-					if (networkOutboundBuffer.hasRemaining()) {
-						int written = send(socketChannel, networkOutboundBuffer);
-						if (written < 0) {
-							return totalWritten == 0 ? written : totalWritten;
-						} else {
-							totalWritten += written;
-						}
-					}
-
-					switch (result.getStatus()) {
-					case OK:
-						switch (result.getHandshakeStatus()) {
-						case NEED_WRAP:
-							break;
-
-						case NEED_UNWRAP:
-							break WRAP;
-
-						case NEED_TASK:
-							runHandshakeTasks();
-							if (SSL_LOG.isLoggable(Level.TRACE)) {
-								SSL_LOG.log(Level.TRACE, "wrap: exit: need tasks");
-							}
-							break;
-
-						case NOT_HANDSHAKING:
-							if (applicationOutboundBuffer.hasRemaining()) {
-								break;
-							} else {
-								break WRAP;
-							}
-						default:
-							break;
-						}
-						break;
-
-					case BUFFER_OVERFLOW:
-						if (SSL_LOG.isLoggable(Level.TRACE)) {
-							SSL_LOG.log(Level.TRACE, "wrap: exit: buffer overflow");
-						}
-						break WRAP;
-
-					case CLOSED:
-						if (SSL_LOG.isLoggable(Level.TRACE)) {
-							SSL_LOG.log(Level.TRACE, "wrap: exit: closed");
-						}
-						break WRAP;
-
-					case BUFFER_UNDERFLOW:
-						if (SSL_LOG.isLoggable(Level.TRACE)) {
-							SSL_LOG.log(Level.TRACE, "wrap: exit: buffer underflow");
-						}
-						break WRAP;
-					}
-				}
-
-				if (SSL_LOG.isLoggable(Level.TRACE)) {
-					SSL_LOG.log(Level.TRACE, "wrap: return: " + totalWritten);
-				}
-				return totalWritten;
-			}
-
-			private void runHandshakeTasks() {
-				while (true) {
-					final Runnable runnable = sslEngine.getDelegatedTask();
-					if (runnable == null) {
-						break;
-					} else {
-						executorService.run(runnable);
-					}
-				}
-			}
-		}
-
-		/**
-		 * <p>
-		 * A wrapper around a real {@link ServerSocketChannel} that produces
-		 * {@link SSLSocketChannel} on {@link #accept()}. The real ServerSocketChannel
-		 * must be bound externally (to this class) before calling the accept method.
-		 * </p>
-		 *
-		 * @see SSLSocketChannel
-		 */
-		private final static class SSLServerSocketChannel extends ServerSocketChannel {
-			static String[] filterArray(String[] items, List<String> includedItems, List<String> excludedItems) {
-				List<String> filteredItems = items == null ? new ArrayList<>() : Arrays.asList(items);
-				if (includedItems != null) {
-					for (int i = filteredItems.size() - 1; i >= 0; i--) {
-						if (!includedItems.contains(filteredItems.get(i))) {
-							filteredItems.remove(i);
-						}
-					}
-
-					for (String includedProtocol : includedItems) {
-						if (!filteredItems.contains(includedProtocol)) {
-							filteredItems.add(includedProtocol);
-						}
-					}
-				}
-
-				if (excludedItems != null) {
-					for (int i = filteredItems.size() - 1; i >= 0; i--) {
-						if (excludedItems.contains(filteredItems.get(i))) {
-							filteredItems.remove(i);
-						}
-					}
-				}
-
-				return filteredItems.toArray(new String[filteredItems.size()]);
-			}
-
-			/**
-			 * Should the SSLSocketChannels created from the accept method be put in
-			 * blocking mode. Default is {@code false}.
-			 */
-			public boolean blockingMode;
-
-			/**
-			 * Should the SS server ask for client certificate authentication? Default is
-			 * {@code false}.
-			 */
-			public boolean wantClientAuthentication;
-
-			/**
-			 * Should the SSL server require client certificate authentication? Default is
-			 * {@code false}.
-			 */
-			public boolean needClientAuthentication;
-
-			/**
-			 * The list of SSL protocols (TLSv1, TLSv1.1, etc.) supported for the SSL
-			 * exchange. Default is the JVM default.
-			 */
-			public List<String> includedProtocols;
-
-			/**
-			 * A list of SSL protocols (SSLv2, SSLv3, etc.) to explicitly exclude for the
-			 * SSL exchange. Default is none.
-			 */
-			public List<String> excludedProtocols;
-
-			/**
-			 * The list of ciphers allowed for the SSL exchange. Default is the JVM default.
-			 */
-			public List<String> includedCipherSuites;
-
-			/**
-			 * A list of ciphers to explicitly exclude for the SSL exchange. Default is
-			 * none.
-			 */
-			public List<String> excludedCipherSuites;
-
-			private final ServerSocketChannel serverSocketChannel;
-
-			private final SSLContext sslContext;
-
-			private final Runner threadPool;
-
-			/**
-			 *
-			 * @param serverSocketChannel The real server socket channel that accepts
-			 *                            network requests.
-			 * @param sslContext          The SSL context used to create the
-			 *                            {@link SSLEngine} for incoming requests.
-			 * @param threadPool          The thread pool passed to SSLSocketChannel used to
-			 *                            execute long running, blocking SSL operations such
-			 *                            as certificate validation with a CA (<a href=
-			 *                            "http://docs.oracle.com/javase/7/docs/api/javax/net/ssl/SSLEngineResult.HandshakeStatus.html#NEED_TASK">NEED_TASK</a>)
-			 * @param logger              The logger for debug and error messages. A null
-			 *                            logger will result in no log operations.
-			 */
-			public SSLServerSocketChannel(ServerSocketChannel serverSocketChannel, SSLContext sslContext,
-					Runner threadPool) {
-				super(serverSocketChannel.provider());
-				this.serverSocketChannel = serverSocketChannel;
-				this.sslContext = sslContext;
-				this.threadPool = threadPool;
-			}
-
-			/**
-			 * <p>
-			 * Accepts a connection made to this channel's socket.
-			 * </p>
-			 *
-			 * <p>
-			 * If this channel is in non-blocking mode then this method will immediately
-			 * return null if there are no pending connections. Otherwise it will block
-			 * indefinitely until a new connection is available or an I/O error occurs.
-			 * </p>
-			 *
-			 * <p>
-			 * The socket channel returned by this method, if any, will be in blocking mode
-			 * regardless of the blocking mode of this channel.
-			 * </p>
-			 *
-			 * <p>
-			 * This method performs exactly the same security checks as the accept method of
-			 * the ServerSocket class. That is, if a security manager has been installed
-			 * then for each new connection this method verifies that the address and port
-			 * number of the connection's remote endpoint are permitted by the security
-			 * manager's checkAccept method.
-			 * </p>
-			 *
-			 * @return An SSLSocketChannel or {@code null} if this channel is in
-			 *         non-blocking mode and no connection is available to be accepted.
-			 * @throws java.nio.channels.NotYetConnectedException   If this channel is not
-			 *                                                      yet connected
-			 * @throws java.nio.channels.ClosedChannelException     If this channel is
-			 *                                                      closed
-			 * @throws java.nio.channels.AsynchronousCloseException If another thread closes
-			 *                                                      this channel while the
-			 *                                                      read operation is in
-			 *                                                      progress
-			 * @throws java.nio.channels.ClosedByInterruptException If another thread
-			 *                                                      interrupts the current
-			 *                                                      thread while the read
-			 *                                                      operation is in
-			 *                                                      progress, thereby
-			 *                                                      closing the channel and
-			 *                                                      setting the current
-			 *                                                      thread's interrupt
-			 *                                                      status
-			 * @throws IOException                                  If some other I/O error
-			 *                                                      occurs
-			 */
-			@Override
-			public SocketChannel accept() throws IOException {
-				SocketChannel channel = serverSocketChannel.accept();
-				if (channel == null) {
-					return null;
-				} else {
-					channel.configureBlocking(blockingMode);
-
-					var sslEngine = sslContext.createSSLEngine();
-					sslEngine.setUseClientMode(false);
-					sslEngine.setWantClientAuth(wantClientAuthentication);
-					sslEngine.setNeedClientAuth(needClientAuthentication);
-					sslEngine.setEnabledProtocols(
-							filterArray(sslEngine.getEnabledProtocols(), includedProtocols, excludedProtocols));
-					sslEngine.setEnabledCipherSuites(filterArray(sslEngine.getEnabledCipherSuites(),
-							includedCipherSuites, excludedCipherSuites));
-
-					return new SSLSocketChannel(channel, sslEngine, threadPool);
-				}
-			}
-
-			@Override
-			public ServerSocketChannel bind(SocketAddress local, int backlog) throws IOException {
-				return serverSocketChannel.bind(local, backlog);
-			}
-
-			@Override
-			public SocketAddress getLocalAddress() throws IOException {
-				return serverSocketChannel.getLocalAddress();
-			}
-
-			@Override
-			public <T> T getOption(SocketOption<T> name) throws IOException {
-				return serverSocketChannel.getOption(name);
-			}
-
-			@Override
-			public <T> ServerSocketChannel setOption(SocketOption<T> name, T value) throws IOException {
-				return serverSocketChannel.setOption(name, value);
-			}
-
-			@Override
-			public ServerSocket socket() {
-				return serverSocketChannel.socket();
-			}
-
-			@Override
-			public Set<SocketOption<?>> supportedOptions() {
-				return serverSocketChannel.supportedOptions();
-			}
-
-			@Override
-			protected void implCloseSelectableChannel() throws IOException {
-				serverSocketChannel.close();
-			}
-
-			@Override
-			protected void implConfigureBlocking(boolean b) throws IOException {
-				serverSocketChannel.configureBlocking(b);
-			}
-		}
-
-		/**
-		 * A wrapper around a real {@link SocketChannel} that adds SSL support.
-		 */
-		private final static class SSLSocketChannel extends SocketChannel {
-			private final SocketChannel socketChannel;
-
-			private final SSLEngineBuffer sslEngineBuffer;
-
-			/**
-			 *
-			 * @param socketChannel   The real SocketChannel.
-			 * @param sslEngine       The SSL engine to use for traffic back and forth on
-			 *                        the given SocketChannel.
-			 * @param executorService Used to execute long running, blocking SSL operations
-			 *                        such as certificate validation with a CA (<a href=
-			 *                        "http://docs.oracle.com/javase/7/docs/api/javax/net/ssl/SSLEngineResult.HandshakeStatus.html#NEED_TASK">NEED_TASK</a>)
-			 * @throws IOException
-			 */
-			public SSLSocketChannel(SocketChannel socketChannel, final SSLEngine sslEngine, Runner executorService) {
-				super(socketChannel.provider());
-
-				this.socketChannel = socketChannel;
-
-				sslEngineBuffer = new SSLEngineBuffer(socketChannel, sslEngine, executorService);
-			}
-
-			@Override
-			public SocketChannel bind(SocketAddress local) throws IOException {
-				socketChannel.bind(local);
-				return this;
-			}
-
-			@Override
-			public boolean connect(SocketAddress socketAddress) throws IOException {
-				return socketChannel.connect(socketAddress);
-			}
-
-			@Override
-			public boolean finishConnect() throws IOException {
-				return socketChannel.finishConnect();
-			}
-
-			@Override
-			public SocketAddress getLocalAddress() throws IOException {
-				return socketChannel.getLocalAddress();
-			}
-
-			@Override
-			public <T> T getOption(SocketOption<T> name) throws IOException {
-				return socketChannel.getOption(name);
-			}
-
-			@Override
-			public SocketAddress getRemoteAddress() throws IOException {
-				return socketChannel.getRemoteAddress();
-			}
-
-			public final SocketChannel getWrappedSocketChannel() {
-				return socketChannel;
-			}
-
-			@Override
-			public boolean isConnected() {
-				return socketChannel.isConnected();
-			}
-
-			@Override
-			public boolean isConnectionPending() {
-				return socketChannel.isConnectionPending();
-			}
-
-			/**
-			 * <p>
-			 * Reads a sequence of bytes from this channel into the given buffer.
-			 * </p>
-			 *
-			 * <p>
-			 * An attempt is made to read up to r bytes from the channel, where r is the
-			 * number of bytes remaining in the buffer, that is, dst.remaining(), at the
-			 * moment this method is invoked.
-			 * </p>
-			 *
-			 * <p>
-			 * Suppose that a byte sequence of length n is read, where 0 <= n <= r. This
-			 * byte sequence will be transferred into the buffer so that the first byte in
-			 * the sequence is at index p and the last byte is at index p + n - 1, where p
-			 * is the buffer's position at the moment this method is invoked. Upon return
-			 * the buffer's position will be equal to p + n; its limit will not have
-			 * changed.
-			 * </p>
-			 *
-			 * <p>
-			 * A read operation might not fill the buffer, and in fact it might not read any
-			 * bytes at all. Whether or not it does so depends upon the nature and state of
-			 * the channel. A socket channel in non-blocking mode, for example, cannot read
-			 * any more bytes than are immediately available from the socket's input buffer;
-			 * similarly, a file channel cannot read any more bytes than remain in the file.
-			 * It is guaranteed, however, that if a channel is in blocking mode and there is
-			 * at least one byte remaining in the buffer then this method will block until
-			 * at least one byte is read.</
-			 *
-			 * <p>
-			 * This method may be invoked at any time. If another thread has already
-			 * initiated a read operation upon this channel, however, then an invocation of
-			 * this method will block until the first operation is complete.
-			 * </p>
-			 *
-			 * @param applicationBuffer The buffer into which bytes are to be transferred
-			 * @return The number of bytes read, possibly zero, or -1 if the channel has
-			 *         reached end-of-stream
-			 * @throws java.nio.channels.NotYetConnectedException   If this channel is not
-			 *                                                      yet connected
-			 * @throws java.nio.channels.ClosedChannelException     If this channel is
-			 *                                                      closed
-			 * @throws java.nio.channels.AsynchronousCloseException If another thread closes
-			 *                                                      this channel while the
-			 *                                                      read operation is in
-			 *                                                      progress
-			 * @throws java.nio.channels.ClosedByInterruptException If another thread
-			 *                                                      interrupts the current
-			 *                                                      thread while the read
-			 *                                                      operation is in
-			 *                                                      progress, thereby
-			 *                                                      closing the channel and
-			 *                                                      setting the current
-			 *                                                      thread's interrupt
-			 *                                                      status
-			 * @throws IOException                                  If some other I/O error
-			 *                                                      occurs
-			 * @throws IllegalArgumentException                     If the given
-			 *                                                      applicationBuffer
-			 *                                                      capacity
-			 *                                                      ({@link ByteBuffer#capacity()}
-			 *                                                      is less then the
-			 *                                                      application buffer size
-			 *                                                      of the {@link SSLEngine}
-			 *                                                      session application
-			 *                                                      buffer size
-			 *                                                      ({@link SSLSession#getApplicationBufferSize()}
-			 *                                                      this channel was
-			 *                                                      constructed was.
-			 */
-			@Override
-			synchronized public int read(ByteBuffer applicationBuffer) throws IOException, IllegalArgumentException {
-				if (SSL_LOG.isLoggable(Level.TRACE)) {
-					SSL_LOG.log(Level.TRACE, "read: {0} {1}", applicationBuffer.position(), applicationBuffer.limit());
-				}
-				int intialPosition = applicationBuffer.position();
-
-				int readFromChannel = sslEngineBuffer.unwrap(applicationBuffer);
-				if (SSL_LOG.isLoggable(Level.TRACE)) {
-					SSL_LOG.log(Level.TRACE, "read: from channel: {0}", readFromChannel);
-				}
-
-				if (readFromChannel < 0) {
-					if (SSL_LOG.isLoggable(Level.TRACE)) {
-						SSL_LOG.log(Level.TRACE, "read: channel closed.");
-					}
-					return readFromChannel;
-				} else {
-					int totalRead = applicationBuffer.position() - intialPosition;
-					if (SSL_LOG.isLoggable(Level.TRACE)) {
-						SSL_LOG.log(Level.TRACE, "read: total read {0}", totalRead);
-					}
-					return totalRead;
-				}
-			}
-
-			/**
-			 * <p>
-			 * Reads a sequence of bytes from this channel into a subsequence of the given
-			 * buffers.
-			 * </p>
-			 *
-			 * <p>
-			 * An invocation of this method attempts to read up to r bytes from this
-			 * channel, where r is the total number of bytes remaining the specified
-			 * subsequence of the given buffer array, that is,
-			 *
-			 * <pre>
-			 * {@code
-			 * dsts[offset].remaining()
-			 *   + dsts[offset+1].remaining()
-			 *   + ... + dsts[offset+length-1].remaining()
-			 * }
-			 * </pre>
-			 * <p>
-			 * at the moment that this method is invoked.
-			 * </p>
-			 *
-			 * <p>
-			 * Suppose that a byte sequence of length n is read, where 0 <= n <= r. Up to
-			 * the first dsts[offset].remaining() bytes of this sequence are transferred
-			 * into buffer dsts[offset], up to the next dsts[offset+1].remaining() bytes are
-			 * transferred into buffer dsts[offset+1], and so forth, until the entire byte
-			 * sequence is transferred into the given buffers. As many bytes as possible are
-			 * transferred into each buffer, hence the final position of each updated
-			 * buffer, except the last updated buffer, is guaranteed to be equal to that
-			 * buffer's limit.
-			 * </p>
-			 *
-			 * <p>
-			 * This method may be invoked at any time. If another thread has already
-			 * initiated a read operation upon this channel, however, then an invocation of
-			 * this method will block until the first operation is complete.
-			 * </p>
-			 *
-			 * @param applicationByteBuffers The buffers into which bytes are to be
-			 *                               transferred
-			 * @param offset                 The offset within the buffer array of the first
-			 *                               buffer into which bytes are to be transferred;
-			 *                               must be non-negative and no larger than
-			 *                               dsts.length
-			 * @param length                 The maximum number of buffers to be accessed;
-			 *                               must be non-negative and no larger than
-			 *                               <code>dsts.length - offset</code>
-			 * @return The number of bytes read, possibly zero, or -1 if the channel has
-			 *         reached end-of-stream
-			 * @throws java.nio.channels.NotYetConnectedException   If this channel is not
-			 *                                                      yet connected
-			 * @throws java.nio.channels.ClosedChannelException     If this channel is
-			 *                                                      closed
-			 * @throws java.nio.channels.AsynchronousCloseException If another thread closes
-			 *                                                      this channel while the
-			 *                                                      read operation is in
-			 *                                                      progress
-			 * @throws java.nio.channels.ClosedByInterruptException If another thread
-			 *                                                      interrupts the current
-			 *                                                      thread while the read
-			 *                                                      operation is in
-			 *                                                      progress, thereby
-			 *                                                      closing the channel and
-			 *                                                      setting the current
-			 *                                                      thread's interrupt
-			 *                                                      status
-			 * @throws IOException                                  If some other I/O error
-			 *                                                      occurs
-			 * @throws IllegalArgumentException                     If one of the given
-			 *                                                      applicationBuffers
-			 *                                                      capacity
-			 *                                                      ({@link ByteBuffer#capacity()}
-			 *                                                      is less then the
-			 *                                                      application buffer size
-			 *                                                      of the {@link SSLEngine}
-			 *                                                      session application
-			 *                                                      buffer size
-			 *                                                      ({@link SSLSession#getApplicationBufferSize()}
-			 *                                                      this channel was
-			 *                                                      constructed was.
-			 */
-			@Override
-			public long read(ByteBuffer[] applicationByteBuffers, int offset, int length)
-					throws IOException, IllegalArgumentException {
-				long totalRead = 0;
-				for (int i = offset; i < length; i++) {
-					ByteBuffer applicationByteBuffer = applicationByteBuffers[i];
-					if (applicationByteBuffer.hasRemaining()) {
-						int read = read(applicationByteBuffer);
-						if (read > 0) {
-							totalRead += read;
-							if (applicationByteBuffer.hasRemaining()) {
-								break;
-							}
-						} else {
-							if ((read < 0) && (totalRead == 0)) {
-								totalRead = -1;
-							}
-							break;
-						}
-					}
-				}
-				return totalRead;
-			}
-
-			@Override
-			public <T> SocketChannel setOption(SocketOption<T> name, T value) throws IOException {
-				return socketChannel.setOption(name, value);
-			}
-
-			@Override
-			public SocketChannel shutdownInput() throws IOException {
-				return socketChannel.shutdownInput();
-			}
-
-			@Override
-			public SocketChannel shutdownOutput() throws IOException {
-				return socketChannel.shutdownOutput();
-			}
-
-			@Override
-			public Socket socket() {
-				return socketChannel.socket();
-			}
-
-			@Override
-			public Set<SocketOption<?>> supportedOptions() {
-				return socketChannel.supportedOptions();
-			}
-
-			/**
-			 * <p>
-			 * Writes a sequence of bytes to this channel from the given buffer.
-			 * </p>
-			 *
-			 * <p>
-			 * An attempt is made to write up to r bytes to the channel, where r is the
-			 * number of bytes remaining in the buffer, that is, src.remaining(), at the
-			 * moment this method is invoked.
-			 * </p>
-			 *
-			 * <p>
-			 * Suppose that a byte sequence of length n is written, where 0 <= n <= r. This
-			 * byte sequence will be transferred from the buffer starting at index p, where
-			 * p is the buffer's position at the moment this method is invoked; the index of
-			 * the last byte written will be p + n - 1. Upon return the buffer's position
-			 * will be equal to p + n; its limit will not have changed.
-			 * </p>
-			 *
-			 * <p>
-			 * Unless otherwise specified, a write operation will return only after writing
-			 * all of the r requested bytes. Some types of channels, depending upon their
-			 * state, may write only some of the bytes or possibly none at all. A socket
-			 * channel in non-blocking mode, for example, cannot write any more bytes than
-			 * are free in the socket's output buffer.
-			 * </p>
-			 *
-			 * <p>
-			 * This method may be invoked at any time. If another thread has already
-			 * initiated a write operation upon this channel, however, then an invocation of
-			 * this method will block until the first operation is complete.
-			 * </p>
-			 *
-			 * @param applicationBuffer The buffer from which bytes are to be retrieved
-			 * @return The number of bytes written, possibly zero
-			 * @throws java.nio.channels.NotYetConnectedException   If this channel is not
-			 *                                                      yet connected
-			 * @throws java.nio.channels.ClosedChannelException     If this channel is
-			 *                                                      closed
-			 * @throws java.nio.channels.AsynchronousCloseException If another thread closes
-			 *                                                      this channel while the
-			 *                                                      read operation is in
-			 *                                                      progress
-			 * @throws java.nio.channels.ClosedByInterruptException If another thread
-			 *                                                      interrupts the current
-			 *                                                      thread while the read
-			 *                                                      operation is in
-			 *                                                      progress, thereby
-			 *                                                      closing the channel and
-			 *                                                      setting the current
-			 *                                                      thread's interrupt
-			 *                                                      status
-			 * @throws IOException                                  If some other I/O error
-			 *                                                      occurs
-			 * @throws IllegalArgumentException                     If the given
-			 *                                                      applicationBuffer
-			 *                                                      capacity
-			 *                                                      ({@link ByteBuffer#capacity()}
-			 *                                                      is less then the
-			 *                                                      application buffer size
-			 *                                                      of the {@link SSLEngine}
-			 *                                                      session application
-			 *                                                      buffer size
-			 *                                                      ({@link SSLSession#getApplicationBufferSize()}
-			 *                                                      this channel was
-			 *                                                      constructed was.
-			 */
-			@Override
-			synchronized public int write(ByteBuffer applicationBuffer) throws IOException, IllegalArgumentException {
-				if (SSL_LOG.isLoggable(Level.TRACE)) {
-					SSL_LOG.log(Level.TRACE, "write:");
-				}
-
-				int intialPosition = applicationBuffer.position();
-				int writtenToChannel = sslEngineBuffer.wrap(applicationBuffer);
-
-				if (writtenToChannel < 0) {
-					if (SSL_LOG.isLoggable(Level.TRACE)) {
-						SSL_LOG.log(Level.TRACE, "write: channel closed");
-					}
-					return writtenToChannel;
-				} else {
-					int totalWritten = applicationBuffer.position() - intialPosition;
-					if (SSL_LOG.isLoggable(Level.TRACE)) {
-						SSL_LOG.log(Level.TRACE, "write: total written: {0} amount available in network outbound: {1}",
-								totalWritten, applicationBuffer.remaining());
-					}
-					return totalWritten;
-				}
-			}
-
-			/**
-			 * <p>
-			 * Writes a sequence of bytes to this channel from a subsequence of the given
-			 * buffers.
-			 * </p>
-			 *
-			 * <p>
-			 * An attempt is made to write up to r bytes to this channel, where r is the
-			 * total number of bytes remaining in the specified subsequence of the given
-			 * buffer array, that is,
-			 * </p>
-			 *
-			 * <pre>
-			 * {@code
-			 * srcs[offset].remaining()
-			 *   + srcs[offset+1].remaining()
-			 *   + ... + srcs[offset+length-1].remaining()
-			 * }
-			 * </pre>
-			 * <p>
-			 * at the moment that this method is invoked.
-			 * </p>
-			 *
-			 * <p>
-			 * Suppose that a byte sequence of length n is written, where 0 <= n <= r. Up to
-			 * the first srcs[offset].remaining() bytes of this sequence are written from
-			 * buffer srcs[offset], up to the next srcs[offset+1].remaining() bytes are
-			 * written from buffer srcs[offset+1], and so forth, until the entire byte
-			 * sequence is written. As many bytes as possible are written from each buffer,
-			 * hence the final position of each updated buffer, except the last updated
-			 * buffer, is guaranteed to be equal to that buffer's limit.
-			 * </p>
-			 *
-			 * <p>
-			 * Unless otherwise specified, a write operation will return only after writing
-			 * all of the r requested bytes. Some types of channels, depending upon their
-			 * state, may write only some of the bytes or possibly none at all. A socket
-			 * channel in non-blocking mode, for example, cannot write any more bytes than
-			 * are free in the socket's output buffer.
-			 * </p>
-			 *
-			 * <p>
-			 * This method may be invoked at any time. If another thread has already
-			 * initiated a write operation upon this channel, however, then an invocation of
-			 * this method will block until the first operation is complete.
-			 * </p>
-			 *
-			 * @param applicationByteBuffers The buffers from which bytes are to be
-			 *                               retrieved
-			 * @param offset                 offset - The offset within the buffer array of
-			 *                               the first buffer from which bytes are to be
-			 *                               retrieved; must be non-negative and no larger
-			 *                               than <code>srcs.length</code>
-			 * @param length                 The maximum number of buffers to be accessed;
-			 *                               must be non-negative and no larger than
-			 *                               <code>srcs.length - offset</code>
-			 * @return The number of bytes written, possibly zero
-			 * @throws java.nio.channels.NotYetConnectedException   If this channel is not
-			 *                                                      yet connected
-			 * @throws java.nio.channels.ClosedChannelException     If this channel is
-			 *                                                      closed
-			 * @throws java.nio.channels.AsynchronousCloseException If another thread closes
-			 *                                                      this channel while the
-			 *                                                      read operation is in
-			 *                                                      progress
-			 * @throws java.nio.channels.ClosedByInterruptException If another thread
-			 *                                                      interrupts the current
-			 *                                                      thread while the read
-			 *                                                      operation is in
-			 *                                                      progress, thereby
-			 *                                                      closing the channel and
-			 *                                                      setting the current
-			 *                                                      thread's interrupt
-			 *                                                      status
-			 * @throws IOException                                  If some other I/O error
-			 *                                                      occurs
-			 * @throws IllegalArgumentException                     If one of the given
-			 *                                                      applicationBuffers
-			 *                                                      capacity
-			 *                                                      ({@link ByteBuffer#capacity()}
-			 *                                                      is less then the
-			 *                                                      application buffer size
-			 *                                                      of the {@link SSLEngine}
-			 *                                                      session application
-			 *                                                      buffer size
-			 *                                                      ({@link SSLSession#getApplicationBufferSize()}
-			 *                                                      this channel was
-			 *                                                      constructed was.
-			 */
-			@Override
-			public long write(ByteBuffer[] applicationByteBuffers, int offset, int length)
-					throws IOException, IllegalArgumentException {
-				long totalWritten = 0;
-				for (int i = offset; i < length; i++) {
-					ByteBuffer byteBuffer = applicationByteBuffers[i];
-					if (byteBuffer.hasRemaining()) {
-						int written = write(byteBuffer);
-						if (written > 0) {
-							totalWritten += written;
-							if (byteBuffer.hasRemaining()) {
-								break;
-							}
-						} else {
-							if ((written < 0) && (totalWritten == 0)) {
-								totalWritten = -1;
-							}
-							break;
-						}
-					}
-				}
-				return totalWritten;
-			}
-
-			@Override
-			protected void implCloseSelectableChannel() throws IOException {
-				try {
-					sslEngineBuffer.flushNetworkOutbound();
-				} catch (Exception e) {
-				}
-
-				socketChannel.close();
-				sslEngineBuffer.close();
-			}
-
-			@Override
-			protected void implConfigureBlocking(boolean b) throws IOException {
-				socketChannel.configureBlocking(b);
-			}
-		}
-
-		final static Logger SSL_LOG = System.getLogger("UHTTPD-SSL");
-	} // smaller
-
 	private final static class ThreadPoolRunner implements Runner {
 		private ExecutorService pool;
 
@@ -5858,7 +4892,7 @@ public class UHTTPD {
 		}
 
 	}
-
+	
 	private static abstract class WebChannel implements ByteChannel {
 
 		protected final Client client;
@@ -5916,10 +4950,9 @@ public class UHTTPD {
 					ch = (char)r;
 					if (ch == '\r') {
 						if (cr) {
-							cr = false;
-							stringBuffer.append("\r\r");
-						} else
-							cr = true;
+							stringBuffer.append("\r");
+						} 
+						cr = true;
 					} else if (ch == '\n' && cr) {
 						break;
 					} else {

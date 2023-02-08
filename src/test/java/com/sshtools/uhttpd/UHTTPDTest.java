@@ -47,23 +47,29 @@ public class UHTTPDTest {
     {
 		System.setProperty("java.util.logging.config.file", ClassLoader.getSystemResource("logging.properties").getPath());
 		System.setProperty("jdk.httpclient.HttpClient.log", "errors,requests,headers,frames[:control:data:window:all],content,ssl,trace,channel,all");
+		System.setProperty("jdk.internal.httpclient.disableHostnameVerification", "true");
+//		System.setProperty("javax.net.debug", "ssl:all");
 	}
 	
-	Methanol client() {
+	final Methanol client() {
 		Builder bldr = Methanol.newBuilder()
         .version(Version.HTTP_1_1)
-        .followRedirects(Redirect.NORMAL)
-        .connectTimeout(Duration.ofSeconds(20));
+        .followRedirects(Redirect.NORMAL);
 		
 		if(System.getProperty("uhttpd.test.timeouts", "true").equals("false")) {
 		     bldr.connectTimeout(Duration.ofSeconds(30));
 		     bldr.readTimeout(Duration.ofSeconds(30));
 		}
 		
+		configureClient(bldr);
+		
 		return bldr
 //        .proxy(ProxySelector.of(new InetSocketAddress("proxy.example.com", 80)))
 //        .authenticator(Authenticator.getDefault())
         .build();
+	}
+	
+	protected void configureClient(Builder builder) {
 	}
 
 	@Test

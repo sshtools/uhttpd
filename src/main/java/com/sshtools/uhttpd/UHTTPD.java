@@ -329,12 +329,10 @@ public class UHTTPD {
 					} catch(SocketTimeoutException ste) {
 						LOG.log(Level.TRACE, "Timeout.", ste);
 					} catch (Exception e) {
-						e.printStackTrace();
 						LOG.log(Level.ERROR, "Failed handling connection.", e);
 					}
 				}
 			} catch (Exception e) {
-				e.printStackTrace();
 				if (LOG.isLoggable(Level.DEBUG))
 					LOG.log(Level.DEBUG, "Failed processing connection.", e);
 			} finally {
@@ -4575,7 +4573,6 @@ public class UHTTPD {
 							LOG.log(Level.DEBUG, "File not found. {0}", fnfe.getMessage());
 						tx.notFound();
 					} catch (Exception ise) {
-						ise.printStackTrace();
 						LOG.log(Level.ERROR, "Request handling failed.", ise);
 						tx.error(ise);
 					}

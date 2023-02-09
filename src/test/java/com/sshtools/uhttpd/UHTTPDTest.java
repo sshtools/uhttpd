@@ -224,6 +224,38 @@ public class UHTTPDTest {
 			Files.delete(tf);
 		}
 	}
+//	@Test
+//	void testGetConditional() throws Exception {
+//		var tf = createTempDataFile(10000);
+//		try(var httpd = createServer().
+//			get("/get", (tx) -> {
+//				tx.response(tf); // can use file here, as compression prevents content length being automatically determined
+//			}).
+//			withMaxUnchunkedSize(10000 / 2). // half size of file will mean gzipped content is chunked
+//			build()) {
+//			httpd.start();
+//			XXXX
+//			//			
+//			var client = client();
+//			var req =  MutableRequest.GET(clientURL() + "/get").
+//					header(UHTTPD.HDR_ACCEPT_ENCODING, "gzip").
+//					build();
+//			var outf = Files.createTempFile("http", "data");
+//			try {
+//				var resp = client.send(req, BodyHandlers.ofFile(outf));
+//
+//				// TODO Methanol seems to strip these headers (i presume because content returned to client code wont be compressed). Not sure how we'd test this
+////				assertEquals("gzip", resp.headers().firstValue(UHTTPD.HDR_CONTENT_ENCODING).get());
+//				assertTrue(isEqual(tf, outf));
+//			}
+//			finally {
+//				Files.delete(outf);
+//			}
+//		}
+//		finally {
+//			Files.delete(tf);
+//		}
+//	}
 
 	@Test
 	void testPostFormUrlEncoded() throws Exception {

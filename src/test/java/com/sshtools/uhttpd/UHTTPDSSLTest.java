@@ -1,7 +1,11 @@
 package com.sshtools.uhttpd;
 
+import java.io.IOException;
 import java.net.Socket;
 import java.security.GeneralSecurityException;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 
@@ -10,14 +14,31 @@ import javax.net.ssl.SSLEngine;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509ExtendedTrustManager;
 
+import org.junit.jupiter.api.BeforeAll;
+
 import com.github.mizosoft.methanol.Methanol.Builder;
 import com.sshtools.uhttpd.UHTTPD.RootContextBuilder;
 
 public class UHTTPDSSLTest extends UHTTPDTest {
 
+    @BeforeAll
+    public static void beforeClass()
+    {
+		
+	}
+    
 	@Override
 	protected RootContextBuilder createServer() {
-		return UHTTPD.server().withoutHttp().withHttps(58443);
+		try {
+			var ks = KeyStore.getInstance("JKS");
+			try(var in = UHTTPDSSLTest.class.getResourceAsStream("/uhttpd.keystore")) {
+				ks.load(in, "changeit".toCharArray());
+			}
+			return UHTTPD.server().withoutHttp().withHttps(58443).withKeyStore(ks);
+		}
+		catch(KeyStoreException | NoSuchAlgorithmException | CertificateException | IOException kse) {
+			throw new IllegalStateException("Failed to setup keystore.", kse);
+		}
 	}
 
 	@Override	

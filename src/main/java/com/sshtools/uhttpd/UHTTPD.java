@@ -1945,9 +1945,9 @@ public class UHTTPD {
 
 		public final Transaction redirect(Status status, String location) {
 			checkNotResponded();
-			if (status != Status.MOVED_PERMANENTLY && status != Status.MOVED_PERMANENTLY)
+			if (status != Status.MOVED_PERMANENTLY && status != Status.MOVED_TEMPORARILY)
 				throw new IllegalArgumentException(MessageFormat.format("May only use {0} or {1}.",
-						Status.MOVED_PERMANENTLY, Status.MOVED_PERMANENTLY));
+						Status.MOVED_PERMANENTLY, Status.MOVED_TEMPORARILY));
 			responseCode(status);
 			header("Location", location == null ? "/" : location);
 			resetContent();

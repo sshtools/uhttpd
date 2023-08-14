@@ -4535,9 +4535,11 @@ public class UHTTPD {
 						if (sslServerSocket != null)
 							sslServerSocket.close();
 					} finally {
-						synchronized (clients) {
-							while (!clients.isEmpty())
-								clients.iterator().next().close();
+						for(var c : new HashSet<>(clients)) {
+							try {
+								c.close();
+							}
+							catch(Exception e) {}
 						}
 						try {
 							join();

@@ -3594,7 +3594,7 @@ public class UHTTPD {
 				LOG.log(Level.DEBUG, "Awaiting HTTP start");
 
 			var line = readLine();
-			if (line == null)
+			if (line.length() == 0)
 				throw new EOFException();
 			if (LOG.isLoggable(Level.DEBUG))
 				LOG.log(Level.DEBUG, "HTTP IN: {0}", line);

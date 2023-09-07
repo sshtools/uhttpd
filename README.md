@@ -74,11 +74,11 @@ Now in Maven Central, so to add to your project just include this single depende
 <dependency>
 	<groupId>com.sshtools</groupId>
 	<artifactId>uhttpd</artifactId>
-	<version>0.0.5</version>
+	<version>[VERSION]</version>
 </dependency>
 ```
 
-Snapshot versions are in the [Sonatype OSS Snapshot Repository](https://oss.sonatype.org/content/repositories/snapshots/).
+* See badge above for version available on Maven Central. Snapshot versions are in the [Sonatype OSS Snapshot Repository](https://oss.sonatype.org/content/repositories/snapshots/). *
 
 ## More Examples
 

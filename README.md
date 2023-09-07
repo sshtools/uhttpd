@@ -1,5 +1,11 @@
 # µHTTPD
 
+![Maven Build/Test JDK 17](https://github.com/sshtools/uhttpd/actions/workflows/maven.yml/badge.svg)
+[![Maven Central](https://maven-badges.herokuapp.com/maven-central/com.sshtools/uhttpd/badge.svg)](https://maven-badges.herokuapp.com/maven-central/com.sshtools/uhttpd)
+[![Coverage Status](https://coveralls.io/repos/github/sshtools/uhttpd/badge.svg)](https://coveralls.io/github/sshtools/uhttpd)
+[![javadoc](https://javadoc.io/badge2/com.sshtools/uhttpd/javadoc.svg)](https://javadoc.io/doc/com.sshtools/uhttpd)
+![JPMS](https://img.shields.io/badge/JPMS-com.sshtools.uhttpd-purple) 
+
 A very small HTTP/HTTPS server, intended for embedding into other applications generating dynamic content.
 
 **This is not yet intended for production use. But may be useful in very simple projects or testing and development.** 

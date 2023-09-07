@@ -663,22 +663,27 @@ public class UHTTPD {
 
 	public final static class CookieBuilder {
 
-		final String name;
+		String name;
 		CookieVersion version = CookieVersion.V1;
 		boolean secure;
 		boolean httpOnly;
-		final String value;
+		String value;
 		Optional<String> path = Optional.empty();
 		Optional<String> domain = Optional.empty();
 		Optional<Long> maxAge = Optional.empty();
 		Optional<Instant> expires = Optional.empty();
 		Optional<SameSite> sameSite = Optional.empty();
-
-		CookieBuilder(String name, String value) {
+		
+		public CookieBuilder withName(String name) {
 			this.name = name;
-			this.value = value;
+			return this;
 		}
-
+		
+		public CookieBuilder withValue(String value) {
+			this.value = value;
+			return this;
+		}
+		
 		public Cookie build() {
 			return new Cookie() {
 
@@ -814,6 +819,11 @@ public class UHTTPD {
 		public CookieBuilder withVersion(CookieVersion version) {
 			this.version = version;
 			return this;
+		}
+
+		public CookieBuilder fromSpec(String asString) {
+			// TODO Auto-generated method stub
+			return null;
 		}
 	}
 
@@ -1558,7 +1568,7 @@ public class UHTTPD {
 		LEBNGTH_REQUIRED(411, "Length Required"), PRECONDITION_FAILED(412, "Precondition Failed"),
 		REQUEST_ENTITY_TOO_LARGE(413, "Request Entity Too Large"), REQUEST_URI_TOO_LONG(414, "Request-URI Too Long"),
 		UNSUPPORTED_MEDIA_TYPE(415, "Request-URI Too Long"), UNPROCESSABLE_ENTITY(422, "Unprocessable Entity"),
-		LOCKED(423, "Locked"), FAILED_DEPENDENCY(424, "Failed Dependency"), INTERNAL_SERVER_ERROR(500, "Not Found"),
+		LOCKED(423, "Locked"), FAILED_DEPENDENCY(424, "Failed Dependency"), UPGRADE_REQUIRED(426, "Failed Dependency"), INTERNAL_SERVER_ERROR(500, "Not Found"),
 		NOT_IMPLEMENTED(501, "Not Implemented"), BAD_GATEWAY(502, "Bad Gateway"),
 		SERVICE_UNAVAILABLE(503, "Service Unavailable"), GATEWAY_TEIMOUT(504, "Gateway Timeout"),
 		HTTP_VERSION_NOT_SUPPORTED(505, "HTTP Version Not Supported"),
@@ -1590,6 +1600,10 @@ public class UHTTPD {
 
 		default boolean asBoolean() {
 			return ofString().map(v -> Boolean.valueOf(v)).orElseThrow();
+		}
+
+		default Optional<Boolean> ofBoolean() {
+			return ofString().map(v -> Boolean.parseBoolean(v));
 		}
 
 		default byte asByte() {
@@ -1696,7 +1710,7 @@ public class UHTTPD {
 		private final Optional<String> queryString;
 //		private Supplier<Optional<Content>> contentSupplier;
 		private final Map<String, Named> incomingHeaders = new LinkedHashMap<>();
-		private final Map<String, String> incomingCookies = new LinkedHashMap<>();
+		private final Map<String, Cookie> incomingCookies = new LinkedHashMap<>();
 		private final List<String> matches = new ArrayList<>();
 		private final Method method;
 		private Optional<String> responseType = Optional.empty();
@@ -1782,7 +1796,7 @@ public class UHTTPD {
 			return this;
 		}
 
-		public final String cookie(String name) {
+		public final Cookie cookie(String name) {
 			return cookieOr(name).orElseThrow();
 		}
 
@@ -1790,7 +1804,7 @@ public class UHTTPD {
 			return cookie(UHTTPD.cookie(name, value).build());
 		}
 
-		public final Optional<String> cookieOr(String name) {
+		public final Optional<Cookie> cookieOr(String name) {
 			return Optional.ofNullable(incomingCookies.get(name));
 		}
 
@@ -2476,15 +2490,16 @@ public class UHTTPD {
 
 			void read(ByteChannel channel) throws IOException {
 				buffer.clear();
-				channel.read(buffer);
+				var read = channel.read(buffer);
+				if(read == -1)
+					throw new EOFException();
+					
 				buffer.flip();
 
 				if (LOG.isLoggable(Level.TRACE))
 					debugByteBuffer("Frame", buffer);
 
 				var b1 = buffer.get();
-				if (b1 == -1)
-					throw new EOFException();
 
 				fin = (b1 & 0x80) != 0;
 				rsv1 = (b1 & 0x40) != 0;
@@ -2741,18 +2756,15 @@ public class UHTTPD {
 
 				// TODO origin check
 
-				var key = req.header("sec-websocket-Key");
+				var keyOr = req.headerOr("sec-websocket-key");
 				var proto = req.headersOr("sec-websocket-protocol");
 				var version = req.headers("sec-websocket-version").asInt();
 				if (version > SUPPORTED_WEBSOCKET_VERSION) {
 					req.header("sec-websocket-version", String.valueOf(SUPPORTED_WEBSOCKET_VERSION));
-					req.responseCode(Status.BAD_REQUEST);
+					req.responseCode(Status.UPGRADE_REQUIRED);
 					return;
 				}
 				var hasher = MessageDigest.getInstance("SHA-1");
-				var responseKeyData = key + WEBSOCKET_UUID;
-				var responseKeyBytes = responseKeyData.getBytes("UTF-8");
-				var responseKey = Base64.getEncoder().encodeToString(hasher.digest(responseKeyBytes));
 				var selectedProtocol = onHandshake.isPresent()
 						? onHandshake.get().handshake(req, proto.get().expand(",").values().toArray(new String[0]))
 						: "";
@@ -2765,7 +2777,18 @@ public class UHTTPD {
 				req.header(HDR_UPGRADE, "websocket");
 				if (!selectedProtocol.equals(""))
 					req.header("sec-websocket-protocol", selectedProtocol);
-				req.header("sec-websocket-accept", responseKey);
+				
+				if(keyOr.isPresent()) {
+					var key = keyOr.get();
+					if(key.length() != 24) {
+						ws.close();
+						throw new IOException("invalid Sec-WebSocket-Key header");
+					}
+					var responseKeyData = key + WEBSOCKET_UUID;
+					var responseKeyBytes = responseKeyData.getBytes("UTF-8");
+					var responseKey = Base64.getEncoder().encodeToString(hasher.digest(responseKeyBytes));
+					req.header("sec-websocket-accept", responseKey);
+				}
 
 				client.wireProtocol = new WebSocketProtocol(ws);
 			}
@@ -3637,9 +3660,40 @@ public class UHTTPD {
 
 					tx.headersOr(HDR_COOKIE).ifPresent(c -> {
 						for (var val : c.values()) {
+							var bldr = new CookieBuilder();
 							var spec = Named.parseSeparatedStrings(val);
-							for (var cookie : spec.values()) {
-								tx.incomingCookies.put(cookie.name(), cookie.asString());
+							var map = new LinkedHashMap<String, String>();
+							for (var el : spec.values()) {
+								if(el.name().equalsIgnoreCase("path")) {
+									bldr.withPath(el.asString());
+								}
+								else if(el.name().equalsIgnoreCase("domain")) {
+									bldr.withDomain(el.asString());
+								}
+								else if(el.name().equalsIgnoreCase("httponly")) {
+									bldr.withHttpOnly();
+								}
+								else if(el.name().equalsIgnoreCase("secure")) {
+									bldr.withSecure();
+								}
+								else if(el.name().equalsIgnoreCase("expires")) {
+									bldr.withExpires(parseDate(el.asString()));
+								}
+								else if(el.name().equalsIgnoreCase("max-age")) {
+									bldr.withMaxAge(el.asLong());
+								}
+								else if(el.name().equalsIgnoreCase("samesite")) {
+									bldr.withSameSite(SameSite.valueOf(el.asString().toUpperCase()));
+								}
+								else {
+									map.put(el.name(), el.hasValue() ? el.asString() : "");
+								}
+							}
+							for(var en : map.entrySet()) {
+								bldr.withName(en.getKey());
+								bldr.withValue(en.getValue());
+								var cookie = bldr.build();
+								tx.incomingCookies.put(cookie.name(), cookie);
 							}
 						}
 					});
@@ -4888,8 +4942,18 @@ public class UHTTPD {
 		public void get(Transaction req) throws Exception {
 			LOG.log(Level.DEBUG, "Resource @{0}", url);
 			var conx = url.openConnection();
+			var lastMod = new Date( ((conx.getLastModified() + 500) / 1000) * 1000 );
+			if(req.headerOr(HDR_IF_MODIFIED_SINCE).isPresent()) {
+				var date = parseDate(req.header(HDR_IF_MODIFIED_SINCE));
+				if(lastMod.after(date)) {
+					req.responseCode(Status.NOT_MODIFIED);
+					return;
+				}
+			}
 			req.responseLength(conx.getContentLengthLong());
 			req.responseType(conx.getContentType());
+			req.header(HDR_LAST_MODIFIED, formatDate(lastMod));
+			
 			req.response(url.openStream());
 		}
 
@@ -5006,19 +5070,19 @@ public class UHTTPD {
 	}
 
 	public static final String HDR_CACHE_CONTROL = "cache-control";
-
 	public static final String HDR_ACCEPT_ENCODING = "accept-encoding";
 	public static final String HDR_CONTENT_ENCODING = "content-encoding";
 	public static final String HDR_CONNECTION = "connection";
 	public static final String HDR_CONTENT_DISPOSITION = "content-disposition";
 	public static final String HDR_CONTENT_LENGTH = "content-length";
 	public static final String HDR_TRANSFER_ENCODING = "transfer-encoding";
+	public static final String HDR_LAST_MODIFIED = "last-modified";
+	public static final String HDR_IF_MODIFIED_SINCE = "if-modified-since";
+	public static final String HDR_IF_UNMODIFIED_SINCE = "if-unmodified-since";
 	public static final String HDR_CONTENT_TYPE = "content-type";
 	public static final String HDR_HOST = "host";
 	public static final String HDR_UPGRADE = "upgrade";
-
 	public static final String HDR_SET_COOKIE = "set-cookie";
-
 	public static final String HDR_COOKIE = "cookie";
 
 	final static Logger LOG = System.getLogger("UHTTPD");
@@ -5081,8 +5145,8 @@ public class UHTTPD {
 		return new ContextBuilder(path);
 	}
 
-	public static CookieBuilder cookie(String name, String version) {
-		return new CookieBuilder(name, version);
+	public static CookieBuilder cookie(String name, String value) {
+		return new CookieBuilder().withName(name).withValue(value);
 	}
 
 	public static Handler fileResource(Path path) {

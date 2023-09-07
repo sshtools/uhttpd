@@ -7,6 +7,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.IOException;
 import java.io.InputStream;
 import java.math.BigInteger;
+import java.net.CookieManager;
+import java.net.HttpCookie;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient.Redirect;
@@ -26,6 +28,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Random;
+import java.util.concurrent.Semaphore;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -50,8 +53,11 @@ public class UHTTPDTest {
 		System.setProperty("jdk.internal.httpclient.disableHostnameVerification", "true");
 //		System.setProperty("javax.net.debug", "ssl:all");
 	}
-	
 	final Methanol client() {
+		return clientBuilder().build();
+	}
+	
+	final Builder clientBuilder() {
 		Builder bldr = Methanol.newBuilder()
         .version(Version.HTTP_1_1)
         .followRedirects(Redirect.NORMAL);
@@ -63,13 +69,38 @@ public class UHTTPDTest {
 		
 		configureClient(bldr);
 		
-		return bldr
+		return bldr;
 //        .proxy(ProxySelector.of(new InetSocketAddress("proxy.example.com", 80)))
 //        .authenticator(Authenticator.getDefault())
-        .build();
 	}
 	
 	protected void configureClient(Builder builder) {
+	}
+
+	@Test
+	void testSendCookie() throws Exception {
+		var mgr = new CookieManager();
+		var num = (int)(Math.random() * 1000);
+		try(var httpd = createServer().
+			get("/cookies\\.html", (tx) -> {
+				var cookie = tx.cookie("mycookie");
+				assertEquals("cookie" + num, cookie.value());
+			}).
+			build()) {
+			httpd.start();
+			
+			//			
+			var sessionCookie = new HttpCookie("mycookie", "cookie" + num);
+	        sessionCookie.setPath("/");
+	        sessionCookie.setVersion(0);
+	        mgr.getCookieStore().add(URI.create(clientURL()), sessionCookie);
+	        
+		        
+			var client = clientBuilder().cookieHandler(mgr).build();
+			var req = HttpRequest.newBuilder().uri(URI.create(clientURL() + "/cookies.html")).GET().build();
+			var resp = client.send(req, BodyHandlers.ofString());
+			assertEquals(Status.OK.getCode(), resp.statusCode());
+		}
 	}
 
 	@Test

@@ -16,7 +16,6 @@ import javax.net.ssl.X509ExtendedTrustManager;
 
 import org.junit.jupiter.api.BeforeAll;
 
-import com.github.mizosoft.methanol.Methanol.Builder;
 import com.sshtools.uhttpd.UHTTPD.RootContextBuilder;
 
 public class UHTTPDSSLTest extends UHTTPDTest {
@@ -42,7 +41,7 @@ public class UHTTPDSSLTest extends UHTTPDTest {
 	}
 
 	@Override	
-	protected void configureClient(Builder builder) {
+	protected java.net.http.HttpClient.Builder configureClient(java.net.http.HttpClient.Builder builder) {
 		try {
 			var sslContext = SSLContext.getInstance("SSL");
 			sslContext.init(null, new TrustManager[] { new DumbTrustManager() }, new java.security.SecureRandom());
@@ -50,6 +49,7 @@ public class UHTTPDSSLTest extends UHTTPDTest {
 			sslParameters.setEndpointIdentificationAlgorithm(null);
 			builder.sslParameters(sslParameters);
 			builder.sslContext(sslContext);
+			return builder;
 		} catch (GeneralSecurityException e) {
 			throw new IllegalStateException("Could not initialise SSL.", e);
 		}
@@ -58,6 +58,11 @@ public class UHTTPDSSLTest extends UHTTPDTest {
 	@Override
 	protected String clientURL() {
 		return "https://localhost:58443";
+	}
+
+	@Override
+	protected String wsClientURL() {
+		return "wss://localhost:58443";
 	}
 	
 	static class DumbTrustManager extends X509ExtendedTrustManager {

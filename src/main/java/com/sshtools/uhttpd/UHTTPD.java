@@ -2269,6 +2269,9 @@ public class UHTTPD {
 		T withTmpDir(Path tmpDir);
 	}
 
+	/**
+	 * https://developer.mozilla.org/en-US/docs/Web/API/WebSockets_API/Writing_WebSocket_servers
+	 */
 	public interface WebSocket extends Closeable {
 		Client client();
 
@@ -2292,7 +2295,6 @@ public class UHTTPD {
 		private Optional<OnWebSocketHandshake> onHandshake = Optional.empty();
 		private Optional<OnWebSocketOpen> onOpen = Optional.empty();
 		private Optional<Integer> maxTextPayloadSize = Optional.empty();
-		private boolean mask = true;
 
 		public WebSocketHandler build() {
 			return new WebSocketHandler(this);
@@ -2325,11 +2327,6 @@ public class UHTTPD {
 
 		public WebSocketBuilder withMaxTextPayloadSize(int maxTextPayloadSize) {
 			this.maxTextPayloadSize = Optional.of(maxTextPayloadSize);
-			return this;
-		}
-
-		public WebSocketBuilder withoutMask() {
-			this.mask = false;
 			return this;
 		}
 
@@ -2463,7 +2460,7 @@ public class UHTTPD {
 			}
 
 			WebSocketFrame(OpCode opCode, ByteBuffer payload, boolean fin) {
-				this(opCode, payload, fin, WebSocketHandler.this.mask, WebSocketHandler.this.mask ? makeKey() : null);
+				this(opCode, payload, fin, false, null);
 			}
 
 			WebSocketFrame(OpCode opCode, ByteBuffer payload, boolean fin, boolean mask, byte[] key) {
@@ -2522,6 +2519,9 @@ public class UHTTPD {
 				if (b1 == -1)
 					throw new EOFException();
 				mask = (b1 & 0x80) != 0;
+				if(!mask) {
+					throw new IOException("Client to server messages should be masked.");
+				}
 				var longPayloadLength = (long) (b1 & 0x7f);
 				if (longPayloadLength > 126) {
 					longPayloadLength = buffer.getLong();
@@ -2736,10 +2736,8 @@ public class UHTTPD {
 		private final Optional<OnWebSocketHandshake> onHandshake;
 		private final Optional<OnWebSocketOpen> onOpen;
 		private final int maxTextPayloadSize;
-		private final boolean mask;
 
 		public WebSocketHandler(WebSocketBuilder builder) {
-			this.mask = builder.mask;
 			this.onData = builder.onData;
 			this.onText = builder.onText;
 			this.onClose = builder.onClose;
@@ -3754,10 +3752,11 @@ public class UHTTPD {
 
 		private void calcChunkingAndClose(Transaction tx) {
 			if (!useLength) {
-				if (tx.protocol.compareTo(Protocol.HTTP_1_0) > 0 && tx.protocol.compareTo(Protocol.HTTP_2) < 0) {
+				if (tx.headerOr(HDR_UPGRADE).isEmpty() && tx.protocol.compareTo(Protocol.HTTP_1_0) > 0 && tx.protocol.compareTo(Protocol.HTTP_2) < 0) {
 					chunk = true;
-				} else
+				} else if(!tx.hasResponseHeader(HDR_UPGRADE)) { 
 					close = true;
+				}
 			}
 		}
 
@@ -3879,7 +3878,8 @@ public class UHTTPD {
 		}
 
 		private void responseContent(Transaction tx) throws IOException {
-			try (var out = responseWriter(tx)) {
+			var wout = responseWriter(tx);
+			try (var out = wout) {
 				if (tx.responder.isPresent()) {
 					var buffer = ByteBuffer.allocateDirect(client.rootContext.sendBufferSize);
 					try {

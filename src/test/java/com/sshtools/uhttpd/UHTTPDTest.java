@@ -13,9 +13,12 @@ import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient.Redirect;
 import java.net.http.HttpClient.Version;
+import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpRequest.BodyPublishers;
 import java.net.http.HttpResponse.BodyHandlers;
+import java.net.http.WebSocket;
+import java.net.http.WebSocket.Listener;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
@@ -28,6 +31,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Random;
+import java.util.UUID;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Semaphore;
 
 import org.junit.jupiter.api.BeforeAll;
@@ -41,6 +46,7 @@ import com.github.mizosoft.methanol.MutableRequest;
 import com.sshtools.uhttpd.UHTTPD.FormData;
 import com.sshtools.uhttpd.UHTTPD.RootContextBuilder;
 import com.sshtools.uhttpd.UHTTPD.Status;
+import com.sshtools.uhttpd.UHTTPD.WebSocketBuilder;
 
 public class UHTTPDTest {
 	static String boundary = new BigInteger(256, new Random()).toString();
@@ -74,7 +80,64 @@ public class UHTTPDTest {
 //        .authenticator(Authenticator.getDefault())
 	}
 	
-	protected void configureClient(Builder builder) {
+	protected java.net.http.HttpClient.Builder configureClient(java.net.http.HttpClient.Builder builder) {
+		return builder;
+	}
+	
+	@Test
+	void testWebsocketServerFirstMessage() throws Exception {
+		var sem = new Semaphore(4);
+		sem.acquire(4);
+		try (var httpd = createServer().
+		    webSocket("/ws", new WebSocketBuilder().
+		    onText((txt, ws) -> {
+				assertEquals("c-onText", txt);
+		   		ws.send("s-onText");
+		    	sem.release();
+		    }).
+		    onClose((code, text, ws) -> {
+		    }).
+		    onOpen((ws) -> {
+		    	sem.release();
+		   		ws.send("s-onOpen");
+		    }).
+		    build()).
+		    classpathResources("(.*)", "web").
+		    build()) {
+			
+			httpd.start();
+			
+			try {
+				// open websocket
+				var ws = configureClient(HttpClient.newBuilder()).build().newWebSocketBuilder().buildAsync(URI.create(wsClientURL() + "/ws"), new Listener() {
+
+					private boolean sentOne;
+
+					@Override
+					public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
+						var txt = data.toString();
+						if(sentOne) {
+							assertEquals("s-onText", txt);
+						}
+						else {
+							assertEquals("s-onOpen", txt);
+							webSocket.sendText("c-onText", true);
+							sentOne = true;
+						}
+				    	sem.release();
+						return Listener.super.onText(webSocket, data, last);
+					}
+					
+				}).get();
+
+				sem.acquire();
+				sem.release();
+				
+
+			} catch (InterruptedException ex) {
+				System.err.println("InterruptedException exception: " + ex.getMessage());
+			} 
+		} 
 	}
 
 	@Test
@@ -522,6 +585,10 @@ public class UHTTPDTest {
 
 	protected RootContextBuilder createServer() {
 		return UHTTPD.server().withoutHttps().withHttp(58080);
+	}
+	
+	protected String wsClientURL() {
+		return "ws://localhost:58080";
 	}
 	
 	protected String clientURL() {

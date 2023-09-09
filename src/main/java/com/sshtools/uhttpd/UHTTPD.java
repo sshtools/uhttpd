@@ -520,6 +520,19 @@ public class UHTTPD {
 		Optional<String> contentType();
 
 		/**
+		 * A convenience method to get if a part that is a piece of {@link FormData} exists.
+		 * <p>
+		 * This cannot be used if the content has already been retrieved as a stream or
+		 * parts.
+		 *
+		 * @param name name
+		 * @return form data.
+		 */
+		default boolean hasFormData(String name) {
+			return ofFormData(name).isPresent();
+		}
+
+		/**
 		 * A convenience method to get a part that is a piece of {@link FormData} given
 		 * it's name.
 		 * <p>
@@ -544,6 +557,20 @@ public class UHTTPD {
 		 */
 		default Optional<Named> ofNamed(String name) {
 			return ofPart(name, Named.class);
+		}
+
+		/**
+		 * A convenience method to get if a part exists.
+		 * <p>
+		 * This cannot be used if the content has already been retrieved as a stream or
+		 * parts.
+		 *
+		 * @param name name
+		 * @param clazz type of part
+		 * @return form data.
+		 */
+		default <P extends Part> boolean hasPart(String name, Class<P> clazz) {
+			return ofPart(name, clazz).isPresent();
 		}
 
 		/**
@@ -1652,7 +1679,7 @@ public class UHTTPD {
 		}
 
 		default Optional<Integer> ofInt() {
-			return ofString().map(v -> Integer.parseInt(v));
+			return ofString().map(v -> v.equals("") ? null : Integer.parseInt(v));
 		}
 
 		default long asLong() {
@@ -3555,8 +3582,14 @@ public class UHTTPD {
 									buf.flip();
 									calcChunkingAndClose(tx);
 									respondWithHeaders(tx);
-									nioChan.write(buf);
-									nioChan.close();
+									try {
+										nioChan.write(buf);
+									}
+									catch(IOException ioe) {
+									}
+									finally {
+										nioChan.close();
+									}
 								}
 							}
 
@@ -4951,7 +4984,7 @@ public class UHTTPD {
 				}
 			}
 			req.responseLength(conx.getContentLengthLong());
-			req.responseType(conx.getContentType());
+			req.responseType(bestMimeType(urlToFilename(url), conx.getContentType()));
 			req.header(HDR_LAST_MODIFIED, formatDate(lastMod));
 			
 			req.response(url.openStream());
@@ -5183,16 +5216,21 @@ public class UHTTPD {
 		return new HttpBasicAuthenticationBuilder(authenticator);
 	}
 
-	public static String mimeType(String fileName) {
-		return URLConnection.guessContentTypeFromName(fileName);
+	public static String bestMimeType(String fileName, String detectedType) {
+		if(detectedType == null || detectedType.isEmpty() || detectedType.equalsIgnoreCase("content/unknown")) {
+			System.out.println(MessageFormat.format("Getting mime type for file {0}", fileName));
+			var type = URLConnection.guessContentTypeFromName(fileName);
+			System.out.println(MessageFormat.format("   Content type is {0}", type));
+			return type;
+		}
+		return detectedType;
 	}
 
 	public static String mimeType(URL url) {
 		try {
 			URLConnection conx = url.openConnection();
 			try {
-				String contentType = conx.getContentType();
-				return contentType;
+				return bestMimeType(urlToFilename(url), conx.getContentType());
 			} finally {
 				try {
 					conx.getInputStream().close();
@@ -5200,8 +5238,12 @@ public class UHTTPD {
 				}
 			}
 		} catch (IOException ioe) {
-			return mimeType(Paths.get(url.getPath()).getFileName().toString());
+			return bestMimeType(urlToFilename(url), null);
 		}
+	}
+
+	public static String urlToFilename(URL url) {
+		return Paths.get(url.getPath()).getFileName().toString();
 	}
 
 	public static RootContextBuilder server() {

@@ -167,6 +167,27 @@ public class UHTTPDTest {
 	}
 
 	@Test
+	void testGetBigString() throws Exception {
+		var strbuf = new StringBuilder();
+		for(int i = 0 ; i < 20000; i ++) {
+			strbuf.append("0123456789");
+		}
+		try(var httpd = createServer().
+			get("/big\\.html", (tx) -> {
+				tx.response(strbuf.toString());
+			}).
+			build()) {
+			httpd.start();
+			
+			//			
+			var client = client();
+			var req = HttpRequest.newBuilder().uri(URI.create(clientURL() + "/big.html?a=1&b=2")).GET().build();
+			var resp = client.send(req, BodyHandlers.ofString());
+			assertEquals(strbuf.toString(), resp.body());
+		}
+	}
+
+	@Test
 	void testGet() throws Exception {
 		try(var httpd = createServer().
 			get("/calc\\.html", (tx) -> {

@@ -94,11 +94,13 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.Stack;
 import java.util.StringTokenizer;
 import java.util.TimeZone;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -1036,6 +1038,153 @@ public class UHTTPD {
 	public interface HandlerSelector {
 		boolean matches(Transaction request);
 	}
+	
+	/**
+	 * A simple session.
+	 * 
+	 * @see #sessionCookies()
+	 */
+	public static class Session {
+		
+		private static ThreadLocal<Session> current = new ThreadLocal<>();
+		
+		private final String id;
+		private final boolean attached;
+		
+		Session() {
+			id = UUID.randomUUID().toString();
+			this.attached = false;
+		}
+		
+		Session(String id) {
+			this.id = id;
+			this.attached = true;
+		}
+
+		public static Session get() {
+			var session = current.get();
+			if(session == null) {
+				session = new Session();
+				current.set(session);
+				var tx = Transaction.get();
+				if(tx.responded()) {
+					throw new IllegalStateException("A session cookie must be created, but the response has already been committed.");
+				}
+				return session; 
+			}
+			return session;
+		}
+		
+		@Override
+		public int hashCode() {
+			return Objects.hash(id);
+		}
+
+		@Override
+		public boolean equals(Object obj) {
+			if (this == obj)
+				return true;
+			if (obj == null)
+				return false;
+			if (getClass() != obj.getClass())
+				return false;
+			Session other = (Session) obj;
+			return Objects.equals(id, other.id);
+		}
+
+		public final String id() {
+			return id;
+		}
+		
+		public final boolean attached() {
+			return attached;
+		}
+	}
+
+	/**
+	 * Builds a {@link Handler} that adds session tracking support using a cookie.
+	 */
+	public final static class SessionCookiesBuilder {
+
+		private Optional<String> cookieName = Optional.empty();
+		private Optional<Function<Transaction, CookieBuilder>> cookieBuilder = Optional.empty();
+
+		SessionCookiesBuilder() {
+		}
+		
+		/**
+		 * Set the cookie name to use.
+		 * 
+		 * @param name cookie name
+		 * @return this for chaining
+		 */
+		public SessionCookiesBuilder withCookieName(String name) {
+			this.cookieName = Optional.of(name);
+			return this;
+		}
+		
+		/**
+		 * Use a custom {@link CookieBuilder} to create the session cookie. The default will
+		 * create simple, secure session cookies.
+		 * 
+		 * @param name cookie name
+		 * @return this for chaining
+		 */
+		public SessionCookiesBuilder withCookieBuilder(Function<Transaction, CookieBuilder> cookieBuilder) {
+			this.cookieBuilder = Optional.of(cookieBuilder);
+			return this;
+		}
+
+		/**
+		 * Builds the handler.
+		 *
+		 * @return handler
+		 * @throws UnknownHostException
+		 * @throws IOException
+		 */
+		public Handler build() throws UnknownHostException, IOException {
+			var cookieName = this.cookieName.orElse(DEFAULT_SESSION_COOKIE_NAME);
+			var cookieBuilder = this.cookieBuilder;
+			return new Handler() {
+				@Override
+				public void get(Transaction tx) throws Exception {
+					var cookieOr = tx.cookieOr(cookieName);
+					cookieOr.ifPresent(c -> Session.current.set(new Session(c.value())));
+					
+					/* TODO: this is not ideal. We should only really add the cookie
+					 *       if the Session was actually accessed and not invalidated
+					 *       before responding
+					 *       
+					 * TODO remove cookie if invalidated
+					 */
+					addCookie(cookieName, cookieBuilder, tx, Session.get());
+					
+//					try {
+//						for(var handler : handlers) {
+//							handler.get(tx);
+//							var session = Session.current.get(); 
+//							if(session != null && !session.attached()) {
+//								if(tx.responded())
+//									throw new IllegalStateException("Cannot attach session cookie, already responsed.");
+//								addCookie(cookieName, cookieBuilder, tx, session);
+//							}
+//							if (tx.responded())
+//								break;
+//						}
+//					}
+//					finally {
+//						Session.current.remove();
+//					}
+				}
+
+				private void addCookie(String cookieName,
+						Optional<Function<Transaction, CookieBuilder>> cookieBuilder, Transaction tx, Session session) {
+					tx.cookie((cookieBuilder.map(f -> f.apply(tx)).orElseGet(() -> new CookieBuilder())).withName(cookieName).withValue(session.id()).build());
+				}
+			};
+		}
+
+	}
 
 	/**
 	 * Builds a {@link Handler} to support HTTP Basic Authentication. See
@@ -1368,6 +1517,10 @@ public class UHTTPD {
 		void join() throws InterruptedException;
 
 		void start();
+
+		Optional<Integer> httpsPort();
+
+		Optional<Integer> httpPort();
 	}
 
 	/**
@@ -1730,6 +1883,8 @@ public class UHTTPD {
 	}
 
 	public final static class Transaction {
+		
+		public static ThreadLocal<Transaction> current = new ThreadLocal<>();
 
 		private final Client client;
 
@@ -1795,6 +1950,18 @@ public class UHTTPD {
 
 			fullContextPath = contextPath = Paths.get("/");
 			fullPath = contextPath.resolve(path);
+		}
+		
+		public static Transaction get() {
+			var tx = current.get();
+			if(tx == null)
+				throw new IllegalStateException("Not a web request thread.");
+			return tx;
+		}
+		
+		public Transaction selector(HandlerSelector selector) {
+			this.selector = Optional.of(selector);
+			return this;
 		}
 
 		public final void authenticate(Principal principal) {
@@ -2097,7 +2264,12 @@ public class UHTTPD {
 			return this;
 		}
 
+		@Deprecated
 		public final boolean responsed() {
+			return code.isPresent();
+		}
+
+		public final boolean responded() {
 			return code.isPresent();
 		}
 
@@ -2856,7 +3028,7 @@ public class UHTTPD {
 		void transact() throws IOException;
 	}
 
-	private abstract static class AbstractContext implements Context {
+	public abstract static class AbstractContext implements Context {
 		protected final Map<HandlerSelector, Handler> handlers = new LinkedHashMap<>();
 		protected final Map<Status, Handler> statusHandlers = new LinkedHashMap<>();
 		protected Optional<Function<Path, String>> etagGenerator;
@@ -2864,7 +3036,7 @@ public class UHTTPD {
 		protected final Path tmpDir;
 		protected final boolean clearTmpDirOnClose;
 
-		AbstractContext(AbstractWebContextBuilder<?, ?> b) {
+		protected AbstractContext(AbstractWebContextBuilder<?, ?> b) {
 			handlers.putAll(b.handlers);
 			statusHandlers.putAll(b.statusHandlers);
 			etagGenerator = b.etagGenerator;
@@ -3020,14 +3192,14 @@ public class UHTTPD {
 		abstract TunnelWireProtocol create(String host, int port, Client client) throws IOException;
 	}
 
-	private static abstract class AbstractWebContextBuilder<T extends AbstractWebContextBuilder<T, C>, C extends Context>
+	public static abstract class AbstractWebContextBuilder<T extends AbstractWebContextBuilder<T, C>, C extends Context>
 			implements WebContextBuilder<T, C> {
 		Map<HandlerSelector, Handler> handlers = new LinkedHashMap<>();
 		Map<Status, Handler> statusHandlers = new LinkedHashMap<>();
 		Optional<Function<Path, String>> etagGenerator;
 		Optional<Path> tmpDir = Optional.empty();
 
-		AbstractWebContextBuilder() {
+		protected AbstractWebContextBuilder() {
 			statusHandlers.put(Status.INTERNAL_SERVER_ERROR, (tx) -> {
 				tx.response("text/html",
 						"<html><body><h1>Internal Server Error</h1><p>__msg__</p><br/><pre>__trace__</pre></body></html>"
@@ -3057,7 +3229,7 @@ public class UHTTPD {
 		@Override
 		public T classpathResources(String regexpWithGroups, String prefix, Handler... handler) {
 			return withClasspathResources(regexpWithGroups,
-					Optional.ofNullable(Thread.currentThread().getContextClassLoader()), prefix, handler);
+					Optional.ofNullable(UHTTPD.class.getClassLoader()), prefix, handler);
 		}
 
 		@Override
@@ -3141,6 +3313,11 @@ public class UHTTPD {
 					handler);
 		}
 
+		public T withClasspathResources(String regexpWithGroups, ClassLoader loader, String prefix,
+				Handler... handler) {
+			return withClasspathResources(regexpWithGroups, Optional.of(loader), prefix, handler);
+		}
+
 		@Override
 		@SuppressWarnings("unchecked")
 		public T withClasspathResources(String regexpWithGroups, Optional<ClassLoader> loader, String prefix,
@@ -3219,19 +3396,21 @@ public class UHTTPD {
 
 	private final static class ClasspathResource implements Handler {
 
-		private Optional<ClassLoader> loader;
+		private final Optional<ClassLoader> loader;
+		private final Optional<Class<?>> base;
 		private final String path;
 
-		private ClasspathResource(Optional<ClassLoader> loader, String path) {
+		private ClasspathResource(Optional<ClassLoader> loader, Optional<Class<?>> base,String path) {
 			this.loader = loader;
 			this.path = path;
+			this.base = base;
 		}
 
 		@Override
 		public void get(Transaction req) throws Exception {
 			LOG.log(Level.DEBUG, "Locating resource for {0}", path);
 			var fullPath = Paths.get(path).normalize().toString();
-			var url = loader.orElse(ClasspathResources.class.getClassLoader()).getResource(fullPath);
+			var url = base.map(c -> c.getResource(path)).orElseGet(() -> loader.orElse(ClasspathResources.class.getClassLoader()).getResource(fullPath));
 			if (url == null)
 				throw new FileNotFoundException(fullPath);
 			else {
@@ -3382,7 +3561,7 @@ public class UHTTPD {
 						needLength = false;
 					}
 					if (needType)
-						tx.responseType = Optional.of(mimeType(path.toUri().toURL()));
+						tx.responseType = Optional.ofNullable(mimeType(path.toUri().toURL()));
 				} catch (IOException ioe) {
 					throw new UncheckedIOException("Failed to responsd with file.", ioe);
 				}
@@ -3396,7 +3575,7 @@ public class UHTTPD {
 						needLength = false;
 					}
 					if (needType)
-						tx.responseType = Optional.of(mimeType(path.toURI().toURL()));
+						tx.responseType = Optional.ofNullable(mimeType(path.toURI().toURL()));
 				} catch (IOException ioe) {
 					throw new UncheckedIOException("Failed to responsd with file.", ioe);
 				}
@@ -3438,7 +3617,7 @@ public class UHTTPD {
 						var waslimit = respBuff.limit();
 						respBuff.limit(respBuff.position() + buf.remaining());
 						buf.put(respBuff);
-						buf.limit(waslimit);
+						respBuff.limit(waslimit);
 
 //						var p = respBuff.position();
 //						respBuff.position(p + buf.remaining());
@@ -3671,6 +3850,7 @@ public class UHTTPD {
 				uri = firstToken;
 			}
 			var tx = new Transaction(uri, method, proto, client, writer(), delegate);
+			Transaction.current.set(tx);
 			try {
 				try {
 
@@ -3759,6 +3939,7 @@ public class UHTTPD {
 							break;
 						} catch (Exception e) {
 							LOG.log(Level.ERROR, "Status handler failed.", e);
+							e.printStackTrace();
 							tx.error(e);
 						}
 					}
@@ -3780,6 +3961,7 @@ public class UHTTPD {
 			} finally {
 				if (tx.content != null)
 					tx.content.close();
+				Transaction.current.set(null);
 			}
 		}
 
@@ -4608,6 +4790,20 @@ public class UHTTPD {
 		}
 
 		@Override
+		public Optional<Integer> httpPort() {
+			try {
+				return serverSocketChannel == null ? Optional.empty() :  Optional.of(((InetSocketAddress)serverSocketChannel.getLocalAddress()).getPort());
+			} catch (IOException e) {
+				throw new UncheckedIOException(e);
+			}
+		}
+
+		@Override
+		public Optional<Integer> httpsPort() {
+			return sslServerSocket == null ? Optional.empty() : Optional.of(sslServerSocket.getLocalPort());
+		}
+
+		@Override
 		public void close() throws IOException {
 			if (!open)
 				throw new IOException("Already closed.");
@@ -4650,13 +4846,23 @@ public class UHTTPD {
 		@Override
 		public void get(Transaction tx) throws Exception {
 
+			var matched = false;
 			for (var c : handlers.entrySet()) {
 				if (c.getKey().matches(tx)) {
+					matched = true;
 					tx.selector = Optional.of(c.getKey());
 					try {
 						c.getValue().get(tx);
-						if (!tx.responsed() && !tx.hasResponse())
-							tx.responseCode(Status.OK);
+						// XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+						//
+						// Dont understand why i did this. 
+						// Taken it out for now until something breaks
+						//
+						//
+						// XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+//						if (!tx.responsed() && !tx.hasResponse())
+//							tx.responseCode(Status.OK);
+						
 					} catch (FileNotFoundException fnfe) {
 						if (LOG.isLoggable(Level.DEBUG))
 							LOG.log(Level.DEBUG, "File not found. {0}", fnfe.getMessage());
@@ -4671,8 +4877,14 @@ public class UHTTPD {
 				}
 			}
 
-			if (tx.code.isEmpty() && !tx.hasResponse()) {
-				tx.notFound();
+			//if (tx.code.isEmpty() && !tx.hasResponse() && tx.outgoingHeaders.keySet().isEmpty() && tx.outgoingCookies.keySet().isEmpty()) {
+			if(!tx.responded() && !tx.hasResponse()) {
+				if(matched) {
+					tx.responseCode(Status.OK);
+				}
+				else {
+					tx.notFound();
+				}
 			}
 
 		}
@@ -5096,6 +5308,7 @@ public class UHTTPD {
 	}
 
 	static final int DEFAULT_BUFFER_SIZE = 32768;
+	public static final String DEFAULT_SESSION_COOKIE_NAME= "uHTTPD_SESSION";
 	public static final Charset HTTP_CHARSET_ENCODING;
 
 	static {
@@ -5161,8 +5374,16 @@ public class UHTTPD {
 		DEFAULT_TWO_DIGIT_YEAR_START = calendar.getTime();
 	}
 
+	public static Handler classpathResource(Class<?> clazz, String path) {
+		return new ClasspathResource(Optional.empty(), Optional.of(clazz), path);
+	}
+	
+	public static Handler classpathResource(ClassLoader classLoader, String path) {
+		return classpathResource(Optional.of(classLoader), path);
+	}
+
 	public static Handler classpathResource(Optional<ClassLoader> classLoader, String path) {
-		return new ClasspathResource(classLoader, path);
+		return new ClasspathResource(classLoader, Optional.empty(), path);
 	}
 
 	public static Handler classpathResource(String path) {
@@ -5216,12 +5437,13 @@ public class UHTTPD {
 		return new HttpBasicAuthenticationBuilder(authenticator);
 	}
 
+	public static SessionCookiesBuilder sessionCookies() {
+		return new SessionCookiesBuilder();
+	}
+
 	public static String bestMimeType(String fileName, String detectedType) {
 		if(detectedType == null || detectedType.isEmpty() || detectedType.equalsIgnoreCase("content/unknown")) {
-			System.out.println(MessageFormat.format("Getting mime type for file {0}", fileName));
-			var type = URLConnection.guessContentTypeFromName(fileName);
-			System.out.println(MessageFormat.format("   Content type is {0}", type));
-			return type;
+			return URLConnection.guessContentTypeFromName(fileName);
 		}
 		return detectedType;
 	}

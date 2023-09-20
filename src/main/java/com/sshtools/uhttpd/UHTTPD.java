@@ -332,6 +332,7 @@ public class UHTTPD {
 						LOG.log(Level.TRACE, "Timeout.", ste);
 					} catch (Exception e) {
 						LOG.log(Level.ERROR, "Failed handling connection.", e);
+						e.printStackTrace();// argh
 					}
 				}
 			} catch (Exception e) {
@@ -691,10 +692,23 @@ public class UHTTPD {
 	 */
 
 	public final static class CookieBuilder {
+		
+		private static final Calendar effectivelyNever;
+		
+		static {
+			effectivelyNever = Calendar.getInstance();
+			effectivelyNever.set(Calendar.YEAR, 3999);
+			effectivelyNever.set(Calendar.MONTH, 12);
+			effectivelyNever.set(Calendar.DAY_OF_MONTH, 31);
+			effectivelyNever.set(Calendar.HOUR_OF_DAY, 23);
+			effectivelyNever.set(Calendar.MINUTE, 59);
+			effectivelyNever.set(Calendar.SECOND, 59);
+			effectivelyNever.set(Calendar.MILLISECOND, 0);
+		}
 
 		String name;
 		CookieVersion version = CookieVersion.V1;
-		boolean secure;
+		Optional<Boolean> secure = Optional.empty();
 		boolean httpOnly;
 		String value;
 		Optional<String> path = Optional.empty();
@@ -714,6 +728,16 @@ public class UHTTPD {
 		}
 		
 		public Cookie build() {
+			final var secure = this.secure.orElseGet(() -> Transaction.get().secure());
+			final var domain = this.domain;
+			final var expires = this.expires;
+			final var httpOnly = this.httpOnly;
+			final var maxAge = this.maxAge;
+			final var name = this.name;
+			final var path = this.path;
+			final var sameSite = this.sameSite;
+			final var value = this.value;
+			final var version = this.version;
 			return new Cookie() {
 
 				@Override
@@ -841,7 +865,11 @@ public class UHTTPD {
 		}
 
 		public CookieBuilder withSecure() {
-			this.secure = true;
+			return withSecure(true);
+		}
+
+		public CookieBuilder withSecure(boolean secure) {
+			this.secure = Optional.of(secure);
 			return this;
 		}
 
@@ -850,10 +878,11 @@ public class UHTTPD {
 			return this;
 		}
 
-		public CookieBuilder fromSpec(String asString) {
-			// TODO Auto-generated method stub
-			return null;
+		public CookieBuilder withMaxExpiry() {
+			
+			return withExpires(effectivelyNever.getTime());
 		}
+
 	}
 
 	/**
@@ -1971,6 +2000,10 @@ public class UHTTPD {
 		public final boolean authenticated() {
 			return principal.isPresent();
 		}
+		
+		public boolean secure() {
+			return client.secure;
+		}
 
 		public final Client client() {
 			return client;
@@ -2142,7 +2175,7 @@ public class UHTTPD {
 		public final Optional<Principal> principal() {
 			return principal;
 		}
-
+		
 		public final Protocol protocol() {
 			return protocol;
 		}

@@ -2995,9 +2995,13 @@ public class UHTTPD {
 					return;
 				}
 				var hasher = MessageDigest.getInstance("SHA-1");
-				var selectedProtocol = onHandshake.isPresent()
-						? onHandshake.get().handshake(req, proto.get().expand(",").values().toArray(new String[0]))
-						: "";
+				
+				var requestedProtocols = proto.map(n -> n.expand(",").values()).orElse(Collections.emptyList());
+				
+				var selectedProtocol = onHandshake.isPresent() ?
+						onHandshake.get().handshake(req, requestedProtocols.toArray(new String[0])) :
+						( requestedProtocols.isEmpty() ? "" : requestedProtocols.get(0)	);
+				
 				var client = req.client();
 
 				var ws = new WebSocketImpl(client, selectedProtocol, version);
@@ -3780,7 +3784,7 @@ public class UHTTPD {
 
 				if (haveLength && responseLength < client.rootContext.maxUnchunkedSize) {
 					if (gzip) {
-						var buf = ByteBuffer.allocateDirect((int) (responseLength + MIN_GZIP_BUFFER));
+						var buf = ByteBuffer.allocateDirect((int) (responseLength * 2)); /* TODO ... improve */
 						WritableByteChannel bufchan = new ByteChannel() {
 
 							boolean closed;
@@ -4711,6 +4715,8 @@ public class UHTTPD {
 
 	private final static class RootContextImpl extends AbstractContext implements RootContext {
 
+		private static final long DEFAULT_MIN_GZIP_SIZE = 2048;
+		
 		private final int backlog;
 		private final boolean cache;
 		private final Optional<InetAddress> httpAddress;
@@ -4756,7 +4762,7 @@ public class UHTTPD {
 			keepAliveTimeoutSecs = builder.keepAliveTimeoutSecs;
 			keepAliveMax = builder.keepAliveMax;
 			runner = builder.runner.orElse(threadPoolRunner().build());
-			minGzipSize = builder.gzipMinSize.orElse(300l);
+			minGzipSize = builder.gzipMinSize.orElse(DEFAULT_MIN_GZIP_SIZE);
 
 			if (httpPort.isPresent()) {
 				LOG.log(Level.INFO, "Starting HTTP server on port {0}", httpPort.get());
@@ -5394,8 +5400,6 @@ public class UHTTPD {
 	private static final String[] DEFAULT_PATTERNS = new String[] { PATTERN_RFC1123, PATTERN_RFC1036, PATTERN_ASCTIME };
 
 	private static final Date DEFAULT_TWO_DIGIT_YEAR_START;
-
-	private static final int MIN_GZIP_BUFFER = 1024;
 
 	public static final TimeZone GMT = TimeZone.getTimeZone("GMT");
 

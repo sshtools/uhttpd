@@ -44,7 +44,7 @@
 	<inceptionYear>2023</inceptionYear>
 	<url>https://github.com/sshtools/uhttpd</url>
 	<description>
-		A very simple embeddable HTTP/HTTPS server that has no external dependencies.
+		A very simple embeddable HTTP/HTTPS server that has no external dependencies. 
 	</description>
 	<licenses>
 		<license>

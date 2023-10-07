@@ -74,7 +74,6 @@ import java.nio.file.StandardOpenOption;
 import java.security.KeyStore;
 import java.security.MessageDigest;
 import java.security.Principal;
-import java.security.SecureRandom;
 import java.text.MessageFormat;
 import java.text.ParsePosition;
 import java.text.SimpleDateFormat;
@@ -83,6 +82,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Calendar;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
@@ -315,10 +315,7 @@ public class UHTTPD {
 					LOG.log(Level.ERROR, "Socket was lost between accepting it and starting to handle it. "
 							+ "This can be caused by the system socket factory being swapped out for another "
 							+ "while the boot HTTP server is running. Closing down the server now, it has become useless!");
-					try {
-						rootContext.close();
-					} catch (IOException e) {
-					}
+					rootContext.close();
 				} else {
 					try {
 						LOG.log(Level.DEBUG, "{0} connected to server", remoteAddress());
@@ -597,7 +594,13 @@ public class UHTTPD {
 		Optional<Long> size();
 	}
 
-	public interface Context extends Closeable, Handler {
+	public interface Group extends Closeable, Handler {
+		
+		@Override
+		void close();
+	}
+
+	public interface Context extends Group {
 
 		String generateETag(Path resource);
 
@@ -1057,6 +1060,19 @@ public class UHTTPD {
 	 */
 	public interface Handler {
 		void get(Transaction req) throws Exception;
+		
+		default void handleMultiple(Transaction tx, Handler... handlers) throws Exception {
+			handleMultiple(tx, Arrays.asList(handlers));
+		}
+		
+		default void handleMultiple(Transaction tx, Collection<? extends Handler> handlers) throws Exception {
+			for (var c : handlers) {
+				c.get(tx);
+	
+				if (tx.responded() || tx.hasResponse())
+					break;
+			}
+		}
 	}
 
 	/**
@@ -1579,6 +1595,15 @@ public class UHTTPD {
 		private int recvBufferSize = DEFAULT_BUFFER_SIZE;
 		private Optional<KeyStore> keyStore = Optional.empty();
 		private int maxUnchunkedSize = 1024 * 512;
+		
+		private RootContextBuilder() {
+			statusHandlers.put(Status.INTERNAL_SERVER_ERROR, (tx) -> {
+				tx.response("text/html",
+						"<html><body><h1>Internal Server Error</h1><p>__msg__</p><br/><pre>__trace__</pre></body></html>"
+								.replace("__msg__", tx.error().map(e -> e.getMessage()).orElse("No message supplied."))
+								.replace("__trace__", tx.errorTrace().orElse("")));
+			});
+		}
 
 		public RootContextBuilder asDaemon() {
 			daemon = true;
@@ -2311,6 +2336,10 @@ public class UHTTPD {
 			this.responseLength = responseLength == -1 ? Optional.empty() : Optional.of(responseLength);
 			return this;
 		}
+		
+		public final Optional<String> responseText() {
+			return responseText;
+		}
 
 		public final Transaction responseText(String text) {
 			checkNotResponded();
@@ -2462,10 +2491,16 @@ public class UHTTPD {
 
 		String username();
 	}
-
-	public interface WebContextBuilder<T extends WebContextBuilder<T, C>, C extends Context> {
+	
+	public interface GroupBuilder<T extends GroupBuilder<T, C>, C extends Group> {
 
 		C build() throws IOException;
+
+		T status(Status status, Handler handler);
+
+	}
+
+	public interface WebContextBuilder<T extends WebContextBuilder<T, C>, C extends Context> extends GroupBuilder<T, C> {
 
 		T chain(Handler... handlers);
 
@@ -2486,8 +2521,6 @@ public class UHTTPD {
 		T handle(String regexp, Handler... handler);
 
 		T post(String regexp, Handler... handler);
-
-		T status(Status status, Handler handler);
 
 		T tunnel(TunnelHandler handler);
 
@@ -2952,7 +2985,14 @@ public class UHTTPD {
 						if (frame.fin)
 							lastMessage = null;
 					}
-				} finally {
+				} catch(EOFException ioe) {
+					LOG.log(Level.TRACE, "WebSocket EOF.", ioe);
+				} catch(IOException ioe) {
+					LOG.log(Level.WARNING, "I/O error in WebSocket.", ioe);
+				} catch(RuntimeException ioe) {
+					LOG.log(Level.ERROR, "Error in WebSocket handling.", ioe);
+				}
+				finally {
 					if (!closed)
 						onClose.ifPresent(h -> h.closed(1006, "Unexpected close.", ws));
 				}
@@ -3064,18 +3104,74 @@ public class UHTTPD {
 
 		void transact() throws IOException;
 	}
-
-	public abstract static class AbstractContext implements Context {
-		protected final Map<HandlerSelector, Handler> handlers = new LinkedHashMap<>();
+	
+	public abstract static class AbstractGroup implements Group {
+		
 		protected final Map<Status, Handler> statusHandlers = new LinkedHashMap<>();
+		
+		protected abstract Collection<? extends Handler> handlers();
+		
+		protected AbstractGroup(AbstractGroupBuilder<?, ?> b) {
+			statusHandlers.putAll(b.statusHandlers);
+		}
+		
+		@Override
+		public final void close() {
+			handlers().forEach(h -> { 
+				if(h instanceof Context) 
+					((Context)h).close();	
+			});
+			onClose();
+		}
+		
+		protected void onClose() {
+		}
+		
+
+		boolean handleStatus(Transaction tx) {
+			
+			for (var c : handlers()) {
+				if (c instanceof AbstractGroup) {
+					if(((AbstractGroup)c).handleStatus(tx)) {
+						return true;
+					}
+				}
+			}
+			
+			while (true) {
+				var code = tx.code.orElse(Status.OK);
+				var statusHandler = statusHandlers.get(code);
+				if (statusHandler == null) {
+					break;
+				} else {
+					try {
+						statusHandler.get(tx);
+						return true;
+					} catch (Exception e) {
+						LOG.log(Level.ERROR, "Status handler failed.", e);
+						if(code == Status.INTERNAL_SERVER_ERROR) 
+							break;
+						else
+							tx.error(e);
+					}
+				}
+			}
+			
+			return false;
+			
+		}
+	}
+
+	public abstract static class AbstractContext extends AbstractGroup implements Context {
+		protected final Map<HandlerSelector, Handler> handlers = new LinkedHashMap<>();
 		protected Optional<Function<Path, String>> etagGenerator;
 		protected AbstractContext parent;
 		protected final Path tmpDir;
 		protected final boolean clearTmpDirOnClose;
 
 		protected AbstractContext(AbstractWebContextBuilder<?, ?> b) {
+			super(b);
 			handlers.putAll(b.handlers);
-			statusHandlers.putAll(b.statusHandlers);
 			etagGenerator = b.etagGenerator;
 
 			handlers.forEach((k, v) -> {
@@ -3092,10 +3188,18 @@ public class UHTTPD {
 		}
 
 		@Override
-		public void close() throws IOException {
+		protected Collection<? extends Handler> handlers() {
+			return handlers.values();
+		}
+
+		@Override
+		protected void onClose() {
 			if (clearTmpDirOnClose) {
 				try (var walk = Files.walk(tmpDir)) {
 					walk.sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
+				}
+				catch(IOException ioe) {
+					throw new UncheckedIOException(ioe);
 				}
 			}
 		}
@@ -3228,21 +3332,29 @@ public class UHTTPD {
 
 		abstract TunnelWireProtocol create(String host, int port, Client client) throws IOException;
 	}
+	
+	public static abstract class AbstractGroupBuilder<T extends AbstractGroupBuilder<T, G>, G extends Group>
+			implements GroupBuilder<T, G> {
+		Map<Status, Handler> statusHandlers = new LinkedHashMap<>();
+
+		protected AbstractGroupBuilder() {
+		}
+
+		@SuppressWarnings("unchecked")
+		public T status(Status status, Handler handler) {
+			statusHandlers.put(status, handler);
+			return (T) this;
+		}
+
+	}
 
 	public static abstract class AbstractWebContextBuilder<T extends AbstractWebContextBuilder<T, C>, C extends Context>
-			implements WebContextBuilder<T, C> {
+			extends AbstractGroupBuilder<T, C> implements WebContextBuilder<T, C> {
 		Map<HandlerSelector, Handler> handlers = new LinkedHashMap<>();
-		Map<Status, Handler> statusHandlers = new LinkedHashMap<>();
 		Optional<Function<Path, String>> etagGenerator;
 		Optional<Path> tmpDir = Optional.empty();
 
 		protected AbstractWebContextBuilder() {
-			statusHandlers.put(Status.INTERNAL_SERVER_ERROR, (tx) -> {
-				tx.response("text/html",
-						"<html><body><h1>Internal Server Error</h1><p>__msg__</p><br/><pre>__trace__</pre></body></html>"
-								.replace("__msg__", tx.error().map(e -> e.getMessage()).orElse("No message supplied."))
-								.replace("__trace__", tx.errorTrace().orElse("")));
-			});
 		}
 
 		@Override
@@ -3310,13 +3422,10 @@ public class UHTTPD {
 			if (handler.length == 1)
 				handlers.put(selector, handler[0]);
 			else {
-				handlers.put(selector, (req) -> {
-					for (var h : handler) {
-						h.get(req);
-						if (req.responsed())
-							break;
-					}
-				});
+				var bldr = new HandlerGroup.HandlerGroupBuilder();
+				for(var h : handler) 
+					bldr.handle(h);
+				handlers.put(selector, bldr.build());
 			}
 			return (T) this;
 		}
@@ -3330,13 +3439,6 @@ public class UHTTPD {
 		public T post(String regexp, Handler... handler) {
 			return handle(new CompoundSelector(new MethodSelector(Method.POST), new RegularExpressionSelector(regexp)),
 					handler);
-		}
-
-		@Override
-		@SuppressWarnings("unchecked")
-		public T status(Status status, Handler handler) {
-			statusHandlers.put(status, handler);
-			return (T) this;
 		}
 
 		@Override
@@ -3513,7 +3615,7 @@ public class UHTTPD {
 					tx.selector = Optional.of(c.getKey());
 					try {
 						c.getValue().get(tx);
-						if (!tx.responsed() && !tx.hasResponse())
+						if (!tx.responded() && !tx.hasResponse())
 							tx.responseCode(Status.OK);
 					} catch (FileNotFoundException fnfe) {
 						if (LOG.isLoggable(Level.DEBUG))
@@ -3524,7 +3626,7 @@ public class UHTTPD {
 						tx.error(ise);
 					}
 
-					if (tx.responsed() || tx.hasResponse())
+					if (tx.responded() || tx.hasResponse())
 						break;
 				}
 			}
@@ -3966,21 +4068,8 @@ public class UHTTPD {
 					}
 				}
 
-				while (true) {
-					var statusHandler = client.rootContext.statusHandlers.get(tx.code.orElse(Status.OK));
-					if (statusHandler == null) {
-						break;
-					} else {
-						try {
-							statusHandler.get(tx);
-							break;
-						} catch (Exception e) {
-							LOG.log(Level.ERROR, "Status handler failed.", e);
-							e.printStackTrace();
-							tx.error(e);
-						}
-					}
-				}
+				
+				client.rootContext.handleStatus(tx);
 
 				if (tx.responseChannel == null) {
 					responseContent(tx);
@@ -4028,7 +4117,7 @@ public class UHTTPD {
 				var ae = tx.headersOr(HDR_ACCEPT_ENCODING);
 				if (ae.isPresent() && ae.get().expand(",").containsIgnoreCase("gzip")) {
 					gzip = true;
-					useLength = false;
+					useLength = false; 
 				}
 			}
 		}
@@ -4712,6 +4801,45 @@ public class UHTTPD {
 		}
 
 	}
+	
+	public final static class HandlerGroup extends AbstractGroup {
+	
+		public final static class HandlerGroupBuilder extends AbstractGroupBuilder<HandlerGroupBuilder, HandlerGroup> {
+			
+			private final List<Handler> handlers = new ArrayList<>();
+			
+			@Override
+			public HandlerGroup build() {
+				return new HandlerGroup(this);
+			}
+			public HandlerGroupBuilder handle(Handler...handlers) {
+				return handle(Arrays.asList(handlers));
+			}
+			
+			public HandlerGroupBuilder handle(Collection<Handler> handlers) {
+				this.handlers.addAll(handlers);
+				return this;
+			}
+		}
+		
+		private final Collection<Handler> handlers;
+	
+		private HandlerGroup(HandlerGroupBuilder builder) {
+			super(builder);
+			this.handlers = Collections.unmodifiableList(builder.handlers);
+		}
+	
+		@Override
+		public void get(Transaction tx) throws Exception {
+			handleMultiple(tx, handlers());
+		}
+
+		@Override
+		protected Collection<Handler> handlers() {
+			return handlers;
+		}
+	
+	}
 
 	private final static class RootContextImpl extends AbstractContext implements RootContext {
 
@@ -4843,9 +4971,9 @@ public class UHTTPD {
 		}
 
 		@Override
-		public void close() throws IOException {
+		protected void onClose() {
 			if (!open)
-				throw new IOException("Already closed.");
+				throw new IllegalStateException("Already closed.");
 			LOG.log(Level.INFO, "Closing root HTTP context.");
 			open = false;
 			try {
@@ -4877,8 +5005,8 @@ public class UHTTPD {
 						runner.close();
 					}
 				}
-			} finally {
-				super.close();
+			} catch(IOException ioe) {
+				throw new UncheckedIOException(ioe);
 			}
 		}
 
@@ -4892,16 +5020,6 @@ public class UHTTPD {
 					tx.selector = Optional.of(c.getKey());
 					try {
 						c.getValue().get(tx);
-						// XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-						//
-						// Dont understand why i did this. 
-						// Taken it out for now until something breaks
-						//
-						//
-						// XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-//						if (!tx.responsed() && !tx.hasResponse())
-//							tx.responseCode(Status.OK);
-						
 					} catch (FileNotFoundException fnfe) {
 						if (LOG.isLoggable(Level.DEBUG))
 							LOG.log(Level.DEBUG, "File not found. {0}", fnfe.getMessage());
@@ -4911,12 +5029,11 @@ public class UHTTPD {
 						tx.error(ise);
 					}
 
-					if (tx.responsed() || tx.hasResponse())
+					if (tx.responded() || tx.hasResponse())
 						break;
 				}
 			}
 
-			//if (tx.code.isEmpty() && !tx.hasResponse() && tx.outgoingHeaders.keySet().isEmpty() && tx.outgoingCookies.keySet().isEmpty()) {
 			if(!tx.responded() && !tx.hasResponse()) {
 				if(matched) {
 					tx.responseCode(Status.OK);
@@ -5570,10 +5687,4 @@ public class UHTTPD {
 		return null;
 	}
 
-	private static byte[] makeKey() {
-		// TODO optimise
-		var b = new byte[4];
-		new SecureRandom().nextBytes(b);
-		return b;
-	}
 }

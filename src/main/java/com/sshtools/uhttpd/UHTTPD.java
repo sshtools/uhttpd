@@ -90,6 +90,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -101,6 +102,7 @@ import java.util.Stack;
 import java.util.StringTokenizer;
 import java.util.TimeZone;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -322,14 +324,13 @@ public class UHTTPD {
 						do {
 							wireProtocol.transact();
 							times++;
-						} while (times < rootContext.keepAliveMax);
+						} while (!closed && times < rootContext.keepAliveMax);
 					} catch (ClosedChannelException | EOFException e) {
 						LOG.log(Level.TRACE, "EOF.", e);
 					} catch(SocketTimeoutException ste) {
 						LOG.log(Level.TRACE, "Timeout.", ste);
 					} catch (Exception e) {
 						LOG.log(Level.ERROR, "Failed handling connection.", e);
-						e.printStackTrace();// argh
 					}
 				}
 			} catch (Exception e) {
@@ -1107,17 +1108,20 @@ public class UHTTPD {
 		}
 
 		public static Session get() {
+			return get(true).orElseThrow();
+		}
+
+		public static Optional<Session> get(boolean create) {
 			var session = current.get();
-			if(session == null) {
+			if(session == null && create) {
 				session = new Session();
 				current.set(session);
 				var tx = Transaction.get();
 				if(tx.responded()) {
 					throw new IllegalStateException("A session cookie must be created, but the response has already been committed.");
 				}
-				return session; 
 			}
-			return session;
+			return Optional.ofNullable(session);
 		}
 		
 		@Override
@@ -1538,7 +1542,7 @@ public class UHTTPD {
 
 	/**
 	 * Select a {@link Handler} based on its {@link Transaction#path()}, i.e. URI.
-	 * If the URI matches, the handler will be executred.
+	 * If the URI matches, the handler will be executed.
 	 *
 	 */
 	public static final class RegularExpressionSelector implements HandlerSelector {
@@ -1552,7 +1556,13 @@ public class UHTTPD {
 		@Override
 		public boolean matches(Transaction req) {
 			var path = req.path().toString();
-			return pattern.matcher(path).matches();
+			var matcher = pattern.matcher(path);
+			if(matcher.matches()) {
+				for(int i = 1 ; i <= matcher.groupCount(); i++) {
+					req.matches.add(matcher.group(i));
+				}
+			}
+			return matcher.matches();
 		}
 
 	}
@@ -2209,6 +2219,11 @@ public class UHTTPD {
 			return queryString;
 		}
 
+		
+		public final Transaction redirect(Status status, Path location) {
+			return redirect(status, location.toString());
+		}
+		
 		public final Transaction redirect(Status status, String location) {
 			checkNotResponded();
 			if (status != Status.MOVED_PERMANENTLY && status != Status.MOVED_TEMPORARILY)
@@ -4865,7 +4880,7 @@ public class UHTTPD {
 		private final ServerSocket sslServerSocket;
 		private final String threadName;
 		private final boolean daemon;
-		private final Set<Client> clients = Collections.synchronizedSet(new HashSet<>());
+		private final Set<Client> clients = new CopyOnWriteArraySet<>();
 
 		private Thread otherThread;
 		private Thread serverThread;
@@ -4985,9 +5000,9 @@ public class UHTTPD {
 						if (sslServerSocket != null)
 							sslServerSocket.close();
 					} finally {
-						for(var c : new HashSet<>(clients)) {
+						while(!clients.isEmpty()) {
 							try {
-								c.close();
+								clients.iterator().next().close(); 
 							}
 							catch(Exception e) {}
 						}

@@ -87,10 +87,8 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -110,6 +108,7 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
@@ -2196,6 +2195,10 @@ public class UHTTPD {
 
 		public final Iterable<Named> parameters() {
 			return parameters.values();
+		}
+
+		public final Stream<Named> parameterStream() {
+			return parameters.values().stream();
 		}
 
 		public final Path path() {

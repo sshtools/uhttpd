@@ -28,7 +28,6 @@
 		<project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
 		<junit.jupiter.version>5.9.2</junit.jupiter.version>
 		<junit.platform.version>1.9.2</junit.platform.version>
-	    <jacoco.agent.jar>${settings.localRepository}/org/jacoco/org.jacoco.agent/${jacoco.version}/org.jacoco.agent-${jacoco.version}-runtime.jar</jacoco.agent.jar>
 	    <surefireArgLine></surefireArgLine>
 		<build.projectProperties>${basedir}/jadaptive.build.properties</build.projectProperties>
 		<build.userProperties>${user.home}/.jadaptive.build.properties</build.userProperties>

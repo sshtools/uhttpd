@@ -1563,7 +1563,6 @@ public class UHTTPD {
 			}
 			return matcher.matches();
 		}
-
 	}
 
 	public interface RootContext extends Context, Runnable {
@@ -1944,6 +1943,10 @@ public class UHTTPD {
 			return this;
 		}
 	}
+	
+	public final static class RequestPath {
+		
+	}
 
 	public final static class Transaction {
 		
@@ -2156,6 +2159,10 @@ public class UHTTPD {
 			var idx = host.indexOf(':');
 			return idx == -1 ? client.port() : Integer.parseInt(host.substring(idx + 1));
 		}
+		
+		public String match(int match) {
+			return matches.get(match);
+		}
 
 		public final List<String> matches() {
 			return Collections.unmodifiableList(matches);
@@ -2203,11 +2210,6 @@ public class UHTTPD {
 
 		public final Path path() {
 			return path;
-		}
-
-		public String pathInfo() {
-			// TODO Auto-generated method stub
-			throw new UnsupportedOperationException("TODO");
 		}
 
 		public final Optional<Principal> principal() {

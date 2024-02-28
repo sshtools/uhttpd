@@ -31,6 +31,7 @@
 	    <surefireArgLine></surefireArgLine>
 		<build.projectProperties>${basedir}/jadaptive.build.properties</build.projectProperties>
 		<build.userProperties>${user.home}/.jadaptive.build.properties</build.userProperties>
+		<build.quietProperties>false</build.quietProperties>
 	</properties>
 	<developers>
 		<developer>
@@ -107,7 +108,7 @@
 							<goal>read-project-properties</goal>
 						</goals>
 						<configuration>
-							<quiet>false</quiet>
+							<quiet>${build.quietProperties}</quiet>
 							<files>
 								<file>${build.projectProperties}</file>
 								<file>${build.userProperties}</file>

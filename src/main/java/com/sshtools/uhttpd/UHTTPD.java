@@ -2549,6 +2549,8 @@ public class UHTTPD {
 		T withClasspathResources(String regexpWithGroups, Optional<ClassLoader> loader, String prefix,
 				Handler... handler);
 
+		T withFileResources(String regexpWithGroups, Path root, Handler... handler);
+
 		T withETagGenerator(Function<Path, String> etagCalculator);
 
 		T withTmpDir(Path tmpDir);
@@ -3483,6 +3485,17 @@ public class UHTTPD {
 				Handler... handler) {
 			var l = new ArrayList<Handler>();
 			l.add(UHTTPD.classpathResources(regexpWithGroups, loader, prefix));
+			l.addAll(Arrays.asList(handler));
+			handle(new RegularExpressionSelector(regexpWithGroups), l.toArray(new Handler[0]));
+			return (T) this;
+		}
+
+		@Override
+		@SuppressWarnings("unchecked")
+		public T withFileResources(String regexpWithGroups, Path root,
+				Handler... handler) {
+			var l = new ArrayList<Handler>();
+			l.add(UHTTPD.fileResources(regexpWithGroups, root));
 			l.addAll(Arrays.asList(handler));
 			handle(new RegularExpressionSelector(regexpWithGroups), l.toArray(new Handler[0]));
 			return (T) this;

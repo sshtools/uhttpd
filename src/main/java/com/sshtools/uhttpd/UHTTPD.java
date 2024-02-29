@@ -5154,7 +5154,7 @@ public class UHTTPD {
 			}
 
 			if (httpsPort.isPresent()) {
-				LOG.log(Level.INFO, "Start HTTPS server on port {0}", httpsPort.get());
+				LOG.log(Level.INFO, "Starting HTTPS server on port {0}", httpsPort.get());
 
 				SSLContext sc = null;
 				try {

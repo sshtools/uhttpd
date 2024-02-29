@@ -2099,6 +2099,19 @@ public class UHTTPD {
 		public final Transaction found(String location) {
 			return redirect(Status.MOVED_PERMANENTLY, location);
 		}
+		
+		public String url() {
+			var sb = new StringBuilder();
+			if(secure()) 
+				sb.append("https://");
+			else 
+				sb.append("http://");
+			sb.append(host());
+			var uri = uri();
+			if(!uri.equals("/"))
+				sb.append(uri);
+			return sb.toString();
+		}
 
 		public final Path fullContextPath() {
 			return fullContextPath;
@@ -2144,7 +2157,7 @@ public class UHTTPD {
 		}
 
 		public final String host() {
-			var hdr = headerOr(HDR_HOST);
+			var hdr = headerOr(HDR_X_FORWARDED_HOST).or(() -> headerOr(HDR_HOST));
 			return hdr.isPresent() ? hdr.get() : urlHost;
 		}
 
@@ -5519,6 +5532,7 @@ public class UHTTPD {
 	public static final String HDR_UPGRADE = "upgrade";
 	public static final String HDR_SET_COOKIE = "set-cookie";
 	public static final String HDR_COOKIE = "cookie";
+	public static final String HDR_X_FORWARDED_HOST = "x-forwarded-host";
 
 	final static Logger LOG = System.getLogger("UHTTPD");
 

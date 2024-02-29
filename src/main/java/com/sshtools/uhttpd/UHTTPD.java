@@ -1568,7 +1568,7 @@ public class UHTTPD {
 							writer.close();
 						logFile = dir.resolve(filename);
 						try {
-							writer = new PrintWriter(Files.newBufferedWriter(logFile, append? StandardOpenOption.APPEND : StandardOpenOption.CREATE), true);
+							writer = new PrintWriter(Files.newBufferedWriter(logFile, openOpens()), true);
 						} catch (IOException e) {
 							throw new UncheckedIOException(e);
 						}
@@ -1647,6 +1647,13 @@ public class UHTTPD {
 				synchronized(lock) {
 					writer.println(buf.toString());
 				}
+			}
+
+			private OpenOption[] openOpens() {
+				if(append)
+					return new OpenOption[] { StandardOpenOption.WRITE, StandardOpenOption.APPEND, StandardOpenOption.CREATE };
+				else
+					return new OpenOption[] { StandardOpenOption.WRITE, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING };
 			}
 			
 		}

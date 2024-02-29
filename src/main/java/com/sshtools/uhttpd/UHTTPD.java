@@ -402,6 +402,11 @@ public class UHTTPD {
 			return port;
 		}
 
+		/**
+		 * Get whether or not this request was made over a secure channel, such as HTTPS.
+		 * 
+		 * @return secure
+		 */
 		public final boolean secure() {
 			return secure;
 		}
@@ -594,19 +599,46 @@ public class UHTTPD {
 		Optional<Long> size();
 	}
 
+	/**
+	 * Interface to be implemented by all {@link Handler}s that somehow
+	 * group other {@link Handlers}s together.
+	 */
 	public interface Group extends Closeable, Handler {
 		
 		@Override
 		void close();
 	}
 
+	/**
+	 * A specialized type of {@link Group} that is the root interface for handlers
+	 * that deal with <strong>Contexts</strong>. Contexts are mounted to a particular path,
+	 * and all child handlers exist as relative paths underneath that.
+	 * <p>
+	 * There are 2 basic types of context, the {@link RootContext}, of which there is
+	 * only one, and {@link ContextImpl} of which there can be many, each of which can
+	 * contain further {@link ContextImpl}s.
+	 */
 	public interface Context extends Group {
 
+		/**
+		 * Generate an ETag for the file resource.
+		 * 
+		 * @param resource resource
+		 * @return etag
+		 */
 		String generateETag(Path resource);
 
+		/**
+		 * Get the temporary directory for this context.
+		 * 
+		 * @return temporary directory
+		 */
 		Path tmpDir();
 	}
 
+	/**
+	 * Builds a basic child {@link Context}.
+	 */
 	public final static class ContextBuilder extends AbstractWebContextBuilder<ContextBuilder, Context> {
 
 		private final String pathExpression;
@@ -621,6 +653,9 @@ public class UHTTPD {
 		}
 	}
 
+	/**
+	 * Represents a cookie.
+	 */
 	public interface Cookie {
 		/**
 		 * Domain of this cookie
@@ -832,55 +867,118 @@ public class UHTTPD {
 			};
 		}
 
+		/**
+		 * Set the domain for the cookie.
+		 * 
+		 * @param domain domain
+		 * @return this for chaining
+		 */
 		public CookieBuilder withDomain(String domain) {
 			this.domain = Optional.of(domain);
 			return this;
 		}
 
+		/**
+		 * Set the expiry instant for this cookie.
+		 * 
+		 * @param expires expires
+		 * @return this for chaining
+		 */
 		public CookieBuilder withExpires(Date expires) {
 			this.expires = Optional.of(expires.toInstant());
 			return this;
 		}
 
+		/**
+		 * Set the expiry instant for this cookie.
+		 * 
+		 * @param expires expires
+		 * @return this for chaining
+		 */
 		public CookieBuilder withExpires(Instant instant) {
 			this.expires = Optional.of(instant);
 			return this;
 		}
 
+		/**
+		 * Set that this cookie is only valid for Http, not use in Javascript.
+		 * 
+		 * @return this for chaining
+		 */
 		public CookieBuilder withHttpOnly() {
 			this.httpOnly = true;
 			return this;
 		}
 
+		/**
+		 * Set the maximum age (in milliseconds) for this cookie.
+		 * 
+		 * @param maxAge max age
+		 * @return this for chaining
+		 */
 		public CookieBuilder withMaxAge(long maxAge) {
 			this.maxAge = Optional.of(maxAge);
 			return this;
 		}
 
+		/**
+		 * Set the valid path for this cookie.
+		 * 
+		 * @param path path
+		 * @return this for chaining
+		 */
 		public CookieBuilder withPath(String path) {
 			this.path = Optional.of(path);
 			return this;
 		}
 
+		/**
+		 * Set the {@link SameSite} option for this cookie.
+		 * 
+		 * @param sameSite same site
+		 * @return this for chaining
+		 */
 		public CookieBuilder withSameSite(SameSite sameSite) {
 			this.sameSite = Optional.of(sameSite);
 			return this;
 		}
 
+		/**
+		 * Set this is a secure cookie.
+		 * 
+		 * @return this for chaining
+		 */
 		public CookieBuilder withSecure() {
 			return withSecure(true);
 		}
-
+		
+		/**
+		 * Set whether this is a secure cookie.
+		 * 
+		 * @param secure secure
+		 * @return this for chaining
+		 */
 		public CookieBuilder withSecure(boolean secure) {
 			this.secure = Optional.of(secure);
 			return this;
 		}
 
+		/**
+		 * Set the cookie version
+		 * 
+		 * @param version version
+		 * @return this for chaining
+		 */
 		public CookieBuilder withVersion(CookieVersion version) {
 			this.version = version;
 			return this;
 		}
 
+		/**
+		 * Set the cookie to effectivey never expire.
+		 * 
+		 * @return this for chaining
+		 */
 		public CookieBuilder withMaxExpiry() {
 			
 			return withExpires(effectivelyNever.getTime());
@@ -993,6 +1091,11 @@ public class UHTTPD {
 			}
 		}
 
+		/**
+		 * Get the charracter set of this form data
+		 * 
+		 * @return character set
+		 */
 		public final Charset charset() {
 			return charset;
 		}

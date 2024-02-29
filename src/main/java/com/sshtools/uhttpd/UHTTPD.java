@@ -3621,7 +3621,13 @@ public class UHTTPD {
 		public void get(Transaction req) throws Exception {
 			var matcher = regexpWithGroups.matcher(req.path().toString());
 			if (matcher.find()) {
-				classpathResource(loader, prefix + matcher.group(1)).get(req);
+				var path = prefix;
+				if(!path.equals("") && !path.endsWith("/"))
+					path += "/";
+				var match = matcher.group(1);
+				while(match.startsWith("/"))
+					match = match.substring(1);
+				classpathResource(loader, path + match).get(req);
 			} else
 				throw new IllegalStateException(
 						String.format("Handling a request where the pattern '%s' does not match the path '%s'",

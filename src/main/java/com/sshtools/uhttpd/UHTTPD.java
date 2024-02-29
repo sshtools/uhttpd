@@ -2148,7 +2148,7 @@ public class UHTTPD {
 		private Optional<HandlerSelector> selector = Optional.empty();
 		private final String urlHost;
 		private final String uri;
-		private Optional<Throwable> error;
+		private Optional<Throwable> error = Optional.empty();
 		private Path fullContextPath;
 		private WritableByteChannel responseChannel;
 		private boolean responseStarted;

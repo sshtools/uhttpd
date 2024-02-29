@@ -1487,6 +1487,170 @@ public class UHTTPD {
 			return Collections.unmodifiableList(values);
 		}
 	}
+	
+	public final static class NCSALoggerBuilder {
+		private Path directory = Paths.get(System.getProperty("user.dir"));
+		private String filenamePattern = "access_log_%d.log";
+		private String filenameDateFormat = "ddMM";
+		private boolean serverName;
+		private boolean extended = true;
+		private boolean append = true;
+		
+		public NCSALoggerBuilder withServerName(boolean serverName) {
+			this.serverName = serverName;
+			return this;
+		}
+		
+		public NCSALoggerBuilder withAppend(boolean append) {
+			this.append = append;
+			return this;
+		}
+		public NCSALoggerBuilder withExtended(boolean extended) {
+			this.extended = extended;
+			return this;
+		}
+		
+		public NCSALoggerBuilder withDirectory(Path directory) {
+			this.directory = directory;
+			return this;
+		}
+		
+		public NCSALoggerBuilder withFilenamePattern(String filenamePattern) {
+			this.filenamePattern = filenamePattern;
+			return this;
+		}
+		
+		public NCSALoggerBuilder withFilenameDateFormat(String filenameDateFormat) {
+			this.filenameDateFormat = filenameDateFormat;
+			return this;
+		}
+		
+		public Consumer<Transaction> build() {
+			return new NCSALogger(this);
+		}
+		
+		private final static class NCSALogger implements Consumer<Transaction> {
+			
+			private PrintWriter writer;
+			private final Path dir;
+			private final SimpleDateFormat formatter;
+			private final boolean serverName;
+			private final boolean extended;
+			private final boolean append;
+			private final String filenamePattern;
+			
+			private Path logFile;
+			private Object lock = new Object();
+
+			private NCSALogger(NCSALoggerBuilder bldr) {
+				this.dir = bldr.directory;
+				this.append = bldr.append;
+				this.formatter = new SimpleDateFormat(bldr.filenameDateFormat);
+				this.serverName = bldr.serverName;
+				this.extended = bldr.extended;
+				this.filenamePattern = bldr.filenamePattern;
+				
+				try {
+					Files.createDirectories(dir);
+				} catch (IOException e) {
+					throw new UncheckedIOException(e);
+				}
+			}
+
+			@Override
+			public void accept(Transaction tx) {
+				var date = new Date();
+				
+				synchronized(lock) {
+					var filename =  filenamePattern.replace("%d", formatter.format(date));				
+					if(logFile == null || !filename.equals(logFile.getFileName().toString())) {
+						if(writer != null)
+							writer.close();
+						logFile = dir.resolve(filename);
+						try {
+							writer = new PrintWriter(Files.newBufferedWriter(logFile, append? StandardOpenOption.APPEND : StandardOpenOption.CREATE), true);
+						} catch (IOException e) {
+							throw new UncheckedIOException(e);
+						}
+					}
+				}
+				
+				var buf= new StringBuilder(256);
+	            if (serverName) {
+	                buf.append(tx.host());
+	                buf.append(' ');
+	            }
+
+	            buf.append(tx.remoteAddress());
+	            buf.append(" - ");
+	            tx.principal().ifPresentOrElse(p -> buf.append(p.getName()), () -> buf.append(" - "));
+
+	            buf.append(" [");
+                buf.append(new Date(tx.timestamp().toEpochMilli()).toString());
+
+	            buf.append("] \"");
+	            buf.append(tx.method().toString());
+	            buf.append(' ');
+	            buf.append(tx.uri());
+	            buf.append(' ');
+	            buf.append(tx.secure() ? "HTTPS" : "HTTP");
+	            buf.append("\" ");
+                int status = tx.responseCode().map(s -> s.getCode()).orElse(0);
+                if (status <= 0)
+                    status = 404;
+                buf.append((char)('0' + ((status / 100) % 10)));
+                buf.append((char)('0' + ((status / 10) % 10)));
+                buf.append((char)('0' + (status % 10)));
+
+	            var responseLength = tx.responseLength().orElse(-1l);
+	            if (responseLength >= 0)
+	            {
+	                buf.append(' ');
+	                if (responseLength > 99999)
+	                    buf.append(responseLength);
+	                else
+	                {
+	                    if (responseLength > 9999)
+	                        buf.append((char)('0' + ((responseLength / 10000) % 10)));
+	                    if (responseLength > 999)
+	                        buf.append((char)('0' + ((responseLength / 1000) % 10)));
+	                    if (responseLength > 99)
+	                        buf.append((char)('0' + ((responseLength / 100) % 10)));
+	                    if (responseLength > 9)
+	                        buf.append((char)('0' + ((responseLength / 10) % 10)));
+	                    buf.append((char)('0' + (responseLength) % 10));
+	                }
+	                buf.append(' ');
+	            }
+	            else
+	                buf.append(" - ");
+
+	            if(extended) {
+	                tx.headerOr(HDR_REFERER).ifPresentOrElse(v -> {
+	                	buf.append('"');
+			            buf.append(v);
+			            buf.append("\" ");
+	                }, () -> buf.append("\"-\" "));
+	                
+	
+	                tx.headerOr(HDR_USER_AGENT).ifPresentOrElse(v -> {
+	                	buf.append('"');
+			            buf.append(v);
+			            buf.append("\" ");
+	                }, () -> buf.append("\"-\" "));
+	            }
+		
+                var now = System.currentTimeMillis();
+                buf.append(' ');
+                buf.append(now - tx.timestamp().toEpochMilli());
+                
+				synchronized(lock) {
+					writer.println(buf.toString());
+				}
+			}
+			
+		}
+	}
 
 	public interface OnWebSocketClose {
 		void closed(int code, String reason, WebSocket websocket);
@@ -1983,6 +2147,7 @@ public class UHTTPD {
 		private boolean responseStarted;
 		private final ByteChannel delegate;
 		private Content content;
+		private final Instant timestamp = Instant.now();
 
 		Transaction(String pathSpec, Method method, Protocol protocol, Client client, Writer writer,
 				ByteChannel delegate) {
@@ -2154,6 +2319,14 @@ public class UHTTPD {
 		public final Optional<Named> headersOr(String name) {
 			return incomingHeaders.values().stream().filter(h -> h.name().equals(name.toLowerCase()))
 					.map(h -> Optional.of(h)).reduce((f, s) -> f).orElse(Optional.empty());
+		}
+
+		public final String remoteAddress() {
+			var hdr = headerOr(HDR_X_FORWARDED_FOR);
+			return hdr.isPresent() ? hdr.get()
+					: client.remoteAddress() instanceof InetSocketAddress
+							? ((InetSocketAddress) client.remoteAddress()).getAddress().getHostAddress()
+							: client.remoteAddress().toString();
 		}
 
 		public final String host() {
@@ -2348,6 +2521,14 @@ public class UHTTPD {
 			responseType(responseType);
 			return response(response);
 		}
+		
+		public Instant timestamp() {
+			return timestamp;
+		}
+		
+		public final Optional<Status> responseCode() {
+			return code;
+		}
 
 		public final Transaction responseCode(Status code) {
 			checkNotResponded();
@@ -2364,6 +2545,10 @@ public class UHTTPD {
 			return code.isPresent();
 		}
 
+		public final Optional<Long> responseLength() {
+			return responseLength;
+		}
+		
 		public final Transaction responseLength(long responseLength) {
 			checkNotResponded();
 			this.responseLength = responseLength == -1 ? Optional.empty() : Optional.of(responseLength);
@@ -2567,6 +2752,8 @@ public class UHTTPD {
 		T withETagGenerator(Function<Path, String> etagCalculator);
 
 		T withTmpDir(Path tmpDir);
+
+		T withLogger(Consumer<Transaction> logger);
 	}
 
 	/**
@@ -3203,11 +3390,13 @@ public class UHTTPD {
 		protected AbstractContext parent;
 		protected final Path tmpDir;
 		protected final boolean clearTmpDirOnClose;
+		protected final Optional<Consumer<Transaction>> logger;
 
 		protected AbstractContext(AbstractWebContextBuilder<?, ?> b) {
 			super(b);
 			handlers.putAll(b.handlers);
 			etagGenerator = b.etagGenerator;
+			logger = b.logger;
 
 			handlers.forEach((k, v) -> {
 				if (v instanceof AbstractContext) {
@@ -3388,6 +3577,7 @@ public class UHTTPD {
 		Map<HandlerSelector, Handler> handlers = new LinkedHashMap<>();
 		Optional<Function<Path, String>> etagGenerator;
 		Optional<Path> tmpDir = Optional.empty();
+		Optional<Consumer<Transaction>> logger = Optional.empty();
 
 		protected AbstractWebContextBuilder() {
 		}
@@ -3525,6 +3715,13 @@ public class UHTTPD {
 		@Override
 		public T withTmpDir(Path tmpDir) {
 			this.tmpDir = Optional.of(tmpDir);
+			return (T) this;
+		}
+
+		@SuppressWarnings("unchecked")
+		@Override
+		public T withLogger(Consumer<Transaction> logger) {
+			this.logger = Optional.of(logger);
 			return (T) this;
 		}
 
@@ -4139,6 +4336,9 @@ public class UHTTPD {
 			} finally {
 				if (tx.content != null)
 					tx.content.close();
+				
+				client.rootContext.logger.ifPresent(l->l.accept(tx));
+				
 				Transaction.current.set(null);
 			}
 		}
@@ -5539,6 +5739,9 @@ public class UHTTPD {
 	public static final String HDR_SET_COOKIE = "set-cookie";
 	public static final String HDR_COOKIE = "cookie";
 	public static final String HDR_X_FORWARDED_HOST = "x-forwarded-host";
+	public static final String HDR_X_FORWARDED_FOR = "x-forwarded-for";
+	public static final String HDR_USER_AGENT = "user-agent";
+	public static final String HDR_REFERER = "referer";
 
 	final static Logger LOG = System.getLogger("UHTTPD");
 

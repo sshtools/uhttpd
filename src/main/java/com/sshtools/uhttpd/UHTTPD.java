@@ -1699,8 +1699,8 @@ public class UHTTPD {
 	            buf.append(tx.secure() ? "HTTPS" : "HTTP");
 	            buf.append("\" ");
                 int status = tx.responseCode().map(s -> s.getCode()).orElse(0);
-                if (status <= 0)
-                    status = 404;
+                if (status == 0)
+                    status = 200;
                 buf.append((char)('0' + ((status / 100) % 10)));
                 buf.append((char)('0' + ((status / 10) % 10)));
                 buf.append((char)('0' + (status % 10)));

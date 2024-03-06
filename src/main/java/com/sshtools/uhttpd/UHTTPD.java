@@ -527,7 +527,7 @@ public class UHTTPD {
 		/**
 		 * A convenience method to get if a part that is a piece of {@link FormData} exists.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as a stream or
+		 * This cannot be used if the content has already been retrieved as a stream of
 		 * parts.
 		 *
 		 * @param name name
@@ -536,12 +536,21 @@ public class UHTTPD {
 		default boolean hasFormData(String name) {
 			return ofFormData(name).isPresent();
 		}
+		
+		/**
+		 * A convenience method to get a boolean checkbox value that is a piece of {@linkFormData}
+		 * <p>
+		 * This cannot be used if the content has already been retrieved as a stream of parts. 
+		 */
+		default boolean ofCheckbox(String name) {
+			return ofFormData(name).map(o -> o.asString()).orElse("").equals("on");
+		}
 
 		/**
 		 * A convenience method to get a part that is a piece of {@link FormData} given
 		 * it's name.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as a stream or
+		 * This cannot be used if the content has already been retrieved as a stream of
 		 * parts.
 		 *
 		 * @param name name
@@ -554,7 +563,7 @@ public class UHTTPD {
 		/**
 		 * A convenience method to get a part that is a {@link Named} given it's name.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as a stream or
+		 * This cannot be used if the content has already been retrieved as a stream of
 		 * parts.
 		 *
 		 * @param name name
@@ -567,7 +576,7 @@ public class UHTTPD {
 		/**
 		 * A convenience method to get if a part exists.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as a stream or
+		 * This cannot be used if the content has already been retrieved as a stream of
 		 * parts.
 		 *
 		 * @param name name
@@ -581,7 +590,7 @@ public class UHTTPD {
 		/**
 		 * Get a part given it's name and class.
 		 * <p>
-		 * This cannot be used if the content has already been retrieved as a stream or
+		 * This cannot be used if the content has already been retrieved as a stream of
 		 * parts.
 		 *
 		 * @param <P>   type of part
@@ -2258,6 +2267,7 @@ public class UHTTPD {
 		private final ByteChannel delegate;
 		private Content content;
 		private final Instant timestamp = Instant.now();
+		private Map<Object, Object> attributes = Collections.synchronizedMap(new HashMap<>());
 
 		Transaction(String pathSpec, Method method, Protocol protocol, Client client, Writer writer,
 				ByteChannel delegate) {
@@ -2307,6 +2317,24 @@ public class UHTTPD {
 
 		public final void authenticate(Principal principal) {
 			this.principal = Optional.of(principal);
+		}
+		
+		public Map<Object, Object> attributes() {
+			return attributes;
+		}
+		
+		@SuppressWarnings("unchecked")
+		public <T> T attr(Object key) {
+			return (T)attrOr(key).orElseThrow(() -> new IllegalArgumentException(MessageFormat.format("No attribute named {0}",  key)));
+		}
+		
+		@SuppressWarnings("unchecked")
+		public <T> Optional<T> attrOr(Object key) {
+			return Optional.ofNullable((T)attributes.get(key));
+		}
+		
+		public Object attr(Object key, Object value) {
+			return attributes.put(key, value);
 		}
 
 		public final boolean authenticated() {

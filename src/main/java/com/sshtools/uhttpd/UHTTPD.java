@@ -42,14 +42,17 @@ import java.lang.ref.SoftReference;
 import java.math.BigDecimal;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.MalformedURLException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketAddress;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.StandardSocketOptions;
+import java.net.URI;
 import java.net.URL;
 import java.net.URLConnection;
+import java.net.URLDecoder;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.CharBuffer;
@@ -2290,13 +2293,18 @@ public class UHTTPD {
 			}
 
 			var idx = pathSpec.indexOf('?');
-			if (idx == -1) {
-				path = Paths.get(pathSpec);
-				queryString = Optional.empty();
-			} else {
-				path = Paths.get(pathSpec.substring(0, idx));
-				queryString = Optional.of(pathSpec.substring(idx + 1));
-				parameters.putAll(Named.parseParameters(queryString.get()));
+			try {
+				if (idx == -1) {
+					path = Paths.get(URLDecoder.decode(pathSpec, "UTF-8"));
+					queryString = Optional.empty();
+				} else {
+					path = Paths.get(URLDecoder.decode(pathSpec.substring(0, idx), "UTF-8"));
+					queryString = Optional.of(pathSpec.substring(idx + 1));
+					parameters.putAll(Named.parseParameters(queryString.get()));
+				}
+			}
+			catch(UnsupportedEncodingException uee) {
+				throw new IllegalStateException("Failed to decode URI.");
 			}
 
 			fullContextPath = contextPath = Paths.get("/");
@@ -4087,7 +4095,7 @@ public class UHTTPD {
 						needLength = false;
 					}
 					if (needType)
-						tx.responseType = Optional.ofNullable(mimeType(path.toUri().toURL()));
+						tx.responseType = Optional.ofNullable(mimeType(path.toUri()));
 				} catch (IOException ioe) {
 					throw new UncheckedIOException("Failed to responsd with file.", ioe);
 				}
@@ -4101,7 +4109,7 @@ public class UHTTPD {
 						needLength = false;
 					}
 					if (needType)
-						tx.responseType = Optional.ofNullable(mimeType(path.toURI().toURL()));
+						tx.responseType = Optional.ofNullable(mimeType(path.toURI()));
 				} catch (IOException ioe) {
 					throw new UncheckedIOException("Failed to responsd with file.", ioe);
 				}
@@ -4202,7 +4210,7 @@ public class UHTTPD {
 		public void get(Transaction req) throws Exception {
 			LOG.log(Level.DEBUG, "File resource {0}", file);
 			req.responseLength(Files.size(file));
-			req.responseType(mimeType(file.toUri().toURL()));
+			req.responseType(mimeType(file.toUri()));
 			req.response(Files.newInputStream(file));
 		}
 	}
@@ -5996,6 +6004,7 @@ public class UHTTPD {
 		return detectedType;
 	}
 
+	@Deprecated
 	public static String mimeType(URL url) {
 		try {
 			URLConnection conx = url.openConnection();
@@ -6012,8 +6021,21 @@ public class UHTTPD {
 		}
 	}
 
+	public static String mimeType(URI uri) {
+		try {
+			return mimeType(uri.toURL());
+		} catch (MalformedURLException murle) {
+			return bestMimeType(uriToFilename(uri), null);
+		}
+	}
+
+	@Deprecated
 	public static String urlToFilename(URL url) {
 		return Paths.get(url.getPath()).getFileName().toString();
+	}
+
+	public static String uriToFilename(URI uri) {
+		return Paths.get(uri.getPath()).getFileName().toString();
 	}
 
 	public static RootContextBuilder server() {

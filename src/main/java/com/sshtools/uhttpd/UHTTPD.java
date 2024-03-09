@@ -4985,6 +4985,7 @@ public class UHTTPD {
 				} else {
 					if (readBuffer.hasRemaining())
 						return readBuffer.get();
+					backBuffer.clear();
 					readBuffer = null;
 					continue;
 				}
@@ -4994,36 +4995,57 @@ public class UHTTPD {
 					if (r == newlineBytes[matchIndex]) {
 						matchIndex++;
 						if (matchIndex == newlineBytes.length) {
+							backBuffer.clear();
 							matchIndex = 0;
 							state = State.END;
 							return -1;
+						} else {
+							backBuffer.put((byte) r);
 						}
 					} else {
-						state = State.WAIT_BOUNDARY;
-						matchIndex = 0;
-						return r;
+						if (backBuffer.position() == 0) {
+							state = State.WAIT_BOUNDARY;
+							matchIndex = 0;
+							return r;
+						} else {
+							backBuffer.put((byte) r);
+							backBuffer.flip();
+							readBuffer = backBuffer;
+						}
 					}
 					break;
 				case WAIT_END:
 					if (r == endBytes[matchIndex]) {
 						matchIndex++;
 						if (matchIndex == endBytes.length) {
+							backBuffer.clear();
 							matchIndex = 0;
 							iterator.end = true;
 							state = State.WAIT_NEWLINE;
+						} else {
+							backBuffer.put((byte) r);
 						}
 					} else {
 						if (r == newlineBytes[matchIndex]) {
 							matchIndex++;
 							if (matchIndex == newlineBytes.length) {
+								backBuffer.clear();
 								matchIndex = 0;
 								state = State.END;
 								return -1;
+							} else {
+								backBuffer.put((byte) r);
 							}
 						} else {
-							state = State.WAIT_BOUNDARY;
-							matchIndex = 0;
-							return r;
+							if (backBuffer.position() == 0) {
+								state = State.WAIT_BOUNDARY;
+								matchIndex = 0;
+								return r;
+							} else {
+								backBuffer.put((byte) r);
+								backBuffer.flip();
+								readBuffer = backBuffer;
+							}
 						}
 					}
 					break;
@@ -5042,6 +5064,7 @@ public class UHTTPD {
 							matchIndex = 0;
 							return r;
 						} else {
+							backBuffer.put((byte) r);
 							backBuffer.flip();
 							readBuffer = backBuffer;
 						}

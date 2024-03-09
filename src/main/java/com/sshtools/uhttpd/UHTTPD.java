@@ -4959,6 +4959,8 @@ public class UHTTPD {
 		private ByteBuffer backBuffer;
 
 		private ByteBuffer readBuffer;
+		
+		private int index = 0;
 
 		private MultipartBoundaryStream(InputStream chin, String boundary, MultipartFormDataPartIterator iterator) {
 			this.chin = chin;
@@ -4966,12 +4968,14 @@ public class UHTTPD {
 			boundaryBytes = ("\r\n--" + boundary).getBytes(HTTP_CHARSET_ENCODING);
 
 			backBuffer = ByteBuffer.allocate(boundaryBytes.length);
+			
 		}
 
 		@Override
 		public int read() throws IOException {
 			if (state == State.END)
 				return -1;
+			
 
 			while (true) {
 
@@ -4981,10 +4985,10 @@ public class UHTTPD {
 					if (r == -1) {
 						state = State.END;
 						return r;
-					}
+					}					
 				} else {
 					if (readBuffer.hasRemaining())
-						return readBuffer.get();
+						return Byte.toUnsignedInt(readBuffer.get());
 					backBuffer.clear();
 					readBuffer = null;
 					continue;
@@ -5004,13 +5008,10 @@ public class UHTTPD {
 						}
 					} else {
 						if (backBuffer.position() == 0) {
-							state = State.WAIT_BOUNDARY;
-							matchIndex = 0;
+							resetToState(State.WAIT_BOUNDARY);
 							return r;
 						} else {
-							backBuffer.put((byte) r);
-							backBuffer.flip();
-							readBuffer = backBuffer;
+							bufferAndFlip(r);
 						}
 					}
 					break;
@@ -5038,13 +5039,10 @@ public class UHTTPD {
 							}
 						} else {
 							if (backBuffer.position() == 0) {
-								state = State.WAIT_BOUNDARY;
-								matchIndex = 0;
+								resetToState(State.WAIT_BOUNDARY);
 								return r;
 							} else {
-								backBuffer.put((byte) r);
-								backBuffer.flip();
-								readBuffer = backBuffer;
+								bufferAndFlip(r);
 							}
 						}
 					}
@@ -5061,12 +5059,10 @@ public class UHTTPD {
 						}
 					} else {
 						if (backBuffer.position() == 0) {
-							matchIndex = 0;
+							resetToState(State.WAIT_BOUNDARY);
 							return r;
 						} else {
-							backBuffer.put((byte) r);
-							backBuffer.flip();
-							readBuffer = backBuffer;
+							bufferAndFlip(r);
 						}
 					}
 					break;
@@ -5074,6 +5070,17 @@ public class UHTTPD {
 					throw new IllegalStateException();
 				}
 			}
+		}
+
+		private void resetToState(State state) {
+			this.state = state;
+			matchIndex = 0;
+		}
+
+		private void bufferAndFlip(int r) {
+			backBuffer.put((byte) r);
+			backBuffer.flip();
+			readBuffer = backBuffer;
 		}
 	}
 

@@ -8,7 +8,10 @@
 
 A very small HTTP/HTTPS server, intended for embedding into other applications generating dynamic content.
 
-**This is not yet intended for production use. But may be useful in very simple projects or testing and development.** 
+## Status
+
+ * Version 0.9.7 is close to production quality.
+ * Known to be in use internally for several projects and one external public server.
 
 ## Quick Start
 
@@ -54,8 +57,8 @@ This will run a server in the foreground on `localhost:8080`. Point your browser
  
 ### TODO
 
- * HTTP 2 and 3.
- * Other authentication.
+ * HTTP 2 and 3 (version 2).
+ * Other authentication (version 2).
  * Lots of tests, testing and tuning.
  
 ### Anti Features

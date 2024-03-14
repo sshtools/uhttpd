@@ -4959,8 +4959,7 @@ public class UHTTPD {
 		private ByteBuffer backBuffer;
 
 		private ByteBuffer readBuffer;
-		
-		private int index = 0;
+		private int reread = -1;
 
 		private MultipartBoundaryStream(InputStream chin, String boundary, MultipartFormDataPartIterator iterator) {
 			this.chin = chin;
@@ -4981,19 +4980,26 @@ public class UHTTPD {
 
 				int r;
 				if (readBuffer == null) {
-					r = chin.read();
+					if(reread != -1) {
+						r = reread;
+						reread = -1;
+					}
+					else {
+						r = chin.read();
+					}
 					if (r == -1) {
 						state = State.END;
 						return r;
 					}					
 				} else {
-					if (readBuffer.hasRemaining())
+					if (readBuffer.hasRemaining()) {
 						return Byte.toUnsignedInt(readBuffer.get());
+					}
 					backBuffer.clear();
 					readBuffer = null;
 					continue;
 				}
-
+				
 				switch (state) {
 				case WAIT_NEWLINE:
 					if (r == newlineBytes[matchIndex]) {
@@ -5078,9 +5084,10 @@ public class UHTTPD {
 		}
 
 		private void bufferAndFlip(int r) {
-			backBuffer.put((byte) r);
+			reread = r;
 			backBuffer.flip();
 			readBuffer = backBuffer;
+			matchIndex = 0;
 		}
 	}
 

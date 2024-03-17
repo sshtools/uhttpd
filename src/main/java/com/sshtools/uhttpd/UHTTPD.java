@@ -60,6 +60,7 @@ import java.nio.channels.AsynchronousCloseException;
 import java.nio.channels.ByteChannel;
 import java.nio.channels.Channels;
 import java.nio.channels.ClosedChannelException;
+import java.nio.channels.FileChannel;
 import java.nio.channels.ReadableByteChannel;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
@@ -655,6 +656,8 @@ public class UHTTPD {
 		
 		@Override
 		void close();
+		
+		Collection<? extends Handler> handlers();
 	}
 
 	/**
@@ -675,13 +678,6 @@ public class UHTTPD {
 		 * @return etag
 		 */
 		String generateETag(Path resource);
-
-		/**
-		 * Get the temporary directory for this context.
-		 * 
-		 * @return temporary directory
-		 */
-		Path tmpDir();
 	}
 
 	/**
@@ -1067,14 +1063,16 @@ public class UHTTPD {
 		private final MultipartBoundaryStream content;
 		private final Charset charset;
 		private final boolean buffered;
+		private final Path tmpdir;
 		
 		private Path storedContent;
-		private boolean streamObtained;
 		private InputStream input;
+		private boolean satisfying;
 
-		FormData(boolean buffered, String contentType, Charset charset, String contentDisposition, MultipartBoundaryStream content) {
+		FormData(Path tmpdir, boolean buffered, String contentType, Charset charset, String contentDisposition, MultipartBoundaryStream content) {
 			Map<String, Named> map = contentDisposition == null ? Collections.emptyMap()
 					: Named.parseSeparatedStrings(contentDisposition);
+			this.tmpdir = tmpdir;
 			this.name = map.get("name").asString();
 			this.buffered = buffered;
 			this.charset = charset;
@@ -1100,65 +1098,117 @@ public class UHTTPD {
 			}
 			TextPart.super.asFile(path);
 		}
-
+		
 		@Override
 		public InputStream asStream() {
-			if(buffered) {
-				if (input == null) {
-					try {
-						if(storedContent == null) {
-							storedContent = Files.createTempFile("uhttpd", ".part");
-							storedContent.toFile().deleteOnExit();
-						}
-						var out = Files.newOutputStream(storedContent);
-						return input = new FilterInputStream(content) {
-							@Override
-							public void close() throws IOException {
-								if(!satisfied()) {
-									satisfy();
+			try {
+				if(input == null) {
+					
+					input = new InputStream() {
+						OutputStream out = null;
+						FileChannel storedIn = null;
+						long read = 0;
+						ByteBuffer oneByte = ByteBuffer.allocate(1);
+						
+						{
+							if(buffered) {
+								if(storedContent == null) {
+									storedContent = Files.createTempFile(tmpdir, "uhttpd", ".part");
+									storedContent.toFile().deleteOnExit();
 								}
+								out = Files.newOutputStream(storedContent);
+							}	
+						}
+						
+						@Override
+						public void close() throws IOException {
+							try {
+								if(!satisfied())
+									satisfy();
+							}
+							finally {
 								try {
 									super.close();
-								} finally {
-									out.close();
+								}
+								finally {
+									try {
+										if(storedIn != null) {
+											storedIn.close();
+										}
+									}
+									finally {
+										if(out != null) {
+											out.close();;
+										}
+									}
 								}
 							}
-	
-							@Override
-							public int read() throws IOException {
-								var r = super.read();
-								if (r != -1) {
+						}
+
+						@Override
+						public int read() throws IOException {
+							int r;
+							if(storedIn == null) {
+								r = content.read();
+								if (buffered && r != -1) {
+									if(!satisfying) {
+										read++;
+									}
 									out.write(r);
 								}
-								return r;
+								if(r == -1) {
+									checkSourceEnded();;
+								}			
 							}
-	
-							@Override
-							public int read(byte[] b, int off, int len) throws IOException {
-								var r = super.read(b, off, len);
-								if (r != -1) {
+							else {
+								r = storedIn.read(oneByte); 
+								if(r != -1) {
+									oneByte.flip();
+									r = oneByte.get();
+									oneByte.clear();
+								}
+							}				
+							return r;
+						}
+
+						@Override
+						public int read(byte[] b, int off, int len) throws IOException {
+							int r;
+							if(storedIn == null) {
+								r = content.read(b, off, len);
+								if (buffered && r != -1) {
+									if(!satisfying) {
+										read += r;
+									}
 									out.write(b, off, r);
 								}
-								return r;
+								if(r == -1) {
+									checkSourceEnded();;
+								}
 							}
-						};
-					} catch (IOException ioe) {
-						throw new UncheckedIOException(ioe);
-					}
-				} else {
-					try {
-						return Files.newInputStream(storedContent);
-					} catch (IOException e) {
-						throw new UncheckedIOException(e);
-					}
-				}		
-			}
-			else {
-				if(streamObtained) {
-					throw new IllegalStateException("Stream already obtained. If you need to access a Part out of order, the part must be buffered.");
+							else {
+								r = storedIn.read(ByteBuffer.wrap(b, off, len));
+							}
+							return r;
+						}
+						
+						private void checkSourceEnded() throws IOException {
+							if(buffered && satisfied() && storedIn == null) {
+								out.close();
+								out = null;
+								storedIn = FileChannel.open(storedContent, StandardOpenOption.READ);
+								storedIn.position(read);
+							}
+						}
+					};
 				}
-				streamObtained = true;
-				return content;
+				else if(!buffered) {
+					throw new IllegalStateException("Unbuffered stream already obtained.");
+				}
+				return input;
+			}
+			catch(IOException ioe) {
+				throw new UncheckedIOException(ioe);
 			}
 		}
 
@@ -1183,12 +1233,6 @@ public class UHTTPD {
 			if(input != null) {
 				try {
 					input.close();
-				} catch (IOException e) {
-				}
-			}
-			if(content != null) {
-				try {
-					content.close();
 				} catch (IOException e) {
 				}
 			}
@@ -1234,13 +1278,14 @@ public class UHTTPD {
 		@Override
 		public void satisfy() throws IOException {
 			TextPart.super.satisfy();
-			if(buffered) {
-				if(input == null)
-					asStream();
+			if(input == null)
+				asStream();
+			satisfying = true;
+			try {
 				input.transferTo(OutputStream.nullOutputStream());
 			}
-			else {
-				content.transferTo(OutputStream.nullOutputStream());
+			finally {
+				satisfying = false;
 			}
 		}
 
@@ -1956,6 +2001,13 @@ public class UHTTPD {
 		Optional<Integer> httpsPort();
 
 		Optional<Integer> httpPort();
+
+		/**
+		 * Get the temporary directory
+		 * 
+		 * @return temporary directory
+		 */
+		Path tmpDir();
 	}
 
 	/**
@@ -1985,6 +2037,8 @@ public class UHTTPD {
 		private int recvBufferSize = DEFAULT_BUFFER_SIZE;
 		private Optional<KeyStore> keyStore = Optional.empty();
 		private int maxUnchunkedSize = 1024 * 512;
+		private Optional<Path> tmpDir = Optional.empty();
+		private Optional<Consumer<Transaction>> logger = Optional.empty();
 		
 		private RootContextBuilder() {
 			statusHandlers.put(Status.INTERNAL_SERVER_ERROR, (tx) -> {
@@ -2003,6 +2057,16 @@ public class UHTTPD {
 		@Override
 		public RootContext build() throws IOException {
 			return new RootContextImpl(this);
+		}
+
+		public RootContextBuilder withTmpDir(Path tmpDir) {
+			this.tmpDir = Optional.of(tmpDir);
+			return this;
+		}
+
+		public RootContextBuilder withLogger(Consumer<Transaction> logger) {
+			this.logger = Optional.of(logger);
+			return this;
 		}
 
 		public RootContextBuilder withBacklog(int backlog) {
@@ -2348,6 +2412,7 @@ public class UHTTPD {
 		private final Map<String, Cookie> outgoingCookies = new LinkedHashMap<>();
 		private final Map<String, Named> parameters = new LinkedHashMap<>();
 		private final Stack<Context> contexts = new Stack<>();
+		private final Path tmpdir;
 		private Path path;
 		private Path contextPath;
 		private Path fullPath;
@@ -2368,8 +2433,9 @@ public class UHTTPD {
 		private final Instant timestamp = Instant.now();
 		private Map<Object, Object> attributes = Collections.synchronizedMap(new HashMap<>());
 
-		Transaction(String pathSpec, Method method, Protocol protocol, Client client, Writer writer,
+		Transaction(Path tmpdir, String pathSpec, Method method, Protocol protocol, Client client, Writer writer,
 				ByteChannel delegate) {
+			this.tmpdir = tmpdir;
 			this.method = method;
 			this.delegate = delegate;
 			this.protocol = protocol;
@@ -2710,7 +2776,7 @@ public class UHTTPD {
 					}
 //					chan = new GZIPChannel(client, chan, StandardOpenOption.READ);
 				}
-				content = new HTTPContent(this, chan);
+				content = new HTTPContent(tmpdir, this, chan);
 			}
 			return content;
 		}
@@ -2992,10 +3058,6 @@ public class UHTTPD {
 		T withFileResources(String regexpWithGroups, Path root, Handler... handler);
 
 		T withETagGenerator(Function<Path, String> etagCalculator);
-
-		T withTmpDir(Path tmpDir);
-
-		T withLogger(Consumer<Transaction> logger);
 	}
 
 	/**
@@ -3573,8 +3635,6 @@ public class UHTTPD {
 		
 		protected final Map<Status, Handler> statusHandlers = new LinkedHashMap<>();
 		
-		protected abstract Collection<? extends Handler> handlers();
-		
 		protected AbstractGroup(AbstractGroupBuilder<?, ?> b) {
 			statusHandlers.putAll(b.statusHandlers);
 		}
@@ -3582,8 +3642,12 @@ public class UHTTPD {
 		@Override
 		public final void close() {
 			handlers().forEach(h -> { 
-				if(h instanceof Context) 
-					((Context)h).close();	
+				if(h instanceof Closeable) {
+					try {
+						((Closeable)h).close();
+					} catch (IOException e) {
+					}	
+				}
 			});
 			onClose();
 		}
@@ -3630,54 +3694,27 @@ public class UHTTPD {
 		protected final Map<HandlerSelector, Handler> handlers = new LinkedHashMap<>();
 		protected Optional<Function<Path, String>> etagGenerator;
 		protected AbstractContext parent;
-		protected final Path tmpDir;
-		protected final boolean clearTmpDirOnClose;
-		protected final Optional<Consumer<Transaction>> logger;
 
 		protected AbstractContext(AbstractWebContextBuilder<?, ?> b) {
 			super(b);
 			handlers.putAll(b.handlers);
 			etagGenerator = b.etagGenerator;
-			logger = b.logger;
 
 			handlers.forEach((k, v) -> {
 				if (v instanceof AbstractContext) {
 					((AbstractContext) v).parent = this;
 				}
 			});
-			clearTmpDirOnClose = b.tmpDir.isEmpty();
-			try {
-				tmpDir = b.tmpDir.orElse(Files.createTempDirectory("uhttpd"));
-			} catch (IOException e) {
-				throw new UncheckedIOException("Failed to create temporary directory.", e);
-			}
 		}
 
 		@Override
-		protected Collection<? extends Handler> handlers() {
+		public Collection<? extends Handler> handlers() {
 			return handlers.values();
-		}
-
-		@Override
-		protected void onClose() {
-			if (clearTmpDirOnClose) {
-				try (var walk = Files.walk(tmpDir)) {
-					walk.sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
-				}
-				catch(IOException ioe) {
-					throw new UncheckedIOException(ioe);
-				}
-			}
 		}
 
 		@Override
 		public String generateETag(Path resource) {
 			return generateETag(this, resource);
-		}
-
-		@Override
-		public Path tmpDir() {
-			return tmpDir;
 		}
 
 		String generateETag(AbstractContext ctx, Path resource) {
@@ -3818,8 +3855,6 @@ public class UHTTPD {
 			extends AbstractGroupBuilder<T, C> implements WebContextBuilder<T, C> {
 		Map<HandlerSelector, Handler> handlers = new LinkedHashMap<>();
 		Optional<Function<Path, String>> etagGenerator;
-		Optional<Path> tmpDir = Optional.empty();
-		Optional<Consumer<Transaction>> logger = Optional.empty();
 
 		protected AbstractWebContextBuilder() {
 		}
@@ -3950,20 +3985,6 @@ public class UHTTPD {
 		@Override
 		public T withETagGenerator(Function<Path, String> etagGenerator) {
 			this.etagGenerator = Optional.of(etagGenerator);
-			return (T) this;
-		}
-
-		@SuppressWarnings("unchecked")
-		@Override
-		public T withTmpDir(Path tmpDir) {
-			this.tmpDir = Optional.of(tmpDir);
-			return (T) this;
-		}
-
-		@SuppressWarnings("unchecked")
-		@Override
-		public T withLogger(Consumer<Transaction> logger) {
-			this.logger = Optional.of(logger);
 			return (T) this;
 		}
 
@@ -4479,7 +4500,7 @@ public class UHTTPD {
 			} else {
 				uri = firstToken;
 			}
-			var tx = new Transaction(uri, method, proto, client, writer(), delegate);
+			var tx = new Transaction(client.rootContext.tmpDir, uri, method, proto, client, writer(), delegate);
 			Transaction.current.set(tx);
 			try {
 				try {
@@ -4551,13 +4572,7 @@ public class UHTTPD {
 				 * Make sure all request content is read (user code might not have read any
 				 * parts)
 				 */
-				for (var part : tx.request().asParts()) {
-					if (!part.satisfied()) {
-						if (LOG.isLoggable(Level.DEBUG))
-							LOG.log(Level.DEBUG, "HTTP IN: Reading unsatisifed part {0}", part);
-						part.satisfy();
-					}
-				}
+				tx.request().close();
 
 				
 				client.rootContext.handleStatus(tx);
@@ -4739,6 +4754,7 @@ public class UHTTPD {
 
 		private final Transaction tx;
 		private final ReadableByteChannel input;
+		private final Path tmpdir;
 
 		private boolean asNamedParts;
 		private boolean asParts;
@@ -4746,9 +4762,11 @@ public class UHTTPD {
 		private boolean asChannel;
 		private List<Part> parts;
 		private Iterator<Part> partIterator;
+		private Boolean isBuffered;
 
-		private HTTPContent(Transaction tx, ReadableByteChannel input) {
+		private HTTPContent(Path tmpdir, Transaction tx, ReadableByteChannel input) {
 			this.tx = tx;
+			this.tmpdir = tmpdir;
 			this.input = input;
 		}
 
@@ -4829,6 +4847,14 @@ public class UHTTPD {
 
 		@SuppressWarnings("unchecked")
 		<P extends Part> Iterable<P> asPartsImpl(boolean buffered, Class<P> partType) {
+			if(isBuffered == null) {
+				isBuffered = buffered;
+			}
+			else if(isBuffered.booleanValue() != buffered) {
+				throw new IllegalStateException(buffered ?
+						"Already unbuffered. Cannot change buffering mode after accessing first part." :
+						"Already buffered. Cannot change buffering mode after accessing first part.");
+			}
 			if (parts == null) {
 				/* If we have not started iterating yet */
 				parts = new ArrayList<>();
@@ -4920,7 +4946,7 @@ public class UHTTPD {
 				var type = content.values().iterator().next();
 				switch (type.name()) {
 				case "multipart/form-data":
-					return new MultipartFormDataPartIterator(buffered, tx.client, input,
+					return new MultipartFormDataPartIterator(tmpdir, buffered, tx.client, input,
 							content.containsKey("boundary") ? content.get("boundary").asString() : null);
 				case "application/x-www-form-urlencoded":
 					return new URLEncodedFormDataPartIterator(tx.client, input);
@@ -5216,9 +5242,11 @@ public class UHTTPD {
 		boolean pastFirstBoundary;
 		FormData next;
 		boolean buffered;
+		Path tmpdir;
 
-		MultipartFormDataPartIterator(boolean buffered, Client client, ByteChannel chan, String boundary) {
+		MultipartFormDataPartIterator(Path tmpdir, boolean buffered, Client client, ByteChannel chan, String boundary) {
 			super(client, chan, StandardOpenOption.READ);
+			this.tmpdir = tmpdir;
 			this.buffered = buffered;
 			this.boundary = boundary;
 		}
@@ -5302,7 +5330,7 @@ public class UHTTPD {
 							LOG.log(Level.DEBUG, "Multipart stream ended.");
 					} else {
 						try {
-							next = new FormData(buffered, contentType, charset, contentDisposition, content);
+							next = new FormData(tmpdir, buffered, contentType, charset, contentDisposition, content);
 						} finally {
 							content = null;
 							end = false;
@@ -5386,7 +5414,7 @@ public class UHTTPD {
 		}
 
 		@Override
-		protected Collection<Handler> handlers() {
+		public Collection<Handler> handlers() {
 			return handlers;
 		}
 	
@@ -5417,6 +5445,10 @@ public class UHTTPD {
 		private final String threadName;
 		private final boolean daemon;
 		private final Set<Client> clients = new CopyOnWriteArraySet<>();
+		private final Path tmpDir;
+		private final Optional<Consumer<Transaction>> logger;
+		
+		private final boolean clearTmpDirOnClose;
 
 		private Thread otherThread;
 		private Thread serverThread;
@@ -5427,6 +5459,14 @@ public class UHTTPD {
 			threadName = builder.threadName;
 			daemon = builder.daemon;
 			maxUnchunkedSize = builder.maxUnchunkedSize;
+			
+			logger = builder.logger;
+			clearTmpDirOnClose = builder.tmpDir.isEmpty();
+			try {
+				tmpDir = builder.tmpDir.orElse(Files.createTempDirectory("uhttpd"));
+			} catch (IOException e) {
+				throw new UncheckedIOException("Failed to create temporary directory.", e);
+			}
 
 			httpPort = builder.httpPort;
 			httpsPort = builder.httpsPort;
@@ -5508,6 +5548,11 @@ public class UHTTPD {
 		}
 
 		@Override
+		public Path tmpDir() {
+			return tmpDir;
+		}
+
+		@Override
 		public Optional<Integer> httpPort() {
 			try {
 				return serverSocketChannel == null ? Optional.empty() :  Optional.of(((InetSocketAddress)serverSocketChannel.getLocalAddress()).getPort());
@@ -5527,6 +5572,14 @@ public class UHTTPD {
 				throw new IllegalStateException("Already closed.");
 			LOG.log(Level.INFO, "Closing root HTTP context.");
 			open = false;
+			if (clearTmpDirOnClose) {
+				try (var walk = Files.walk(tmpDir)) {
+					walk.sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
+				}
+				catch(IOException ioe) {
+					throw new UncheckedIOException(ioe);
+				}
+			}
 			try {
 				try {
 					if (serverSocketChannel != null)
@@ -5558,6 +5611,8 @@ public class UHTTPD {
 				}
 			} catch(IOException ioe) {
 				throw new UncheckedIOException(ioe);
+			} finally {
+				super.onClose();
 			}
 		}
 

@@ -11,9 +11,9 @@ import java.net.CookieManager;
 import java.net.HttpCookie;
 import java.net.URI;
 import java.net.URLEncoder;
+import java.net.http.HttpClient;
 import java.net.http.HttpClient.Redirect;
 import java.net.http.HttpClient.Version;
-import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpRequest.BodyPublishers;
 import java.net.http.HttpResponse.BodyHandlers;
@@ -31,7 +31,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Random;
-import java.util.UUID;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.Semaphore;
 
@@ -566,11 +565,18 @@ public class UHTTPDTest {
 				post("/upload", (tx) -> {
 					var content = tx.request();
 
+					try {
 					assertEquals(tf.getFileName().toString(), content.asFormData("filename").asString());
-					assertEquals("A Description", content.asFormData("reference").asString());
+					var ref = content.asFormData("reference");
+					var refStr = ref.asString();
+					assertEquals("A Description", refStr);
 					assertEquals(halfBoundary, content.asFormData("halfboundary").asString());
 					assertEquals("An Email", content.asFormData("email").asString());
 					assertEquals("A Name", content.asFormData("name").asString());
+					}
+					catch(Exception e) {
+						e.printStackTrace();
+					}
 				}).
 				build()) {
 				httpd.start();

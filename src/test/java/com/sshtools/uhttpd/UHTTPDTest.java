@@ -603,6 +603,50 @@ public class UHTTPDTest {
 			Files.delete(tf);
 		}
 	}
+	
+	@Test
+	void testMultipartIncompleteAccess() throws Exception {
+		
+		var tf = createTempDataFile(10);
+		var halfBoundary = "--" + boundary.substring(0, boundary.length() / 2);
+		try {
+			
+			try(var httpd = createServer().
+				post("/upload", (tx) -> {
+					var content = tx.request();
+					assertEquals("An Email", content.asFormData("email").asString());
+				}).
+				build()) {
+				httpd.start();
+				
+				//
+				var client = client();
+				
+				var multipartBody = MultipartBodyPublisher.newBuilder()
+					      .filePart("file", tf, MediaType.APPLICATION_OCTET_STREAM)
+					      .textPart("name", "A Name")
+					      .textPart("email", "An Email")
+					      .textPart("halfboundary", halfBoundary)
+					      .textPart("reference", "A Description")
+					      .textPart("filename", tf.getFileName().toString())
+					      .build();
+				
+				
+				var req = HttpRequest.newBuilder().
+						uri(URI.create(clientURL() + "/upload")).
+						header("Content-Type", "multipart/form-data;boundary=" + boundary).
+						POST(multipartBody).
+						build();
+				var resp = client.send(req, BodyHandlers.ofString());
+				System.err.println("GOT RESP " + resp.body());
+				assertEquals(Status.OK.getCode(), resp.statusCode());
+				System.err.println("DONE");
+			}
+		}
+		finally {
+			Files.delete(tf);
+		}
+	}
 
 	protected RootContextBuilder createServer() {
 		return UHTTPD.server().withoutHttps().withHttp(58080);

@@ -491,6 +491,8 @@ public class UHTTPD {
 		 * <p>
 		 * This cannot be used if the content has already been retrieved as a stream,
 		 * channel or a named part.
+		 * <p>
+		 * This may only be called once for a transaction.
 		 *
 		 * @return parts
 		 */
@@ -499,15 +501,46 @@ public class UHTTPD {
 		}
 
 		/**
-		 * Get all of the {@link Part}s of a certain type that make up this content.
+		 * Get all of the {@link Part}s that make up this content.
 		 * <p>
 		 * This cannot be used if the content has already been retrieved as a stream,
 		 * channel or a named part.
+		 * <p>
+		 * The parts content will be buffered to disk for the duration of the 
+		 * transaction, allowing this method to be called multiple times if required.
+		 *
+		 * @return parts
+		 */
+		default Iterable<Part> asBufferedParts() {
+			return asBufferedParts(Part.class);
+		}
+
+		/**
+		 * Get all of the {@link Part}s of a certain type that make up this content.
+		 * <p>
+		 * This cannot be used if the content has already been retrieved as a stream,
+		 * channel or a named part. 
+		 * <p>
+		 * This may only be called once for a transaction.
 		 *
 		 * @param partType type
 		 * @return parts
 		 */
 		<P extends Part> Iterable<P> asParts(Class<P> partType);
+
+		/**
+		 * Get all of the {@link Part}s of a certain type that make up this content.
+		 * <p>
+		 * This cannot be used if the content has already been retrieved as a stream,
+		 * channel or a named part.
+		 * <p>
+		 * The parts content will be buffered to disk for the duration of the 
+		 * transaction, allowing this method to be called multiple times if required.
+		 *
+		 * @param partType type
+		 * @return parts
+		 */
+		<P extends Part> Iterable<P> asBufferedParts(Class<P> partType);
 
 		/**
 		 * Get the entire content as a stream.
@@ -595,6 +628,9 @@ public class UHTTPD {
 		 * <p>
 		 * This cannot be used if the content has already been retrieved as a stream of
 		 * parts.
+		 * <p>
+		 * Parts can be read in any order, with the content buffered to disk for the
+		 * duration of the transaction.
 		 *
 		 * @param <P>   type of part
 		 * @param name  part name
@@ -1030,19 +1066,23 @@ public class UHTTPD {
 		private final String name;
 		private final MultipartBoundaryStream content;
 		private final Charset charset;
+		private final boolean buffered;
+		
 		private Path storedContent;
-		private FilterInputStream filter;
+		private boolean streamObtained;
+		private InputStream input;
 
-		FormData(String contentType, Charset charset, String contentDisposition, MultipartBoundaryStream content) {
+		FormData(boolean buffered, String contentType, Charset charset, String contentDisposition, MultipartBoundaryStream content) {
 			Map<String, Named> map = contentDisposition == null ? Collections.emptyMap()
 					: Named.parseSeparatedStrings(contentDisposition);
 			this.name = map.get("name").asString();
+			this.buffered = buffered;
 			this.charset = charset;
 			this.content = content;
 			this.contentType = Optional.ofNullable(contentType);
 			this.filename = Optional.ofNullable(map.get("filename")).map(n -> n.asString());
 		}
-
+		
 		@Override
 		public final ReadableByteChannel asChannel() {
 			return Channels.newChannel(asStream());
@@ -1052,24 +1092,38 @@ public class UHTTPD {
 		public final Reader asReader() {
 			return new InputStreamReader(asStream(), charset());
 		}
+		
+		@Override
+		public void asFile(Path path) {
+			if(buffered && input == null) {
+				storedContent = path;
+			}
+			TextPart.super.asFile(path);
+		}
 
 		@Override
 		public InputStream asStream() {
-			if (storedContent == null) {
-				if (filter == null) {
+			if(buffered) {
+				if (input == null) {
 					try {
-						storedContent = Files.createTempFile("uhttpd", ".part");
+						if(storedContent == null) {
+							storedContent = Files.createTempFile("uhttpd", ".part");
+							storedContent.toFile().deleteOnExit();
+						}
 						var out = Files.newOutputStream(storedContent);
-						return filter = new FilterInputStream(content) {
+						return input = new FilterInputStream(content) {
 							@Override
 							public void close() throws IOException {
+								if(!satisfied()) {
+									satisfy();
+								}
 								try {
 									super.close();
 								} finally {
 									out.close();
 								}
 							}
-
+	
 							@Override
 							public int read() throws IOException {
 								var r = super.read();
@@ -1078,7 +1132,7 @@ public class UHTTPD {
 								}
 								return r;
 							}
-
+	
 							@Override
 							public int read(byte[] b, int off, int len) throws IOException {
 								var r = super.read(b, off, len);
@@ -1092,14 +1146,19 @@ public class UHTTPD {
 						throw new UncheckedIOException(ioe);
 					}
 				} else {
-					return filter;
+					try {
+						return Files.newInputStream(storedContent);
+					} catch (IOException e) {
+						throw new UncheckedIOException(e);
+					}
+				}		
+			}
+			else {
+				if(streamObtained) {
+					throw new IllegalStateException("Stream already obtained. If you need to access a Part out of order, the part must be buffered.");
 				}
-			} else {
-				try {
-					return Files.newInputStream(storedContent);
-				} catch (IOException e) {
-					throw new UncheckedIOException(e);
-				}
+				streamObtained = true;
+				return content;
 			}
 		}
 
@@ -1114,6 +1173,25 @@ public class UHTTPD {
 
 		@Override
 		public void close() {
+			if(!satisfied()) {
+				try {
+					satisfy();
+				} catch (IOException e) {
+				}
+			}
+			
+			if(input != null) {
+				try {
+					input.close();
+				} catch (IOException e) {
+				}
+			}
+			if(content != null) {
+				try {
+					content.close();
+				} catch (IOException e) {
+				}
+			}
 			if (storedContent != null) {
 				try {
 					Files.delete(storedContent);
@@ -1156,7 +1234,14 @@ public class UHTTPD {
 		@Override
 		public void satisfy() throws IOException {
 			TextPart.super.satisfy();
-			asStream().transferTo(OutputStream.nullOutputStream());
+			if(buffered) {
+				if(input == null)
+					asStream();
+				input.transferTo(OutputStream.nullOutputStream());
+			}
+			else {
+				content.transferTo(OutputStream.nullOutputStream());
+			}
 		}
 
 		@Override
@@ -1800,6 +1885,17 @@ public class UHTTPD {
 		Reader asReader();
 
 		InputStream asStream();
+
+		default void asFile(Path path) {
+			try(var in = asStream()) {
+				try(var out = Files.newOutputStream(path)) {
+					in.transferTo(out);
+				}
+			}
+			catch(IOException ioe) {
+				throw new UncheckedIOException(ioe);
+			}
+		}
 
 		String asString();
 
@@ -4670,7 +4766,16 @@ public class UHTTPD {
 				return Collections.emptyList();
 			}
 			asParts = true;
-			return asPartsImpl(partType);
+			return asPartsImpl(false, partType);
+		}
+
+		@Override
+		public <P extends Part> Iterable<P> asBufferedParts(Class<P> partType) {
+			if (asStream || asNamedParts || asChannel) {
+				return Collections.emptyList();
+			}
+			asParts = true;
+			return asPartsImpl(true, partType);
 		}
 
 		@Override
@@ -4702,7 +4807,7 @@ public class UHTTPD {
 			if (LOG.isLoggable(Level.TRACE))
 				LOG.log(Level.TRACE, "Looking for part named {0} of type {1}", name, clazz);
 
-			for (var part : asPartsImpl(clazz)) {
+			for (var part : asPartsImpl(true, clazz)) {
 				if (part.name().equals(name)) {
 					if (LOG.isLoggable(Level.TRACE))
 						LOG.log(Level.TRACE, "Found part named {0} of type {1}", name, clazz);
@@ -4723,11 +4828,11 @@ public class UHTTPD {
 		}
 
 		@SuppressWarnings("unchecked")
-		<P extends Part> Iterable<P> asPartsImpl(Class<P> partType) {
+		<P extends Part> Iterable<P> asPartsImpl(boolean buffered, Class<P> partType) {
 			if (parts == null) {
 				/* If we have not started iterating yet */
 				parts = new ArrayList<>();
-				return createIterable(partType);
+				return createIterable(buffered, partType);
 			} else if (partIterator == null) {
 				/* If we have finished iterating */
 				return (Iterable<P>) parts;
@@ -4790,13 +4895,13 @@ public class UHTTPD {
 			}
 		}
 
-		<P extends Part> Iterable<P> createIterable(Class<P> partType) {
+		<P extends Part> Iterable<P> createIterable(boolean buffered, Class<P> partType) {
 			return new Iterable<>() {
 
 				@SuppressWarnings("unchecked")
 				@Override
 				public Iterator<P> iterator() {
-					var it = iteratorImpl(new PsuedoCloseByteChannel() {
+					var it = iteratorImpl(buffered, new PsuedoCloseByteChannel() {
 						@Override
 						protected int readImpl(ByteBuffer dst) throws IOException {
 							return input.read(dst);
@@ -4809,13 +4914,13 @@ public class UHTTPD {
 			};
 		}
 
-		Iterator<Part> iteratorImpl(ByteChannel input) {
+		Iterator<Part> iteratorImpl(boolean buffered, ByteChannel input) {
 			if (contentType().isPresent()) {
 				var content = Named.parseSeparatedStrings(contentType().get());
 				var type = content.values().iterator().next();
 				switch (type.name()) {
 				case "multipart/form-data":
-					return new MultipartFormDataPartIterator(tx.client, input,
+					return new MultipartFormDataPartIterator(buffered, tx.client, input,
 							content.containsKey("boundary") ? content.get("boundary").asString() : null);
 				case "application/x-www-form-urlencoded":
 					return new URLEncodedFormDataPartIterator(tx.client, input);
@@ -4960,6 +5065,7 @@ public class UHTTPD {
 
 		private ByteBuffer readBuffer;
 		private int reread = -1;
+		private boolean closed;
 
 		private MultipartBoundaryStream(InputStream chin, String boundary, MultipartFormDataPartIterator iterator) {
 			this.chin = chin;
@@ -4971,7 +5077,15 @@ public class UHTTPD {
 		}
 
 		@Override
+		public void close() throws IOException {
+			super.close();
+			closed = true;
+		}
+
+		@Override
 		public int read() throws IOException {
+			if(closed)
+				throw new IOException("Closed.");
 			if (state == State.END)
 				return -1;
 			
@@ -5101,9 +5215,11 @@ public class UHTTPD {
 		boolean end;
 		boolean pastFirstBoundary;
 		FormData next;
+		boolean buffered;
 
-		MultipartFormDataPartIterator(Client client, ByteChannel chan, String boundary) {
+		MultipartFormDataPartIterator(boolean buffered, Client client, ByteChannel chan, String boundary) {
 			super(client, chan, StandardOpenOption.READ);
+			this.buffered = buffered;
 			this.boundary = boundary;
 		}
 
@@ -5186,7 +5302,7 @@ public class UHTTPD {
 							LOG.log(Level.DEBUG, "Multipart stream ended.");
 					} else {
 						try {
-							next = new FormData(contentType, charset, contentDisposition, content);
+							next = new FormData(buffered, contentType, charset, contentDisposition, content);
 						} finally {
 							content = null;
 							end = false;

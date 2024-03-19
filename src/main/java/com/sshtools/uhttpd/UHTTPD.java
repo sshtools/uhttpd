@@ -2287,7 +2287,7 @@ public class UHTTPD {
 		}
 
 		default boolean asBoolean() {
-			return ofString().map(v -> Boolean.valueOf(v)).orElseThrow();
+			return ofString().map(v -> "on".equals(v) || Boolean.valueOf(v)).orElseThrow();
 		}
 
 		default Optional<Boolean> ofBoolean() {

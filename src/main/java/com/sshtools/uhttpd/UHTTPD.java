@@ -6207,7 +6207,11 @@ public class UHTTPD {
 
 	public static String bestMimeType(String fileName, String detectedType) {
 		if(detectedType == null || detectedType.isEmpty() || detectedType.equalsIgnoreCase("content/unknown")) {
-			return URLConnection.guessContentTypeFromName(fileName);
+			var guessedType = URLConnection.guessContentTypeFromName(fileName);
+			if(guessedType == null && fileName.endsWith(".cjs")) {
+				return "application/javascript";
+			}
+			return guessedType;
 		}
 		return detectedType;
 	}

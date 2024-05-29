@@ -2291,7 +2291,7 @@ public class UHTTPD {
 		}
 		
 		public boolean messageBody() {
-			return info() || this == NO_CONTENT || this == NOT_MODIFIED;
+			return !(info() || this == NO_CONTENT || this == NOT_MODIFIED);
 		}
 
 	}

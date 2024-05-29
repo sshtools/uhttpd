@@ -4403,7 +4403,7 @@ public class UHTTPD {
 		public WritableByteChannel responseWriter(Transaction tx) throws IOException {
 			if (responseWriter == null) {
 				if(!isRespondable(tx))
-					throw new IOException("Request method and status does not allow a message body in the response.");
+					throw new IOException(MessageFormat.format("Request method {0} and status {1} does not allow a message body in the response.", tx.method, tx.code.orElse(Status.OK)));
 				calcResponseLengthAndType(tx);
 				var out = client.channel();
 				WritableByteChannel nioChan = new PsuedoCloseByteChannel() {
@@ -4620,7 +4620,13 @@ public class UHTTPD {
 				client.rootContext.handleStatus(tx);
 
 				if (tx.responseChannel == null) {
-					responseContent(tx);
+					if(isRespondable(tx)) {
+						responseContent(tx);
+					}
+					else {
+						calcChunkingAndClose(tx);
+						respondWithHeaders(tx);
+					}
 				}
 
 				writer().flush();

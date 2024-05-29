@@ -307,6 +307,38 @@ public class UHTTPDTest {
 	}
 
 	@Test
+	void testGetFileGzip2() throws Exception {
+		var tf = createCompressableTempDataFile(2047);
+		try(var httpd = createServer().
+			get("/get", (tx) -> {
+				tx.response(tf); // can use file here, as compression prevents content length being automatically determined
+			}).
+//			withMaxUnchunkedSize(10000 * 2). // twice size of file will mean gzipped content is buffered
+			build()) {
+			httpd.start();
+			
+			//			
+			var client = client();
+			var req =  MutableRequest.GET(clientURL() + "/get").
+					header(UHTTPD.HDR_ACCEPT_ENCODING, "gzip").
+					build();
+			var outf = Files.createTempFile("http", "data");
+			try {
+				var resp = client.send(req, BodyHandlers.ofFile(outf));
+				// TODO Methanol seems to strip these headers (i presume because content returned to client code wont be compressed). Not sure how we'd test this
+//				assertEquals("gzip", resp.headers().firstValue(UHTTPD.HDR_CONTENT_ENCODING).get());
+				assertTrue(isEqual(tf, outf));
+			}
+			finally {
+				Files.delete(outf);
+			}
+		}
+		finally {
+			Files.delete(tf);
+		}
+	}
+
+	@Test
 	void testGetFileGzipChunked() throws Exception {
 		var tf = createCompressableTempDataFile(10000);
 		try(var httpd = createServer().
@@ -413,6 +445,40 @@ public class UHTTPDTest {
 						try(var other = Files.newByteChannel(tf)) {
 							assertTrue(isEqual(in, other));
 						}
+					}
+					tx.responseCode(Status.OK);
+				}).
+				build()) {
+				httpd.start();
+				
+				//
+				var client = client();
+				var req = HttpRequest.newBuilder().
+						uri(URI.create(clientURL() + "/upload")).
+						header("Content-Type", "application/octet-stream").
+						POST(BodyPublishers.ofFile(tf)).
+						build();
+				var resp = client.send(req, BodyHandlers.ofString());
+				assertEquals(Status.OK.getCode(), resp.statusCode());
+			}
+		}
+		finally {
+			Files.delete(tf);
+		}
+	}
+
+	@Test
+	void testPostEmptyFile() throws Exception {
+		
+		var tf = createTempDataFile(0);
+		try {
+			
+			try(var httpd = createServer().
+				post("/upload", (tx) -> {
+					var content = tx.request();
+					assertEquals("application/octet-stream", content.contentType().orElseThrow());
+					try(var in = content.asStream()) {
+						assertEquals(-1, in.read());
 					}
 					tx.responseCode(Status.OK);
 				}).
@@ -635,6 +701,116 @@ public class UHTTPDTest {
 					      .textPart("halfboundary", halfBoundary)
 					      .textPart("reference", "A Description")
 					      .textPart("filename", tf.getFileName().toString())
+					      .build();
+				
+				
+				var req = HttpRequest.newBuilder().
+						uri(URI.create(clientURL() + "/upload")).
+						header("Content-Type", "multipart/form-data;boundary=" + boundary).
+						POST(multipartBody).
+						build();
+				var resp = client.send(req, BodyHandlers.ofString());
+				System.err.println("GOT RESP " + resp.body());
+				assertEquals(Status.OK.getCode(), resp.statusCode());
+				System.err.println("DONE");
+			}
+		}
+		finally {
+			Files.delete(tf);
+		}
+	}
+	
+	@Test
+	void testMultipartEmpyFile() throws Exception {
+		
+		var tf = createTempDataFile(0);
+		try {
+			
+			try(var httpd = createServer().
+				post("/upload", (tx) -> {
+
+					var content = tx.request();
+					int parts = 0;
+					for(var part : content.asParts(FormData.class)) {
+						switch(part.name()) {
+						case "file":
+							try(var in = part.asStream()) {
+								assertEquals(-1, in.read());
+							}
+							break;
+						default:
+							throw new IllegalStateException("Unexpected part " + part.name());
+						
+						}
+						parts++;
+					}
+					
+					assertEquals(1, parts);
+				}).
+				build()) {
+				httpd.start();
+				
+				//
+				var client = client();
+				
+				var multipartBody = MultipartBodyPublisher.newBuilder()
+					      .filePart("file", tf, MediaType.APPLICATION_OCTET_STREAM)
+					      .build();
+				
+				
+				var req = HttpRequest.newBuilder().
+						uri(URI.create(clientURL() + "/upload")).
+						header("Content-Type", "multipart/form-data;boundary=" + boundary).
+						POST(multipartBody).
+						build();
+				var resp = client.send(req, BodyHandlers.ofString());
+				System.err.println("GOT RESP " + resp.body());
+				assertEquals(Status.OK.getCode(), resp.statusCode());
+				System.err.println("DONE");
+			}
+		}
+		finally {
+			Files.delete(tf);
+		}
+	}
+	
+	@Test
+	void testMultipart2EmpyFiles() throws Exception {
+		
+		var tf = createTempDataFile(0);
+		try {
+			
+			try(var httpd = createServer().
+				post("/upload", (tx) -> {
+
+					var content = tx.request();
+					int parts = 0;
+					for(var part : content.asParts(FormData.class)) {
+						switch(part.name()) {
+						case "file":
+						case "file2":
+							try(var in = part.asStream()) {
+								assertEquals(-1, in.read());
+							}
+							break;
+						default:
+							throw new IllegalStateException("Unexpected part " + part.name());
+						
+						}
+						parts++;
+					}
+					
+					assertEquals(2, parts);
+				}).
+				build()) {
+				httpd.start();
+				
+				//
+				var client = client();
+				
+				var multipartBody = MultipartBodyPublisher.newBuilder()
+					      .filePart("file", tf, MediaType.APPLICATION_OCTET_STREAM)
+					      .filePart("file2", tf, MediaType.APPLICATION_OCTET_STREAM)
 					      .build();
 				
 				

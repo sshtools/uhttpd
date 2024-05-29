@@ -1579,7 +1579,7 @@ public class UHTTPD {
 		static Named parseHeader(String raw) {
 			var idx = raw.indexOf(':');
 			if (idx == -1)
-				throw new IllegalArgumentException("Malformed header.");
+				throw new IllegalArgumentException("Malformed header. '" + raw + "'");
 			return new Named(raw.substring(0, idx).toLowerCase(), raw.substring(idx + 1).trim());
 		}
 
@@ -2276,6 +2276,22 @@ public class UHTTPD {
 
 		public String getText() {
 			return text;
+		}
+		
+		public boolean info() {
+			return code > 99 && code < 200;
+		}
+		
+		public boolean redirect() {
+			return code > 299 && code < 400;
+		}
+		
+		public boolean ok() {
+			return code > 199 && code < 300;
+		}
+		
+		public boolean messageBody() {
+			return info() || this == NO_CONTENT || this == NOT_MODIFIED;
 		}
 
 	}
@@ -4386,6 +4402,8 @@ public class UHTTPD {
 		@Override
 		public WritableByteChannel responseWriter(Transaction tx) throws IOException {
 			if (responseWriter == null) {
+				if(!isRespondable(tx))
+					throw new IOException("Request method and status does not allow a message body in the response.");
 				calcResponseLengthAndType(tx);
 				var out = client.channel();
 				WritableByteChannel nioChan = new PsuedoCloseByteChannel() {
@@ -4398,54 +4416,32 @@ public class UHTTPD {
 
 				if (haveLength && responseLength < client.rootContext.maxUnchunkedSize) {
 					if (gzip) {
-						var buf = ByteBuffer.allocateDirect((int) (responseLength * 2)); /* TODO ... improve */
-						WritableByteChannel bufchan = new ByteChannel() {
-
-							boolean closed;
-
-							@Override
-							public void close() throws IOException {
-								if (isOpen()) {
-									closed = true;
-									useLength = true;
-									responseLength = buf.position();
-									buf.flip();
-									calcChunkingAndClose(tx);
-									respondWithHeaders(tx);
-									try {
-										nioChan.write(buf);
-									}
-									catch(IOException ioe) {
-									}
-									finally {
-										nioChan.close();
-									}
-								}
-							}
-
+						// bufchan = new GZIPChannel(client, bufchan, StandardOpenOption.WRITE);
+						var bufchan = createBufferChannel(tx, nioChan);
+						var gzout = new GZIPOutputStream(Channels.newOutputStream(bufchan), true);
+						var chan = Channels.newChannel(gzout);
+						return new WritableByteChannel() {
+							
 							@Override
 							public boolean isOpen() {
-								return !closed;
+								return chan.isOpen();
 							}
-
+							
 							@Override
-							public int read(ByteBuffer dst) throws IOException {
-								throw new UnsupportedOperationException();
+							public void close() throws IOException {
+								try {
+									gzout.finish();
+								}
+								finally {
+									chan.close();
+								}
 							}
-
+							
 							@Override
 							public int write(ByteBuffer src) throws IOException {
-								var r = src.remaining();
-								buf.put(src);
-								return r;
+								return chan.write(src);
 							}
 						};
-						if (gzip) {
-							// bufchan = new GZIPChannel(client, bufchan, StandardOpenOption.WRITE);
-							bufchan = Channels
-									.newChannel(new GZIPOutputStream(Channels.newOutputStream(bufchan), true));
-						}
-						return bufchan;
 					} else {
 						calcChunkingAndClose(tx);
 						respondWithHeaders(tx);
@@ -4468,6 +4464,52 @@ public class UHTTPD {
 				return responseWriter;
 			}
 
+		}
+
+		protected ByteChannel createBufferChannel(Transaction tx, WritableByteChannel nioChan) {
+
+			var buf = ByteBuffer.allocateDirect((int) (responseLength * 2)); /* TODO ... improve */
+			return new ByteChannel() {
+
+				boolean closed;
+
+				@Override
+				public void close() throws IOException {
+					if (isOpen()) {
+						closed = true;
+						useLength = true;
+						responseLength = buf.position();
+						buf.flip();
+						calcChunkingAndClose(tx);
+						respondWithHeaders(tx);
+						try {
+							nioChan.write(buf);
+						}
+						catch(IOException ioe) {
+						}
+						finally {
+							nioChan.close();
+						}
+					}
+				}
+
+				@Override
+				public boolean isOpen() {
+					return !closed;
+				}
+
+				@Override
+				public int read(ByteBuffer dst) throws IOException {
+					throw new UnsupportedOperationException();
+				}
+
+				@Override
+				public int write(ByteBuffer src) throws IOException {
+					var r = src.remaining();
+					buf.put(src);
+					return r;
+				}
+			};
 		}
 
 		@Override
@@ -4609,26 +4651,44 @@ public class UHTTPD {
 				}
 			}
 		}
+		
+		private boolean isRespondable(Transaction tx) {
+			if(tx.method == Method.HEAD)
+				return false;
+			var code = tx.code.orElse(Status.OK);
+			if(!code.messageBody()) {
+				return false;
+			}
+			return true;
+		}
 
 		private void calcResponseLengthAndType(Transaction tx) {
 			chunk = false;
-			haveLength = useLength = tx.responseLength.isPresent();
-			responseLength = useLength ? tx.responseLength.get() : -1;
-			responseBigEnoughToCompress = (!useLength || (responseLength >= client.rootContext.minGzipSize));
-
-			// TODO gzip header might contain parameters for compression
-			gzip = responseBigEnoughToCompress && client.rootContext.gzip && tx.hasResponse()
-					&& tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING)
-					&& tx.outgoingHeaders.get(HDR_CONTENT_ENCODING).containsIgnoreCase("gzip");
-
-			if (responseBigEnoughToCompress && client.rootContext.gzip
-					&& !tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) && tx.hasResponse()) {
-				var ae = tx.headersOr(HDR_ACCEPT_ENCODING);
-				if (ae.isPresent() && ae.get().expand(",").containsIgnoreCase("gzip")) {
-					gzip = true;
-					useLength = false; 
+			if(isRespondable(tx)) {
+				haveLength = useLength = tx.responseLength.isPresent();
+				responseLength = useLength ? tx.responseLength.get() : -1;
+				responseBigEnoughToCompress = (!useLength || (responseLength >= client.rootContext.minGzipSize));
+	
+				// TODO gzip header might contain parameters for compression
+				gzip = responseBigEnoughToCompress && client.rootContext.gzip && tx.hasResponse()
+						&& tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING)
+						&& tx.outgoingHeaders.get(HDR_CONTENT_ENCODING).containsIgnoreCase("gzip");
+	
+				if (responseBigEnoughToCompress && client.rootContext.gzip
+						&& !tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) && tx.hasResponse()) {
+					var ae = tx.headersOr(HDR_ACCEPT_ENCODING);
+					if (ae.isPresent() && ae.get().expand(",").containsIgnoreCase("gzip")) {
+						gzip = true;
+						useLength = false; 
+					}
 				}
 			}
+			else {
+				useLength = haveLength = true;
+				gzip = responseBigEnoughToCompress = false;
+				responseLength = 0;
+			}
+			
 		}
 
 		private void reset() {
@@ -4806,8 +4866,19 @@ public class UHTTPD {
 
 		@Override
 		public void close() {
-			if (parts != null) {
-				parts.forEach(p -> p.close());
+			try {
+				if(asChannel) {
+					Channels.newInputStream(asChannel()).transferTo(OutputStream.nullOutputStream());
+				}
+				else if(asParts) {
+					parts.forEach(p -> p.close());
+				}
+				else {
+					asStream().transferTo(OutputStream.nullOutputStream());
+				}
+			}
+			catch(IOException ioe) {
+				LOG.log(Level.DEBUG, "Failed to drain stream.", ioe);
 			}
 		}
 

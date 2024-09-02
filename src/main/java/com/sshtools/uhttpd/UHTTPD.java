@@ -71,6 +71,7 @@ import java.nio.charset.CharsetDecoder;
 import java.nio.charset.CharsetEncoder;
 import java.nio.charset.CoderResult;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.OpenOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -1998,9 +1999,18 @@ public class UHTTPD {
 
 		void start();
 
-		Optional<Integer> httpsPort();
+		default Optional<Integer> httpsPort() {
+			return httpAddress().filter(a -> a instanceof InetSocketAddress).map(a -> ((InetSocketAddress)a).getPort());
+		}
 
-		Optional<Integer> httpPort();
+		default Optional<Integer> httpPort() {
+			return httpsAddress().filter(a -> a instanceof InetSocketAddress).map(a -> ((InetSocketAddress)a).getPort());
+			
+		}
+
+		Optional<SocketAddress> httpAddress();
+
+		Optional<SocketAddress> httpsAddress();
 
 		/**
 		 * Get the temporary directory
@@ -2242,7 +2252,11 @@ public class UHTTPD {
 		HTTP, HTTPS
 	}
 
+	private final static Map<Integer, Status> byCode = new HashMap<>();
+
 	public enum Status {
+		
+		
 		CONTINUE(100, "Continue"), SWITCHING_PROTOCOLS(101, "Switching Protocols"), PROCESSING(102, "Processing"),
 		OK(200, "OK"), CREATED(201, "Created"), ACCEPTED(202, "Accepted"),
 		NON_AUTHORITATIVE_INFORMATION(203, "Non-Authoritative Information"), NO_CONTENT(204, "No Content"),
@@ -2266,8 +2280,13 @@ public class UHTTPD {
 		private String text;
 
 		Status(int code, String text) {
+			byCode.put(code, this);
 			this.code = code;
 			this.text = text;
+		}
+		
+		public static Optional<Status> ofCode(int code) {
+			return Optional.ofNullable(byCode.get(code));
 		}
 
 		public int getCode() {
@@ -4072,8 +4091,10 @@ public class UHTTPD {
 			LOG.log(Level.DEBUG, "Locating resource for {0}", path);
 			var fullPath = Paths.get(path).normalize().toString();
 			var url = base.map(c -> c.getResource(path)).orElseGet(() -> loader.orElse(ClasspathResources.class.getClassLoader()).getResource(fullPath));
-			if (url == null)
-				throw new FileNotFoundException(fullPath);
+			if (url == null) {
+				/* TODO we want this to fall through really to the default notFound() */
+//				throw new FileNotFoundException(fullPath);
+			}
 			else {
 				urlResource(url).get(req);
 			}
@@ -5630,17 +5651,17 @@ public class UHTTPD {
 		}
 
 		@Override
-		public Optional<Integer> httpPort() {
+		public Optional<SocketAddress> httpAddress() {
 			try {
-				return serverSocketChannel == null ? Optional.empty() :  Optional.of(((InetSocketAddress)serverSocketChannel.getLocalAddress()).getPort());
+				return serverSocketChannel == null ? Optional.empty() :  Optional.of((serverSocketChannel.getLocalAddress()));
 			} catch (IOException e) {
 				throw new UncheckedIOException(e);
 			}
 		}
 
 		@Override
-		public Optional<Integer> httpsPort() {
-			return sslServerSocket == null ? Optional.empty() : Optional.of(sslServerSocket.getLocalPort());
+		public Optional<SocketAddress> httpsAddress() {
+			return sslServerSocket == null ? Optional.empty() :  Optional.of((sslServerSocket.getLocalSocketAddress()));
 		}
 
 		@Override
@@ -5703,7 +5724,8 @@ public class UHTTPD {
 					tx.selector = Optional.of(c.getKey());
 					try {
 						c.getValue().get(tx);
-					} catch (FileNotFoundException fnfe) {
+					} catch (FileNotFoundException | NoSuchFileException fnfe) {
+						fnfe.printStackTrace();
 						if (LOG.isLoggable(Level.DEBUG))
 							LOG.log(Level.DEBUG, "File not found. {0}", fnfe.getMessage());
 						tx.notFound();

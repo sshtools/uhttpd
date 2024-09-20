@@ -3676,7 +3676,7 @@ public class UHTTPD {
 		
 		@Override
 		public final void close() {
-			handlers().forEach(h -> { 
+			new ArrayList<>(handlers()).forEach(h -> { 
 				if(h instanceof Closeable) {
 					try {
 						((Closeable)h).close();

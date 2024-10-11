@@ -2004,7 +2004,7 @@ public class UHTTPD {
 		}
 
 		default Optional<Integer> httpPort() {
-			return httpsAddress().filter(a -> a instanceof InetSocketAddress).map(a -> ((InetSocketAddress)a).getPort());
+			return httpAddress().filter(a -> a instanceof InetSocketAddress).map(a -> ((InetSocketAddress)a).getPort());
 			
 		}
 

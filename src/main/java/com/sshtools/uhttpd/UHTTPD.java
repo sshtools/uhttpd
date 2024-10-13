@@ -2330,7 +2330,18 @@ public class UHTTPD {
 		}
 
 		default byte asByte() {
-			return ofString().map(v -> Byte.parseByte(v)).orElseThrow();
+			return ofString().map(v -> { 
+				return Byte.parseByte(v); 
+			}).orElseThrow();
+		}
+		
+		default int asUnsignedByte() {
+			return ofString().map(v -> { 
+				var vv = (int)Short.parseShort(v);
+				if(vv < 0 || vv > 255)
+					throw new NumberFormatException();
+				return vv;
+			}).orElseThrow();
 		}
 
 		@Override

@@ -2019,7 +2019,7 @@ public class UHTTPD {
 		 */
 		Path tmpDir();
 	}
-
+	
 	/**
 	 * Builder to create a new instance of the main server, an {@link UHTTPD}
 	 * instance.
@@ -2049,6 +2049,7 @@ public class UHTTPD {
 		private int maxUnchunkedSize = 1024 * 512;
 		private Optional<Path> tmpDir = Optional.empty();
 		private Optional<Consumer<Transaction>> logger = Optional.empty();
+		private boolean sendLowerCaseHeaders = true;
 		
 		private RootContextBuilder() {
 			statusHandlers.put(Status.INTERNAL_SERVER_ERROR, (tx) -> {
@@ -2086,6 +2087,15 @@ public class UHTTPD {
 
 		public RootContextBuilder withHttp(int httpPort) {
 			this.httpPort = Optional.of(httpPort);
+			return this;
+		}
+
+		public RootContextBuilder withoutSendLowerCaseHeaders() {
+			return withSendLowerCaseHeaders(false);
+		}
+
+		public RootContextBuilder withSendLowerCaseHeaders(boolean sendLowerCaseHeaders) {
+			this.sendLowerCaseHeaders = sendLowerCaseHeaders;
 			return this;
 		}
 
@@ -2442,6 +2452,10 @@ public class UHTTPD {
 
 	public final static class Transaction {
 		
+		private static final String HDR_LOCATION = "Location";
+
+		public static final String HDR_WWW_AUTHENTICATE = "WWW-Authenticate";
+
 		public static ThreadLocal<Transaction> current = new ThreadLocal<>();
 
 		private final Client client;
@@ -2645,7 +2659,15 @@ public class UHTTPD {
 		}
 
 		public final boolean hasResponseHeader(String name) {
-			return outgoingHeaders.containsKey(name);
+			return outgoingHeaders.containsKey(name.toLowerCase());
+		}
+
+		public final Named responseHeader(String name) {
+			return responseHeaderOr(name).orElseThrow(() ->new IllegalArgumentException("No header " + name));
+		}
+		
+		public final Optional<Named> responseHeaderOr(String name) {
+			return Optional.ofNullable(outgoingHeaders.get(name.toLowerCase()));
 		}
 
 		public final String header(String name) {
@@ -2654,7 +2676,12 @@ public class UHTTPD {
 
 		public final Transaction header(String name, String value) {
 			checkNotResponded();
-			outgoingHeaders.put(name.toLowerCase(), new Named(name.toLowerCase(), value));
+			if(client.rootContext.sendLowerCaseHeader)
+				outgoingHeaders.put(
+						name.toLowerCase(), new Named(name.toLowerCase(), value));
+			else
+				outgoingHeaders.put(
+						name.toLowerCase(), new Named(name, value));
 			return this;
 		}
 
@@ -2775,7 +2802,7 @@ public class UHTTPD {
 				throw new IllegalArgumentException(MessageFormat.format("May only use {0} or {1}.",
 						Status.MOVED_PERMANENTLY, Status.MOVED_TEMPORARILY));
 			responseCode(status);
-			header("Location", location == null ? "/" : location);
+			header(HDR_LOCATION, location == null ? "/" : location);
 			resetContent();
 			return this;
 		}
@@ -2979,7 +3006,7 @@ public class UHTTPD {
 			checkNotResponded();
 			responseCode(Status.UNAUTHORIZED);
 			responseType("text/plain");
-			header("WWW-Authenticate", String.format("Basic realm=\"%s\"", realm));
+			header(HDR_WWW_AUTHENTICATE, String.format("Basic realm=\"%s\"", realm));
 			responseLength = Optional.empty();
 			return this;
 
@@ -3170,6 +3197,14 @@ public class UHTTPD {
 	}
 
 	public static final class WebSocketHandler implements Handler {
+
+		private static final String HDR_SEC_WEBSOCKET_ACCEPT = "Sec-Websocket-Accept";
+
+		private static final String HDR_SEC_WEBSOCKET_PROTOCOL = "Sec-Websocket-Protocol";
+
+		private static final String HDR_SEC_WEBSOCKET_KEY = "Sec-Websocket-Key";
+
+		private static final String HDR_SEC_WEBSOCKET_VERSION = "Sec-Websocket-Version";
 
 		/**
 		 * Order is important!
@@ -3598,11 +3633,11 @@ public class UHTTPD {
 
 				// TODO origin check
 
-				var keyOr = req.headerOr("sec-websocket-key");
-				var proto = req.headersOr("sec-websocket-protocol");
-				var version = req.headers("sec-websocket-version").asInt();
+				var keyOr = req.headerOr(HDR_SEC_WEBSOCKET_KEY);
+				var proto = req.headersOr(HDR_SEC_WEBSOCKET_PROTOCOL);
+				var version = req.headers(HDR_SEC_WEBSOCKET_VERSION).asInt();
 				if (version > SUPPORTED_WEBSOCKET_VERSION) {
-					req.header("sec-websocket-version", String.valueOf(SUPPORTED_WEBSOCKET_VERSION));
+					req.header(HDR_SEC_WEBSOCKET_VERSION, String.valueOf(SUPPORTED_WEBSOCKET_VERSION));
 					req.responseCode(Status.UPGRADE_REQUIRED);
 					return;
 				}
@@ -3622,7 +3657,7 @@ public class UHTTPD {
 				req.header(HDR_CONNECTION, "Upgrade");
 				req.header(HDR_UPGRADE, "websocket");
 				if (!selectedProtocol.equals(""))
-					req.header("sec-websocket-protocol", selectedProtocol);
+					req.header(HDR_SEC_WEBSOCKET_PROTOCOL, selectedProtocol);
 				
 				if(keyOr.isPresent()) {
 					var key = keyOr.get();
@@ -3633,7 +3668,7 @@ public class UHTTPD {
 					var responseKeyData = key + WEBSOCKET_UUID;
 					var responseKeyBytes = responseKeyData.getBytes("UTF-8");
 					var responseKey = Base64.getEncoder().encodeToString(hasher.digest(responseKeyBytes));
-					req.header("sec-websocket-accept", responseKey);
+					req.header(HDR_SEC_WEBSOCKET_ACCEPT, responseKey);
 				}
 
 				client.wireProtocol = new WebSocketProtocol(ws);
@@ -4709,11 +4744,11 @@ public class UHTTPD {
 	
 				// TODO gzip header might contain parameters for compression
 				gzip = responseBigEnoughToCompress && client.rootContext.gzip && tx.hasResponse()
-						&& tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING)
-						&& tx.outgoingHeaders.get(HDR_CONTENT_ENCODING).containsIgnoreCase("gzip");
+						&& tx.hasResponseHeader(HDR_CONTENT_ENCODING)
+						&& tx.responseHeader(HDR_CONTENT_ENCODING).containsIgnoreCase("gzip");
 	
 				if (responseBigEnoughToCompress && client.rootContext.gzip
-						&& !tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) && tx.hasResponse()) {
+						&& !tx.hasResponseHeader(HDR_CONTENT_ENCODING) && tx.hasResponse()) {
 					var ae = tx.headersOr(HDR_ACCEPT_ENCODING);
 					if (ae.isPresent() && ae.get().expand(",").containsIgnoreCase("gzip")) {
 						gzip = true;
@@ -4760,7 +4795,7 @@ public class UHTTPD {
 						tx.responseText.orElse(status.getText()));
 
 			if (responseBigEnoughToCompress && client.rootContext.gzip
-					&& !tx.outgoingHeaders.containsKey(HDR_CONTENT_ENCODING) && tx.hasResponse()) {
+					&& !tx.hasResponseHeader(HDR_CONTENT_ENCODING) && tx.hasResponse()) {
 				var ae = tx.headersOr(HDR_ACCEPT_ENCODING);
 				if (ae.isPresent() && ae.get().expand(",").containsIgnoreCase("gzip")) {
 					w.print(HDR_CONTENT_ENCODING);
@@ -5562,6 +5597,8 @@ public class UHTTPD {
 		private Thread otherThread;
 		private Thread serverThread;
 
+		private final boolean sendLowerCaseHeader;
+
 		private RootContextImpl(RootContextBuilder builder) throws UnknownHostException, IOException {
 			super(builder);
 
@@ -5583,6 +5620,7 @@ public class UHTTPD {
 			httpsAddress = builder.httpsAddress;
 			backlog = builder.backlog;
 			cache = builder.cache;
+			sendLowerCaseHeader = builder.sendLowerCaseHeaders;
 			keepAlive = builder.keepAlive;
 			gzip = builder.gzip;
 			sendBufferSize = builder.sendBufferSize;
@@ -6187,25 +6225,25 @@ public class UHTTPD {
 		HTTP_CHARSET_ENCODING = Charset.forName("ISO-8859-1");
 	}
 
-	public static final String HDR_CACHE_CONTROL = "cache-control";
-	public static final String HDR_ACCEPT_ENCODING = "accept-encoding";
-	public static final String HDR_CONTENT_ENCODING = "content-encoding";
-	public static final String HDR_CONNECTION = "connection";
-	public static final String HDR_CONTENT_DISPOSITION = "content-disposition";
-	public static final String HDR_CONTENT_LENGTH = "content-length";
-	public static final String HDR_TRANSFER_ENCODING = "transfer-encoding";
-	public static final String HDR_LAST_MODIFIED = "last-modified";
-	public static final String HDR_IF_MODIFIED_SINCE = "if-modified-since";
-	public static final String HDR_IF_UNMODIFIED_SINCE = "if-unmodified-since";
-	public static final String HDR_CONTENT_TYPE = "content-type";
-	public static final String HDR_HOST = "host";
-	public static final String HDR_UPGRADE = "upgrade";
-	public static final String HDR_SET_COOKIE = "set-cookie";
-	public static final String HDR_COOKIE = "cookie";
-	public static final String HDR_X_FORWARDED_HOST = "x-forwarded-host";
-	public static final String HDR_X_FORWARDED_FOR = "x-forwarded-for";
-	public static final String HDR_USER_AGENT = "user-agent";
-	public static final String HDR_REFERER = "referer";
+	public static final String HDR_CACHE_CONTROL = "Cache-Control";
+	public static final String HDR_ACCEPT_ENCODING = "Accept-Encoding";
+	public static final String HDR_CONTENT_ENCODING = "Content-Encoding";
+	public static final String HDR_CONNECTION = "Connection";
+	public static final String HDR_CONTENT_DISPOSITION = "Content-Disposition";
+	public static final String HDR_CONTENT_LENGTH = "Content-Length";
+	public static final String HDR_TRANSFER_ENCODING = "Transfer-Encoding";
+	public static final String HDR_LAST_MODIFIED = "Last-Modified";
+	public static final String HDR_IF_MODIFIED_SINCE = "If-Modified-Since";
+	public static final String HDR_IF_UNMODIFIED_SINCE = "If-Unmodified-Since";
+	public static final String HDR_CONTENT_TYPE = "Content-Type";
+	public static final String HDR_HOST = "Host";
+	public static final String HDR_UPGRADE = "Upgrade";
+	public static final String HDR_SET_COOKIE = "Set-Cookie";
+	public static final String HDR_COOKIE = "Cookie";
+	public static final String HDR_X_FORWARDED_HOST = "X-Forwarded-Host";
+	public static final String HDR_X_FORWARDED_FOR = "X-Forwarded-For";
+	public static final String HDR_USER_AGENT = "User-Agent";
+	public static final String HDR_REFERER = "Referer";
 
 	final static Logger LOG = System.getLogger("UHTTPD");
 

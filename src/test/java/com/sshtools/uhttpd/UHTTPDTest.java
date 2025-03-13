@@ -29,6 +29,7 @@ import java.security.SecureRandom;
 import java.text.MessageFormat;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.Random;
 import java.util.concurrent.CompletionStage;
@@ -599,7 +600,7 @@ public class UHTTPDTest {
 					      .textPart("dval", dval)
 					      .textPart("fval", fval)
 					      .textPart("aval", aval)
-					      .textPart("now", UHTTPD.formatInstant(now))
+					      .textPart("now", UHTTPD.formatDate(OffsetDateTime.ofInstant(now, UHTTPD.UTC_ZONE)))
 					      .textPart("filename", tf.getFileName().toString())
 					      .build();
 				

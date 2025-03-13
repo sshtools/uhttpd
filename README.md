@@ -10,7 +10,7 @@ A very small HTTP/HTTPS server, intended for embedding into other applications g
 
 ## Status
 
- * Version 0.9.7 is close to production quality.
+ * Version 0.9.10 is close to production quality.
  * Known to be in use internally for several projects and one external public server.
 
 ## Quick Start
@@ -104,6 +104,8 @@ Simple examples. Most will start the server in the foreground indefinitely.
  * [Running In Background](#running-in-background)
  
 ### Serving some HTML
+
+Just generate a page of HTML from a Java string.
  
  ```java
 try(var httpd = UHTTPD.server().
@@ -128,9 +130,12 @@ try(var httpd = UHTTPD.server().
 	build()) {
 	httpd.run();
 }
- ``` 
- 
-### Handling `GET` parameters
+
+```
+
+### Handling GET parameters
+
+Access the `Named` via `Transaction.parameter`. From this, you can get as various types.
  
  ```java
 try(var httpd = UHTTPD.server().
@@ -145,7 +150,7 @@ try(var httpd = UHTTPD.server().
 }
  ```
  
-### Handling `POST` parameters
+### Handling POST parameters
 
 For example, file uploads.
  

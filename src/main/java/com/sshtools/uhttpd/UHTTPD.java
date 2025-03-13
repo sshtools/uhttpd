@@ -38,7 +38,6 @@ import java.io.UnsupportedEncodingException;
 import java.io.Writer;
 import java.lang.System.Logger;
 import java.lang.System.Logger.Level;
-import java.lang.ref.SoftReference;
 import java.math.BigDecimal;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -80,9 +79,12 @@ import java.security.KeyStore;
 import java.security.MessageDigest;
 import java.security.Principal;
 import java.text.MessageFormat;
-import java.text.ParsePosition;
 import java.text.SimpleDateFormat;
 import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -95,7 +97,6 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
@@ -103,7 +104,6 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.Stack;
 import java.util.StringTokenizer;
-import java.util.TimeZone;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
@@ -714,7 +714,7 @@ public class UHTTPD {
 		 *
 		 * @return cookie expires
 		 */
-		Optional<Instant> expires();
+		Optional<OffsetDateTime> expires();
 
 		/**
 		 * HTTP usage only.
@@ -797,7 +797,7 @@ public class UHTTPD {
 		Optional<String> path = Optional.empty();
 		Optional<String> domain = Optional.empty();
 		Optional<Long> maxAge = Optional.empty();
-		Optional<Instant> expires = Optional.empty();
+		Optional<OffsetDateTime> expires = Optional.empty();
 		Optional<SameSite> sameSite = Optional.empty();
 		
 		public CookieBuilder withName(String name) {
@@ -829,7 +829,7 @@ public class UHTTPD {
 				}
 
 				@Override
-				public Optional<Instant> expires() {
+				public Optional<OffsetDateTime> expires() {
 					return expires;
 				}
 
@@ -883,8 +883,7 @@ public class UHTTPD {
 					});
 					expires.ifPresent(p -> {
 						b.append("; Expires=");
-						var date = new Date(p.toEpochMilli());
-						b.append(formatDate(date));
+						b.append(formatDate(p));
 					});
 					if (secure) {
 						b.append("; Secure");
@@ -930,8 +929,7 @@ public class UHTTPD {
 		 * @return this for chaining
 		 */
 		public CookieBuilder withExpires(Date expires) {
-			this.expires = Optional.of(expires.toInstant());
-			return this;
+			return withExpires(expires.toInstant());
 		}
 
 		/**
@@ -941,7 +939,18 @@ public class UHTTPD {
 		 * @return this for chaining
 		 */
 		public CookieBuilder withExpires(Instant instant) {
-			this.expires = Optional.of(instant);
+			return withExpires(OffsetDateTime.ofInstant(instant, UTC_ZONE));
+		}
+
+		/**
+		 * Set the expiry instant for this cookie. The date time should be in
+		 * the UTC/GMT zone.
+		 * 
+		 * @param expires expires
+		 * @return this for chaining
+		 */
+		public CookieBuilder withExpires(OffsetDateTime dateTime) {
+			this.expires = Optional.of(dateTime);
 			return this;
 		}
 
@@ -1551,7 +1560,11 @@ public class UHTTPD {
 	 */
 	public enum Method {
 		CONNECT, DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT, TRACE, COPY, LOCK, MKCOL, MOVE, PROPFIND, PROPPATCH,
-		UNLOCK
+		UNLOCK;
+
+		boolean isSafe() {
+			return this == GET || this == HEAD;
+		}
 	}
 
 	/**
@@ -2455,10 +2468,12 @@ public class UHTTPD {
 		private static final String HDR_LOCATION = "Location";
 
 		public static final String HDR_WWW_AUTHENTICATE = "WWW-Authenticate";
+		public static final String DATE_FORMAT = "EEE, dd MMM yyyy HH:mm:ss zzz";
 
 		public static ThreadLocal<Transaction> current = new ThreadLocal<>();
 
 		private final Client client;
+		private static final Pattern ETAG_PATTERN = Pattern.compile("\\*|\\s*((W\\/)?(\"[^\"]*\"))\\s*,?");
 
 		private Optional<Status> code = Optional.empty();
 		private final Optional<String> queryString;
@@ -2492,6 +2507,7 @@ public class UHTTPD {
 		private Content content;
 		private final Instant timestamp = Instant.now();
 		private Map<Object, Object> attributes = Collections.synchronizedMap(new HashMap<>());
+		private boolean unmodified = false;
 
 		Transaction(Path tmpdir, String pathSpec, Method method, Protocol protocol, Client client, Writer writer,
 				ByteChannel delegate) {
@@ -2670,8 +2686,71 @@ public class UHTTPD {
 			return Optional.ofNullable(outgoingHeaders.get(name.toLowerCase()));
 		}
 
+		public final boolean modified(long millisSinceEpoch) {
+			return modified(Instant.ofEpochMilli(millisSinceEpoch));
+		}
+
+		public final boolean modified(Instant instant) {
+			return modified(OffsetDateTime.ofInstant(instant, UTC_ZONE));
+		}
+
+		public final boolean modified(String etag) {
+			return modified(Optional.of(etag), Optional.empty());
+		}
+		
+		public final boolean modified(OffsetDateTime instant) {
+			return modified(Optional.empty(), Optional.of(instant));
+		}
+
+		public final boolean modified(String etag, OffsetDateTime instant) {
+			return modified(Optional.of(etag), Optional.of(instant));
+		}
+
+		public final boolean modified(Optional<String> etag, Optional<OffsetDateTime> instant) {
+			return !notModified(etag, instant);
+		}
+		
+		private boolean notModified(Optional<String> etag, Optional<OffsetDateTime> instant) {
+			if (this.unmodified || (code.isPresent() && code.get() != Status.OK)) {
+				return this.unmodified;
+			}
+			if (validateIfMatch(etag)) {
+				respondAsUnmodified(etag, instant);
+				return this.unmodified;
+			}
+			else if (validateIfUnmodifiedSince(instant)) {
+				respondAsUnmodified(etag, instant);
+				return this.unmodified;
+			}
+			if (!validateIfNoneMatch(etag)) {
+				validateIfModifiedSince(instant);
+			}
+			ifModifiedResponse(etag, instant);
+			return this.unmodified;
+		}
+
 		public final String header(String name) {
 			return headerOr(name).orElseThrow();
+		}
+
+		public final OffsetDateTime dateHeader(String name) {
+			return dateHeaderOr(name).orElseThrow();
+		}
+
+		public final Optional<OffsetDateTime> dateHeaderOr(String name) {
+			return headerOr(name).map(UHTTPD::parseDate);
+		}
+
+		public final Transaction dateHeader(String name, long millisSinceEpoch) {
+			return dateHeader(name, Instant.ofEpochMilli(millisSinceEpoch));
+		}
+
+		public final Transaction dateHeader(String name, Instant instant) {
+			return dateHeader(name, OffsetDateTime.ofInstant(instant, UTC_ZONE));
+		}
+		
+		public final Transaction dateHeader(String name, OffsetDateTime instant) {
+			return header(name, instant.toString());
 		}
 
 		public final Transaction header(String name, String value) {
@@ -2964,12 +3043,14 @@ public class UHTTPD {
 
 					@Override
 					public void close() throws IOException {
-						output.close();
+						if(output != null)
+							output.close();
+						responseStarted = true;
 					}
 
 					@Override
 					public boolean isOpen() {
-						return output.isOpen();
+						return output == null || output.isOpen();
 					}
 
 					@Override
@@ -3027,6 +3108,140 @@ public class UHTTPD {
 			path = Paths.get(resPath);
 			fullContextPath = fullContextPath.resolve(ctxPath.substring(1));
 			fullPath = fullContextPath.resolve(resPath.substring(1));
+		}
+
+		private void respondAsUnmodified(Optional<String> etag, Optional<OffsetDateTime> lastModifiedTimestamp) {
+			if (unmodified) {
+				checkNotResponded();
+				responseCode(Status.PRECONDITION_FAILED);
+			}
+			else {
+				ifModifiedResponseHeaders(etag, lastModifiedTimestamp);
+			}
+		}
+
+		private void ifModifiedResponse(Optional<String> etag, Optional<OffsetDateTime> lastModifiedTimestamp) {
+			if (unmodified) {
+				responseCode(method.isSafe() ? Status.NOT_MODIFIED : Status.PRECONDITION_FAILED);
+			}
+			ifModifiedResponseHeaders(etag, lastModifiedTimestamp);
+		}
+
+		private void ifModifiedResponseHeaders(Optional<String> etag, Optional<OffsetDateTime> lastModifiedTimestamp) {
+			if (method.isSafe()) {
+				if (lastModifiedTimestamp.isPresent() && dateHeaderOr(HDR_LAST_MODIFIED).isEmpty()) {
+					dateHeader(HDR_LAST_MODIFIED, lastModifiedTimestamp.get());
+				}
+				if (hasValue(etag) && dateHeaderOr(HDR_ETAG).isEmpty()) {
+					header(HDR_ETAG, pad(etag).get());
+				}
+			}
+		}
+		
+		private void validateIfModifiedSince(Optional<OffsetDateTime> lastModifiedTimestamp) {
+			if (lastModifiedTimestamp.isEmpty()) {
+				return;
+			}
+			var ifModifiedSince = dateHeaderOr(HDR_IF_MODIFIED_SINCE);
+			if (ifModifiedSince.isPresent()) {
+				unmodified =  ifModifiedSince.get().equals(lastModifiedTimestamp.get()) || lastModifiedTimestamp.get().isAfter(lastModifiedTimestamp.get());
+			}
+		}
+
+		private boolean validateIfNoneMatch(Optional<String> eTag) {
+			var ifNoneMatchHeaders = headersOr(HDR_IF_NONE_MATCH);
+			if (ifNoneMatchHeaders.isEmpty()) {
+				return false;
+			}
+			unmodified = !matchETags(ifNoneMatchHeaders.get().values(), eTag, true);
+			return true;
+		}
+
+		private boolean validateIfMatch(Optional<String> etag) {
+			if(method.isSafe())
+				return false;
+
+			var hdrds = headersOr(HDR_IF_MATCH);
+			if (hdrds.isEmpty()) {
+				return false;
+			}
+			unmodified = matchETags(hdrds.get().values(), etag, false);
+			return true;
+		}
+
+		private boolean matchETags(List<String> requestedETags, Optional<String> etag, boolean weakCompare) {
+			etag = pad(etag);
+			// https://datatracker.ietf.org/doc/html/rfc9110#section-8.8.3
+			for(var hdrTag : requestedETags) {
+				var mtchr = ETAG_PATTERN.matcher(hdrTag);
+				while (mtchr.find()) {
+					if ("*".equals(mtchr.group()) && hasValue(etag) && !method.isSafe()) {
+						return false;
+					}
+					if (weakCompare) {
+						if (etagWeak(etag, mtchr.group(1))) {
+							return false;
+						}
+					}
+					else {
+						if (etagStrong(etag, mtchr.group(1))) {
+							return false;
+						}
+					}
+				}
+			}
+			return true;
+		}
+		
+		private static boolean etagStrong(Optional<String> first, String second) {
+			if (!hasValue(first) || first.get().toLowerCase().startsWith("w/")) {
+				return false;
+			}
+			return first.get().equals(second);
+		}
+
+		private boolean etagWeak(Optional<String> first, String second) {
+			if (!hasValue(first) || !hasValue(second)) {
+				return false;
+			}
+			if (first.get().toLowerCase().startsWith("w/")) {
+				first = Optional.of(first.get().substring(2));
+			}
+			if (second.toLowerCase().startsWith("w/")) {
+				second = second.substring(2);
+			}
+			return first.get().equals(second);
+		}
+
+		private boolean validateIfUnmodifiedSince(Optional<OffsetDateTime> lastModifiedTimestamp) {
+			if (lastModifiedTimestamp.isEmpty()) {
+				return false;
+			}
+			var ifUnmodifiedSince = dateHeaderOr(HDR_IF_UNMODIFIED_SINCE);
+			if (ifUnmodifiedSince.isEmpty()) {
+				return false;
+			}
+			this.unmodified = ifUnmodifiedSince.get().isBefore(lastModifiedTimestamp.get());
+			return true;
+		}
+		
+		private static Optional<String> pad(Optional<String> etag) {
+			if (!hasValue(etag)) {
+				return etag;
+			}
+			var v = etag.get();
+			if ((v.startsWith("\"") || v.toLowerCase().startsWith("w/\"")) && v.endsWith("\"")) {
+				return etag;
+			}
+			return Optional.of("\"" + etag.get() + "\"");
+		}
+
+		private static boolean hasValue(String val) {
+			return val != null && val.length() > 0;
+		}
+		
+		private static boolean hasValue(Optional<String> val) {
+			return val.isPresent() && hasValue(val.get());
 		}
 	}
 
@@ -4232,46 +4447,6 @@ public class UHTTPD {
 		}
 	}
 
-	/**
-	 * A factory for {@link SimpleDateFormat}s. The instances are stored in a
-	 * threadlocal way because SimpleDateFormat is not threadsafe as noted in
-	 * {@link SimpleDateFormat its javadoc}.
-	 *
-	 */
-	private final static class DateFormatHolder {
-
-		private static final ThreadLocal<SoftReference<Map<String, SimpleDateFormat>>> THREADLOCAL_FORMATS = new ThreadLocal<>();
-
-		/**
-		 * creates a {@link SimpleDateFormat} for the requested format string.
-		 *
-		 * @param pattern a non-{@code null} format String according to
-		 *                {@link SimpleDateFormat}. The format is not checked against
-		 *                {@code null} since all paths go through {@link DateUtils}.
-		 * @return the requested format. This simple dateformat should not be used to
-		 *         {@link SimpleDateFormat#applyPattern(String) apply} to a different
-		 *         pattern.
-		 */
-		public static SimpleDateFormat formatFor(final String pattern) {
-			final SoftReference<Map<String, SimpleDateFormat>> ref = THREADLOCAL_FORMATS.get();
-			Map<String, SimpleDateFormat> formats = ref == null ? null : ref.get();
-			if (formats == null) {
-				formats = new HashMap<>();
-				THREADLOCAL_FORMATS.set(new SoftReference<>(formats));
-			}
-
-			SimpleDateFormat format = formats.get(pattern);
-			if (format == null) {
-				format = new SimpleDateFormat(pattern, Locale.US);
-				format.setTimeZone(TimeZone.getTimeZone("GMT"));
-				formats.put(pattern, format);
-			}
-
-			return format;
-		}
-
-	}
-
 	private final static class DefaultResponder implements BufferFiller {
 
 		private final Object response;
@@ -4648,7 +4823,7 @@ public class UHTTPD {
 									bldr.withSecure();
 								}
 								else if(el.name().equalsIgnoreCase("expires")) {
-									bldr.withExpires(parseDate(el.asString()));
+									bldr.withExpires(parseDate(el.asString()).toInstant());
 								}
 								else if(el.name().equalsIgnoreCase("max-age")) {
 									bldr.withMaxAge(el.asLong());
@@ -5451,9 +5626,9 @@ public class UHTTPD {
 										pastFirstBoundary = true;
 									}
 								}
-							} else if (line.toLowerCase().startsWith(HDR_CONTENT_TYPE + ": ")) {
+							} else if (line.toLowerCase().startsWith(HDR_CONTENT_TYPE.toLowerCase() + ": ")) {
 								contentType = Named.parseHeader(line).asString();
-							} else if (line.toLowerCase().startsWith(HDR_CONTENT_DISPOSITION + ": ")) {
+							} else if (line.toLowerCase().startsWith(HDR_CONTENT_DISPOSITION.toLowerCase() + ": ")) {
 								contentDisposition = Named.parseHeader(line).asString();
 							} else if (line.equals("")) {
 								// content will start after a NL (CR was terminated the readLine())
@@ -6097,19 +6272,12 @@ public class UHTTPD {
 		public void get(Transaction req) throws Exception {
 			LOG.log(Level.DEBUG, "Resource @{0}", url);
 			var conx = url.openConnection();
-			var lastMod = new Date( ((conx.getLastModified() + 500) / 1000) * 1000 );
-			if(req.headerOr(HDR_IF_MODIFIED_SINCE).isPresent()) {
-				var date = parseDate(req.header(HDR_IF_MODIFIED_SINCE));
-				if(lastMod.after(date)) {
-					req.responseCode(Status.NOT_MODIFIED);
-					return;
-				}
+			var lastMod = OffsetDateTime.ofInstant(Instant.ofEpochMilli(conx.getLastModified()), UTC_ZONE);
+			if(req.modified(lastMod)) {
+				req.responseLength(conx.getContentLengthLong());
+				req.responseType(bestMimeType(urlToFilename(url), conx.getContentType()));
+				req.response(url.openStream());
 			}
-			req.responseLength(conx.getContentLengthLong());
-			req.responseType(bestMimeType(urlToFilename(url), conx.getContentType()));
-			req.header(HDR_LAST_MODIFIED, formatDate(lastMod));
-			
-			req.response(url.openStream());
 		}
 
 	}
@@ -6244,47 +6412,17 @@ public class UHTTPD {
 	public static final String HDR_X_FORWARDED_FOR = "X-Forwarded-For";
 	public static final String HDR_USER_AGENT = "User-Agent";
 	public static final String HDR_REFERER = "Referer";
+	public static final String HDR_IF_MATCH = "If-Match";
+	public static final String HDR_IF_NONE_MATCH = "If-None-Match";
+	public static final String HDR_ETAG = "ETag";
+
+	public static final ZoneId UTC_ZONE = ZoneId.of("UTC");
 
 	final static Logger LOG = System.getLogger("UHTTPD");
 
 	private final static HandlerSelector ALL_SELECTOR = new AllSelector();
 
 	private static final String WEBSOCKET_UUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-
-	/**
-	 * Date format pattern used to parse HTTP date headers in RFC 1123 format.
-	 */
-	public static final String PATTERN_RFC1123 = "EEE, dd MMM yyyy HH:mm:ss zzz";
-
-	/**
-	 * Simple date format for the creation date ISO representation (partial).
-	 */
-	protected static final String PATTERN_ISO = "yyyy-MM-dd'T'HH:mm:ss'Z'";
-
-	/**
-	 * Date format pattern used to parse HTTP date headers in RFC 1036 format.
-	 */
-	public static final String PATTERN_RFC1036 = "EEE, dd-MMM-yy HH:mm:ss zzz";
-
-	/**
-	 * Date format pattern used to parse HTTP date headers in ANSI C
-	 * {@code asctime()} format.
-	 */
-	public static final String PATTERN_ASCTIME = "EEE MMM d HH:mm:ss yyyy";
-
-	private static final String[] DEFAULT_PATTERNS = new String[] { PATTERN_RFC1123, PATTERN_RFC1036, PATTERN_ASCTIME };
-
-	private static final Date DEFAULT_TWO_DIGIT_YEAR_START;
-
-	public static final TimeZone GMT = TimeZone.getTimeZone("GMT");
-
-	static {
-		final Calendar calendar = Calendar.getInstance();
-		calendar.setTimeZone(GMT);
-		calendar.set(2000, Calendar.JANUARY, 1, 0, 0, 0);
-		calendar.set(Calendar.MILLISECOND, 0);
-		DEFAULT_TWO_DIGIT_YEAR_START = calendar.getTime();
-	}
 
 	public static Handler classpathResource(Class<?> clazz, String path) {
 		return new ClasspathResource(Optional.empty(), Optional.of(clazz), path);
@@ -6323,25 +6461,8 @@ public class UHTTPD {
 		return new FileResources(regexpPatternWithGroups, root);
 	}
 
-	//
-	// The following code comes from Apache Http client DateUtils under
-	// the same license as this project.
-	//
-
-	public static String formatDate(Date date) {
-		return DateFormatHolder.formatFor(PATTERN_RFC1123).format(date);
-	}
-
-	public static String formatInstant(Instant instant) {
-		return formatDate(new Date(instant.toEpochMilli()));
-	}
-
-	public static String formatISODate(Date date) {
-		return DateFormatHolder.formatFor(PATTERN_ISO).format(date);
-	}
-
-	public static String formatISOInstant(Instant instant) {
-		return formatISODate(new Date(instant.toEpochMilli()));
+	public static String formatDate(OffsetDateTime date) {
+		return date.toString();
 	}
 
 	public static HttpBasicAuthenticationBuilder httpBasicAuthentication(
@@ -6418,49 +6539,23 @@ public class UHTTPD {
 		return new URLResource(url);
 	}
 
-	/**
-	 * Parses the date value using the given date formats.
-	 *
-	 * @param dateValue the date value to parse
-	 *
-	 * @return the parsed date or null if input could not be parsed
-	 */
-	static Date parseDate(final String dateValue) {
-		return parseDate(dateValue, DEFAULT_PATTERNS, null);
-	}
-
-	/**
-	 * Parses the date value using the given date formats.
-	 *
-	 * @param dateValue   the date value to parse
-	 * @param dateFormats the date formats to use
-	 * @param startDate   During parsing, two digit years will be placed in the
-	 *                    range {@code startDate} to {@code startDate + 100 years}.
-	 *                    This value may be {@code null}. When {@code null} is given
-	 *                    as a parameter, year {@code 2000} will be used.
-	 *
-	 * @return the parsed date or null if input could not be parsed
-	 */
-	static Date parseDate(final String dateValue, final String[] dateFormats, final Date startDate) {
-		final String[] localDateFormats = dateFormats != null ? dateFormats : DEFAULT_PATTERNS;
-		final Date localStartDate = startDate != null ? startDate : DEFAULT_TWO_DIGIT_YEAR_START;
-		String v = dateValue;
-		// trim single quotes around date if present
-		// see issue #5279
-		if (v.length() > 1 && v.startsWith("'") && v.endsWith("'")) {
-			v = v.substring(1, v.length() - 1);
+	final static DateTimeFormatter[] DATE_FORMATS = {
+			DateTimeFormatter.ISO_OFFSET_DATE_TIME,
+			DateTimeFormatter.RFC_1123_DATE_TIME,
+			DateTimeFormatter.ofPattern("EEE MMM d HH:mm:ss yyyy"),
+	};
+	
+	static OffsetDateTime parseDate(String dateValue) {
+		if (dateValue.length() > 1 && dateValue.startsWith("'") && dateValue.endsWith("'")) {
+			dateValue = dateValue.substring(1, dateValue.length() - 1);
 		}
-
-		for (final String dateFormat : localDateFormats) {
-			final SimpleDateFormat dateParser = DateFormatHolder.formatFor(dateFormat);
-			dateParser.set2DigitYearStart(localStartDate);
-			final ParsePosition pos = new ParsePosition(0);
-			final Date result = dateParser.parse(v, pos);
-			if (pos.getIndex() != 0) {
-				return result;
+		for(var fmt : DATE_FORMATS) {
+			try {
+				return OffsetDateTime.parse(dateValue, fmt);
+			} catch(DateTimeParseException dtpe){
 			}
 		}
-		return null;
+		throw new IllegalArgumentException("Date `" + dateValue + "` could not be parsed by any supported date/time parsers.");
 	}
 
 }

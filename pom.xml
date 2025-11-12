@@ -19,7 +19,7 @@
 	<modelVersion>4.0.0</modelVersion>
 	<groupId>com.sshtools</groupId>
 	<artifactId>uhttpd</artifactId>
-	<version>0.9.12-SNAPSHOT</version>
+	<version>0.9.12</version>
 	<name>µTTPD - A very small HTTP/HTTPS server</name>
 	<properties>
 		<maven.compiler.target>11</maven.compiler.target>
@@ -55,16 +55,6 @@
 			<distribution>repo</distribution>
 		</license>
 	</licenses>
-	<distributionManagement>
-		<snapshotRepository>
-			<id>ossrh-sshtools</id>
-			<url>https://oss.sonatype.org/content/repositories/snapshots</url>
-		</snapshotRepository>
-		<repository>
-			<id>ossrh-sshtools</id>
-			<url>https://oss.sonatype.org/service/local/staging/deploy/maven2/</url>
-		</repository>
-	</distributionManagement>
 	<scm>
 		<url>https://github.com/sshtools/uhttpd</url>
 		<connection>scm:git:https://github.com/sshtools/uhttpd.git</connection>
@@ -226,17 +216,17 @@
 						</execution>
 					</executions>
 				</plugin>
-				<plugin>
-					<groupId>org.sonatype.plugins</groupId>
-					<artifactId>nexus-staging-maven-plugin</artifactId>
-					<version>1.6.13</version>
-					<extensions>true</extensions>
-					<configuration>
-						<serverId>ossrh-sshtools</serverId>
-						<nexusUrl>https://oss.sonatype.org/</nexusUrl>
-						<autoReleaseAfterClose>true</autoReleaseAfterClose>
-					</configuration>
-				</plugin>
+	            <plugin>
+	                <groupId>org.sonatype.central</groupId>
+	                <artifactId>central-publishing-maven-plugin</artifactId>
+	                <version>0.8.0</version>
+	                <extensions>true</extensions>
+	                <configuration>
+	                    <autoPublish>true</autoPublish>
+	                    <waitUntil>published</waitUntil>
+	            		<publishingServerId>central-sshtools</publishingServerId>
+	                </configuration>
+	            </plugin>
 			</plugins>
 		</pluginManagement>
 	</build>
@@ -265,8 +255,8 @@
 						</executions>
 					</plugin>
 					<plugin>
-						<groupId>org.sonatype.plugins</groupId>
-						<artifactId>nexus-staging-maven-plugin</artifactId>
+		                <groupId>org.sonatype.central</groupId>
+		                <artifactId>central-publishing-maven-plugin</artifactId>
 					</plugin>
 				</plugins>
 			</build>

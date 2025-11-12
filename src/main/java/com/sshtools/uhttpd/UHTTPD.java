@@ -61,6 +61,7 @@ import java.nio.channels.Channels;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.ReadableByteChannel;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.channels.WritableByteChannel;
@@ -206,7 +207,6 @@ public class UHTTPD {
 		final SocketAddress localAddress;
 		final SocketAddress remoteAddress;
 		final Consumer<Integer> timeoutSetter;
-		final List<Path> tempFiles = new  CopyOnWriteArrayList<>();
 
 		boolean closed = false;
 		int times = 0;
@@ -309,12 +309,6 @@ public class UHTTPD {
 				} catch (IOException ioe) {
 				} finally {
 					rootContext.clients.remove(this);
-					tempFiles.forEach(t -> {
-						try {
-							Files.deleteIfExists(t);
-						} catch (IOException e) {
-						}
-					});
 				}
 			}
 		}
@@ -1084,10 +1078,12 @@ public class UHTTPD {
 		private final boolean buffered;
 		private final Path tmpdir;
 		
-		private Path storedContent;
 		private InputStream input;
 		private boolean satisfying;
 		private Optional<String> str;
+
+		private Path bufferFile;
+		private ByteBuffer bufferMemory;
 
 		FormData(Path tmpdir, boolean buffered, String contentType, Charset charset, String contentDisposition, MultipartBoundaryStream content) {
 			Map<String, Named> map = contentDisposition == null ? Collections.emptyMap()
@@ -1114,7 +1110,7 @@ public class UHTTPD {
 		@Override
 		public void asFile(Path path) {
 			if(buffered && input == null) {
-				storedContent = path;
+				bufferFile = path;
 			}
 			TextPart.super.asFile(path);
 		}
@@ -1125,26 +1121,22 @@ public class UHTTPD {
 				if(input == null) {
 					
 					input = new InputStream() {
-						OutputStream out = null;
-						FileChannel storedIn = null;
-						long read = 0;
-						ByteBuffer oneByte = ByteBuffer.allocate(1);
+						
+						private OutputStream out = null;
+						private SeekableByteChannel bufferIn = null;
+						private long read = 0;
+						private ByteBuffer oneByte = ByteBuffer.allocate(1);
 						
 						{
 							if(buffered) {
-								if(storedContent == null) {
-									storedContent = Files.createTempFile(tmpdir, "uhttpd", ".part");
-									storedContent.toFile().deleteOnExit();
-									content.iterator.client.tempFiles.add(storedContent);
-									out = Files.newOutputStream(storedContent);
+								if(bufferFile != null) {
+									bufferIn = FileChannel.open(bufferFile, StandardOpenOption.READ);
+								}
+								else if(bufferMemory != null){
+									bufferIn = new ByteBufferChannel(bufferMemory);
 								}
 								else {
-									try {
-										storedIn = FileChannel.open(storedContent, StandardOpenOption.READ);
-									}
-									catch(NoSuchFileException nfsfe) {
-										throw new IllegalStateException("An attempt has been made to read a part as a stream more than once.");
-									}
+									out = new ByteArrayOutputStream();										
 								}
 							}	
 						}
@@ -1161,13 +1153,21 @@ public class UHTTPD {
 								}
 								finally {
 									try {
-										if(storedIn != null) {
-											storedIn.close();
+										if(bufferIn != null) {
+											bufferIn.close();
 										}
 									}
 									finally {
 										if(out != null) {
-											out.close();;
+											try {
+												out.close();
+												if(out instanceof ByteArrayOutputStream) {
+													bufferMemory = ByteBuffer.wrap(((ByteArrayOutputStream)out).toByteArray());
+												}
+											}
+											finally {
+												out = null;
+											}
 										}
 									}
 								}
@@ -1177,12 +1177,15 @@ public class UHTTPD {
 						@Override
 						public int read() throws IOException {
 							int r;
-							if(storedIn == null) {
+							if(bufferIn == null) {
 								r = content.read();
 								if (buffered && r != -1) {
 									if(!satisfying) {
 										read++;
 									}
+									
+									switchToFileBuffer(r);
+									
 									out.write(r);
 								}
 								if(r == -1) {
@@ -1190,7 +1193,7 @@ public class UHTTPD {
 								}			
 							}
 							else {
-								r = storedIn.read(oneByte); 
+								r = bufferIn.read(oneByte); 
 								if(r != -1) {
 									oneByte.flip();
 									r = oneByte.get();
@@ -1203,12 +1206,13 @@ public class UHTTPD {
 						@Override
 						public int read(byte[] b, int off, int len) throws IOException {
 							int r;
-							if(storedIn == null) {
+							if(bufferIn == null) {
 								r = content.read(b, off, len);
 								if (buffered && r != -1) {
 									if(!satisfying) {
 										read += r;
 									}
+									switchToFileBuffer(r);
 									out.write(b, off, r);
 								}
 								if(r == -1) {
@@ -1216,17 +1220,41 @@ public class UHTTPD {
 								}
 							}
 							else {
-								r = storedIn.read(ByteBuffer.wrap(b, off, len));
+								r = bufferIn.read(ByteBuffer.wrap(b, off, len));
 							}
 							return r;
 						}
+
+						private void switchToFileBuffer(int r) throws IOException {
+							if(out instanceof ByteArrayOutputStream) {
+								var bout = (ByteArrayOutputStream)out;
+								if(bout.size() + r > content.iterator.client.rootContext.maxFormDataInMemory) {
+									/* Switch to file backed buffer */
+									bufferFile = Files.createTempFile(tmpdir, "uhttpd", ".part");
+									bufferFile.toFile().deleteOnExit();
+									content.iterator.content.tempFiles.add(bufferFile);
+									out = Files.newOutputStream(bufferFile);
+									out.write(bout.toByteArray());
+								}
+							}
+						}
 						
 						private void checkSourceEnded() throws IOException {
-							if(buffered && satisfied() && storedIn == null) {
+							if(buffered && satisfied() && bufferIn == null) {
 								out.close();
-								out = null;
-								storedIn = FileChannel.open(storedContent, StandardOpenOption.READ);
-								storedIn.position(read);
+								try {
+									if(bufferFile == null) {
+										bufferMemory = ByteBuffer.wrap(((ByteArrayOutputStream)out).toByteArray());
+										bufferIn = new ByteBufferChannel(bufferMemory);
+									}
+									else {
+										bufferIn = FileChannel.open(bufferFile, StandardOpenOption.READ);
+										bufferIn.position(read);
+									}
+								}
+								finally {
+									out = null;
+								}
 							}
 						}
 					};
@@ -1265,13 +1293,13 @@ public class UHTTPD {
 				} catch (IOException e) {
 				}
 			}
-			if (storedContent != null) {
+			if (bufferFile != null) {
 				try {
-					Files.delete(storedContent);
+					Files.delete(bufferFile);
 				} catch (IOException e) {
 					throw new UncheckedIOException(e);
 				} finally {
-					storedContent = null;
+					bufferFile = null;
 				}
 			}
 		}
@@ -5106,6 +5134,7 @@ public class UHTTPD {
 		private List<Part> parts;
 		private Iterator<Part> partIterator;
 		private Boolean isBuffered;
+		private List<Path> tempFiles = new CopyOnWriteArrayList<>();
 
 		private HTTPContent(Path tmpdir, Transaction tx, ReadableByteChannel input) {
 			this.tx = tx;
@@ -5162,6 +5191,14 @@ public class UHTTPD {
 			}
 			catch(IOException ioe) {
 				LOG.log(Level.DEBUG, "Failed to drain stream.", ioe);
+			}
+			finally {
+				tempFiles.forEach(f -> {
+					try {
+						Files.deleteIfExists(f);
+					} catch (IOException e) {
+					}
+				});
 			}
 		}
 
@@ -5314,7 +5351,7 @@ public class UHTTPD {
 				var type = content.values().iterator().next();
 				switch (type.name()) {
 				case "multipart/form-data":
-					return new MultipartFormDataPartIterator(tmpdir, buffered, tx.client, input,
+					return new MultipartFormDataPartIterator(this, tmpdir, buffered, tx.client, input,
 							content.containsKey("boundary") ? content.get("boundary").asString() : null);
 				case "application/x-www-form-urlencoded":
 					return new URLEncodedFormDataPartIterator(tx.client, input);
@@ -5611,9 +5648,11 @@ public class UHTTPD {
 		FormData next;
 		boolean buffered;
 		Path tmpdir;
+		HTTPContent content;
 
-		MultipartFormDataPartIterator(Path tmpdir, boolean buffered, Client client, ByteChannel chan, String boundary) {
+		MultipartFormDataPartIterator(HTTPContent content, Path tmpdir, boolean buffered, Client client, ByteChannel chan, String boundary) {
 			super(client, chan, StandardOpenOption.READ);
+			this.content = content;
 			this.tmpdir = tmpdir;
 			this.buffered = buffered;
 			this.boundary = boundary;
@@ -6434,6 +6473,61 @@ public class UHTTPD {
 			}
 			return writer;
 		}
+	}
+	
+	private final static class ByteBufferChannel implements SeekableByteChannel {
+		
+		private boolean open = true;
+		private final ByteBuffer buffer;
+		
+		private ByteBufferChannel(ByteBuffer  buffer) {
+			this.buffer = buffer;
+		}
+
+		@Override
+		public boolean isOpen() {
+			return open;
+		}
+
+		@Override
+		public void close() throws IOException {
+			open = false;
+		}
+
+		@Override
+		public int read(ByteBuffer dst) throws IOException {
+			if(buffer.hasRemaining()) {
+				var p = dst.position();
+				dst.put(buffer);
+				return dst.position() - p;
+			}
+			else {
+				return -1;
+			}
+		}
+
+		@Override
+		public long position() throws IOException {
+			return buffer.position();
+		}
+
+		@Override
+		public SeekableByteChannel position(long newPosition) throws IOException {
+			buffer.position((int)newPosition);
+			return this;
+		}
+
+		@Override
+		public long size() throws IOException {
+			return buffer.capacity();
+		}
+
+		@Override
+		public int write(ByteBuffer src) throws IOException { throw new UnsupportedOperationException(); }
+
+		@Override
+		public SeekableByteChannel truncate(long size) throws IOException { throw new UnsupportedOperationException(); }
+		
 	}
 
 	static final int DEFAULT_BUFFER_SIZE = 32768;

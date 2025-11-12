@@ -105,6 +105,7 @@ import java.util.Set;
 import java.util.Stack;
 import java.util.StringTokenizer;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -205,6 +206,7 @@ public class UHTTPD {
 		final SocketAddress localAddress;
 		final SocketAddress remoteAddress;
 		final Consumer<Integer> timeoutSetter;
+		final List<Path> tempFiles = new  CopyOnWriteArrayList<>();
 
 		boolean closed = false;
 		int times = 0;
@@ -305,8 +307,15 @@ public class UHTTPD {
 				try {
 					channel.close();
 				} catch (IOException ioe) {
+				} finally {
+					rootContext.clients.remove(this);
+					tempFiles.forEach(t -> {
+						try {
+							Files.deleteIfExists(t);
+						} catch (IOException e) {
+						}
+					});
 				}
-				rootContext.clients.remove(this);
 			}
 		}
 
@@ -1078,6 +1087,7 @@ public class UHTTPD {
 		private Path storedContent;
 		private InputStream input;
 		private boolean satisfying;
+		private Optional<String> str;
 
 		FormData(Path tmpdir, boolean buffered, String contentType, Charset charset, String contentDisposition, MultipartBoundaryStream content) {
 			Map<String, Named> map = contentDisposition == null ? Collections.emptyMap()
@@ -1125,8 +1135,17 @@ public class UHTTPD {
 								if(storedContent == null) {
 									storedContent = Files.createTempFile(tmpdir, "uhttpd", ".part");
 									storedContent.toFile().deleteOnExit();
+									content.iterator.client.tempFiles.add(storedContent);
+									out = Files.newOutputStream(storedContent);
 								}
-								out = Files.newOutputStream(storedContent);
+								else {
+									try {
+										storedIn = FileChannel.open(storedContent, StandardOpenOption.READ);
+									}
+									catch(NoSuchFileException nfsfe) {
+										throw new IllegalStateException("An attempt has been made to read a part as a stream more than once.");
+									}
+								}
 							}	
 						}
 						
@@ -1301,11 +1320,18 @@ public class UHTTPD {
 
 		@Override
 		public Optional<String> ofString() {
-			try (var stream = asStream()) {
-				return Optional.of(new String(stream.readAllBytes(), charset));
-			} catch (IOException e) {
-				throw new UncheckedIOException(e);
+			if(str == null) {
+				try (var stream = asStream()) {
+					str = Optional.of(new String(stream.readAllBytes(), charset));
+				} catch (IOException e) {
+					throw new UncheckedIOException(e);
+				}
 			}
+			return str;
+		}
+
+		private void reopen() {
+			input = null;
 		}
 	}
 
@@ -1825,9 +1851,10 @@ public class UHTTPD {
 					if(logFile == null || !filename.equals(logFile.getFileName().toString())) {
 						if(writer != null)
 							writer.close();
-						logFile = dir.resolve(filename);
 						try {
-							writer = new PrintWriter(Files.newBufferedWriter(logFile, openOpens()), true);
+							var f = dir.resolve(filename);
+							writer = new PrintWriter(Files.newBufferedWriter(f, openOpens()), true);
+							logFile = f;
 						} catch (IOException e) {
 							throw new UncheckedIOException(e);
 						}
@@ -1898,14 +1925,16 @@ public class UHTTPD {
 			            buf.append("\" ");
 	                }, () -> buf.append("\"-\" "));
 	            }
-		
-                var now = System.currentTimeMillis();
-                buf.append(' ');
-                buf.append(now - tx.timestamp().toEpochMilli());
-                
-				synchronized(lock) {
-					writer.println(buf.toString());
-				}
+
+	            if(writer != null) {
+	                var now = System.currentTimeMillis();
+	                buf.append(' ');
+	                buf.append(now - tx.timestamp().toEpochMilli());
+	                
+					synchronized(lock) {
+						writer.println(buf.toString());
+					}
+	            }
 			}
 
 			private OpenOption[] openOpens() {
@@ -2063,6 +2092,7 @@ public class UHTTPD {
 		private Optional<Path> tmpDir = Optional.empty();
 		private Optional<Consumer<Transaction>> logger = Optional.empty();
 		private boolean sendLowerCaseHeaders = true;
+		private int maxFormDataInMemory = 1024;
 		
 		private RootContextBuilder() {
 			statusHandlers.put(Status.INTERNAL_SERVER_ERROR, (tx) -> {
@@ -2146,6 +2176,11 @@ public class UHTTPD {
 			} catch (UnknownHostException e) {
 				throw new IllegalArgumentException("Invalid address.", e);
 			}
+			return this;
+		}
+
+		public RootContextBuilder withMaxFormDataInMemory(int maxFormDataInMemory) {
+			this.maxFormDataInMemory = maxFormDataInMemory;
 			return this;
 		}
 
@@ -5180,6 +5215,11 @@ public class UHTTPD {
 				return createIterable(buffered, partType);
 			} else if (partIterator == null) {
 				/* If we have finished iterating */
+				parts.forEach(item -> {
+					if(item instanceof FormData) {
+						((FormData)item).reopen();
+					}
+				});
 				return (Iterable<P>) parts;
 			} else {
 				/* We are part way through iterating */
@@ -5193,7 +5233,8 @@ public class UHTTPD {
 							
 							P item = null;
 							Iterator<P> storedIt;
-
+							boolean endStored;
+							
 							@Override
 							public boolean hasNext() {
 								checkNext();
@@ -5217,19 +5258,27 @@ public class UHTTPD {
 								if(item == null) {
 									while(true) {
 										if(storedIt == null) {
-											if(partIterator.hasNext()) {
-												item = (P)partIterator.next();
-												break;
-											}
-											else {
-												storedIt = (Iterator<P>) parts.iterator();
-											}
+											storedIt = (Iterator<P>) parts.iterator();
 										}
 										else {
-											if(storedIt.hasNext()) {
-												item = storedIt.next();
+											if(!endStored) {
+												if(storedIt.hasNext()) {
+													item = storedIt.next();
+													if(item instanceof FormData) {
+														((FormData)item).reopen();
+													}
+													break;
+												}
+												else {
+													endStored = true;
+												}
 											}
-											break;
+											else {
+												if(partIterator.hasNext()) {
+													item = (P)partIterator.next();
+												}
+												break;
+											}
 										}
 									}
 								}
@@ -5755,6 +5804,7 @@ public class UHTTPD {
 		private final boolean gzip;
 		private final int sendBufferSize;
 		private final int recvBufferSize;
+		private final int maxFormDataInMemory;
 		private final int maxUnchunkedSize;
 		private final long minGzipSize;
 		private boolean open = true;
@@ -5800,6 +5850,7 @@ public class UHTTPD {
 			gzip = builder.gzip;
 			sendBufferSize = builder.sendBufferSize;
 			recvBufferSize = builder.recvBufferSize;
+			maxFormDataInMemory = builder.maxFormDataInMemory;
 			keepAliveTimeoutSecs = builder.keepAliveTimeoutSecs;
 			keepAliveMax = builder.keepAliveMax;
 			runner = builder.runner.orElse(threadPoolRunner().build());

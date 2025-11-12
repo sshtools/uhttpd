@@ -620,6 +620,148 @@ public class UHTTPDTest {
 			Files.delete(tf);
 		}
 	}
+
+	@Test
+	void testMultipartAcrossIterations() throws Exception {
+		
+		var tf = createTempDataFile(10);
+		var halfBoundary = "--" + boundary.substring(0, boundary.length() / 2);
+		var now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+		
+		var sr = new SecureRandom();
+		var lval = sr.nextLong();
+		var sval = (short)sr.nextInt();
+		var ival = sr.nextInt();
+		var bval = (byte)sr.nextInt();
+		var cval = (char)sr.nextInt();
+		var dval = sr.nextDouble();
+		var fval = sr.nextFloat();
+		var aval = sr.nextBoolean();
+		try {
+			
+			try(var httpd = createServer().
+				post("/upload", (tx) -> {
+					var content = tx.request();
+					int parts = 0;
+
+					for(var part : content.asBufferedParts(FormData.class)) {
+						System.out.println("RUN 1 " + part.name());
+
+						switch(part.name()) {
+						case "file":
+							try(var in = part.asChannel()) {
+								try(var other = Files.newByteChannel(tf)) {
+									assertTrue(isEqual(in, other));
+								}
+							}
+							break;
+						case "filename":
+							assertEquals(tf.getFileName().toString(), part.asString());
+							break;
+						default:
+							break;
+						}
+					}
+					
+					for(var part : content.asBufferedParts(FormData.class)) {
+
+						System.out.println("RUN 2 " + part.name());
+						
+						switch(part.name()) {
+						case "file":
+							try(var in = part.asChannel()) {
+								try(var other = Files.newByteChannel(tf)) {
+									assertTrue(isEqual(in, other));
+								}
+							}
+							break;
+						case "filename":
+							assertEquals(tf.getFileName().toString(), part.asString());
+							break;
+						case "name":
+							assertEquals("A Name", part.asString());
+							break;
+						case "email":
+							assertEquals("An Email", part.asString());
+							break;
+						case "halfboundary":
+							assertEquals(halfBoundary, part.asString());
+							break;
+						case "lval":
+							assertEquals(lval, part.asLong());
+							break;
+						case "sval":
+							assertEquals(sval, part.asShort());
+							break;
+						case "ival":
+							assertEquals(ival, part.asInt());
+							break;
+						case "bval":
+							assertEquals(bval, part.asByte());
+							break;
+						case "cval":
+							assertEquals(cval, part.asChar());
+							break;
+						case "dval":
+							assertEquals(dval, part.asDouble());
+							break;
+						case "fval":
+							assertEquals(fval, part.asFloat());
+							break;
+						case "aval":
+							assertEquals(aval, part.asBoolean());
+							break;
+						case "now":
+							assertEquals(now, part.asInstant());
+							break;
+						default:
+							throw new IllegalStateException("Unexpected part " + part.name());
+						
+						}
+						parts++;
+					}
+					
+					assertEquals(14, parts);
+				}).
+				build()) {
+				httpd.start();
+				
+				//
+				var client = client();
+				
+				var multipartBody = MultipartBodyPublisher.newBuilder()
+					      .filePart("file", tf, MediaType.APPLICATION_OCTET_STREAM)
+					      .textPart("name", "A Name")
+					      .textPart("email", "An Email")
+					      .textPart("halfboundary", halfBoundary)
+					      .textPart("lval", lval)
+					      .textPart("sval", sval)
+					      .textPart("ival", ival)
+					      .textPart("bval", bval)
+					      .textPart("cval", cval)
+					      .textPart("dval", dval)
+					      .textPart("fval", fval)
+					      .textPart("aval", aval)
+					      .textPart("now", UHTTPD.formatDate(OffsetDateTime.ofInstant(now, UHTTPD.UTC_ZONE)))
+					      .textPart("filename", tf.getFileName().toString())
+					      .build();
+				
+				
+				var req = HttpRequest.newBuilder().
+						uri(URI.create(clientURL() + "/upload")).
+						header("Content-Type", "multipart/form-data;boundary=" + boundary).
+						POST(multipartBody).
+						build();
+				var resp = client.send(req, BodyHandlers.ofString());
+				System.err.println("GOT RESP " + resp.body());
+				assertEquals(Status.OK.getCode(), resp.statusCode());
+				System.err.println("DONE");
+			}
+		}
+		finally {
+			Files.delete(tf);
+		}
+	}
 	
 	@Test
 	void testMultipartMisorderedAccess() throws Exception {

@@ -6008,11 +6008,15 @@ public class UHTTPD {
 							catch(Exception e) {}
 						}
 						try {
-							join();
+							if(serverThread != null) {
+								serverThread.interrupt();
+								join();
+							}
 						} catch (InterruptedException e) {
 						} finally {
 							if (otherThread != null) {
 								try {
+									otherThread.interrupt();
 									otherThread.join();
 								} catch (InterruptedException e) {
 								}
@@ -6073,10 +6077,7 @@ public class UHTTPD {
 
 		@Override
 		public void run() {
-			serverThread = Thread.currentThread();
-
 			/* Run, keeping number of thread used to minimum required for configuration */
-
 			if (serverSocketChannel == null) {
 				/* HTTPS only */
 				runOn(true, sslServerSocket, Scheme.HTTPS, httpsPort.get());

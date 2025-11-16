@@ -2551,9 +2551,9 @@ public class UHTTPD {
 		private final Map<String, Named> parameters = new LinkedHashMap<>();
 		private final Stack<Context> contexts = new Stack<>();
 		private final Path tmpdir;
-		private Path path;
-		private Path contextPath;
-		private Path fullPath;
+		private String path;
+		private String contextPath;
+		private String fullPath;
 		private Optional<Principal> principal = Optional.empty();
 		private final Protocol protocol;
 		private Optional<BufferFiller> responder = Optional.empty();
@@ -2563,7 +2563,7 @@ public class UHTTPD {
 		private final String urlHost;
 		private final String uri;
 		private Optional<Throwable> error = Optional.empty();
-		private Path fullContextPath;
+		private String fullContextPath;
 		private WritableByteChannel responseChannel;
 		private boolean responseStarted;
 		private final ByteChannel delegate;
@@ -2596,10 +2596,10 @@ public class UHTTPD {
 			var idx = pathSpec.indexOf('?');
 			try {
 				if (idx == -1) {
-					path = Paths.get(URLDecoder.decode(pathSpec, "UTF-8"));
+					path = URLDecoder.decode(pathSpec, "UTF-8");
 					queryString = Optional.empty();
 				} else {
-					path = Paths.get(URLDecoder.decode(pathSpec.substring(0, idx), "UTF-8"));
+					path = URLDecoder.decode(pathSpec.substring(0, idx), "UTF-8");
 					queryString = Optional.of(pathSpec.substring(idx + 1));
 					parameters.putAll(Named.parseParameters(queryString.get()));
 				}
@@ -2608,8 +2608,8 @@ public class UHTTPD {
 				throw new IllegalStateException("Failed to decode URI.");
 			}
 
-			fullContextPath = contextPath = Paths.get("/");
-			fullPath = contextPath.resolve(path);
+			fullContextPath = contextPath = "/";
+			fullPath = resolvePaths(contextPath, path);
 		}
 		
 		public static Transaction get() {
@@ -2662,7 +2662,7 @@ public class UHTTPD {
 			return contexts.peek();
 		}
 
-		public final Path contextPath() {
+		public final String contextPath() {
 			return contextPath;
 		}
 
@@ -2725,11 +2725,11 @@ public class UHTTPD {
 			return sb.toString();
 		}
 
-		public final Path fullContextPath() {
+		public final String fullContextPath() {
 			return fullContextPath;
 		}
 
-		public final Path fullPath() {
+		public final String fullPath() {
 			return fullPath;
 		}
 
@@ -2917,7 +2917,7 @@ public class UHTTPD {
 			return parameters.values().stream();
 		}
 
-		public final Path path() {
+		public final String path() {
 			return path;
 		}
 
@@ -3167,10 +3167,10 @@ public class UHTTPD {
 
 		void pushContext(Context context, String ctxPath, String resPath) {
 			this.contexts.push(context);
-			contextPath = Paths.get(ctxPath);
-			path = Paths.get(resPath);
-			fullContextPath = fullContextPath.resolve(ctxPath.substring(1));
-			fullPath = fullContextPath.resolve(resPath.substring(1));
+			contextPath = ctxPath;
+			path = resPath;
+			fullContextPath = resolvePaths(fullContextPath, ctxPath.substring(1));
+			fullPath = resolvePaths(fullContextPath, resPath.substring(1));
 		}
 
 		private void respondAsUnmodified(Optional<String> etag, Optional<OffsetDateTime> lastModifiedTimestamp) {
@@ -4413,7 +4413,7 @@ public class UHTTPD {
 		@Override
 		public void get(Transaction req) throws Exception {
 			LOG.log(Level.DEBUG, "Locating resource for {0}", path);
-			var fullPath = Paths.get(path).normalize().toString();
+			var fullPath = normalize(path);
 			var url = base.map(c -> c.getResource(path)).orElseGet(() -> loader.orElse(ClasspathResources.class.getClassLoader()).getResource(fullPath));
 			if (url == null) {
 				/* TODO we want this to fall through really to the default notFound() */
@@ -4670,7 +4670,12 @@ public class UHTTPD {
 				var path = matcher.group(1);
 				while (path.startsWith("/"))
 					path = path.substring(1);
-				var fullPath = root.resolve(Paths.get(path).normalize());
+				
+				var fullPath = root.resolve(normalize(path));
+				if(!fullPath.toAbsolutePath().startsWith(root.toAbsolutePath())) {
+					throw new FileNotFoundException(fullPath.toString());
+				}
+				
 				LOG.log(Level.DEBUG, "Locating resource for {0}", path);
 				if (Files.exists(fullPath)) {
 					if (!Files.isDirectory(fullPath)) {
@@ -6702,6 +6707,89 @@ public class UHTTPD {
 			}
 		}
 		throw new IllegalArgumentException("Date `" + dateValue + "` could not be parsed by any supported date/time parsers.");
+	}
+	
+	static String resolvePaths(String path, String filename) {
+		if(filename.startsWith("/"))
+			return filename;
+		else
+			return concatenatePaths(path, filename);
+	}
+	
+	static String concatenatePaths(String path, String filename) {
+		if (filename.startsWith("./"))
+			filename = filename.substring(2);
+		while (path.endsWith("/")) {
+			path = path.substring(0, path.length() - 1);
+		}
+		return path + "/" + filename;
+	}
+	
+	static String normalize(String path) {
+	    if (path == null || path.isEmpty()) return "";
+
+	    final boolean absolute = path.charAt(0) == '/';
+
+	    // Split by '/', handling consecutive slashes via empty segments
+	    // Iterate and use a small deque-like buffer implemented with an array list.
+	    java.util.ArrayList<String> stack = new java.util.ArrayList<>();
+
+	    int i = 0, n = path.length();
+	    while (i < n) {
+	        // Skip consecutive '/'
+	        while (i < n && path.charAt(i) == '/') i++;
+	        if (i >= n) break;
+
+	        // Read next segment [i, j)
+	        int j = i;
+	        while (j < n && path.charAt(j) != '/') j++;
+	        String segment = path.substring(i, j);
+	        i = j;
+
+	        if (segment.equals("") || segment.equals(".")) {
+	            // ignore
+	            continue;
+	        } else if (segment.equals("..")) {
+	            if (!stack.isEmpty()) {
+	                // Pop last normal segment if possible
+	                String last = stack.get(stack.size() - 1);
+	                if (!last.equals("..")) {
+	                    stack.remove(stack.size() - 1);
+	                } else {
+	                    // previous was ".." (only happens for relative paths); keep another ".."
+	                    if (!absolute) stack.add("..");
+	                }
+	            } else {
+	                // Nothing to pop
+	                if (!absolute) stack.add(".."); // keep leading ".." for relative paths
+	                // If absolute, ignore attempts to go above root
+	            }
+	        } else {
+	            // normal path component
+	            stack.add(segment);
+	        }
+	    }
+
+	    // Build result
+	    if (absolute) {
+	        if (stack.isEmpty()) return String.valueOf('/');
+	        StringBuilder sb = new StringBuilder(path.length());
+	        for (int k = 0; k < stack.size(); k++) {
+	            sb.append('/').append(stack.get(k));
+	        }
+	        return sb.toString();
+	    } else {
+	        if (stack.isEmpty()) return ""; // no leading "./" retained
+	        String first = stack.get(0);
+	        int totalLen = Math.max(0, stack.size() - 1); // for slashes
+	        for (String s : stack) totalLen += s.length();
+	        StringBuilder sb = new StringBuilder(totalLen);
+	        sb.append(first);
+	        for (int k = 1; k < stack.size(); k++) {
+	            sb.append('/').append(stack.get(k));
+	        }
+	        return sb.toString();
+	    }
 	}
 
 }

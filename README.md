@@ -10,7 +10,7 @@ A very small HTTP/HTTPS server, intended for embedding into other applications g
 
 ## Status
 
- * Version 0.9.11 is close to production quality.
+ * Version 0.9.14 is close to production quality.
  * Known to be in use internally for several projects and one external public server.
 
 ## Quick Start

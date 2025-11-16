@@ -6371,7 +6371,7 @@ public class UHTTPD {
 			var lastMod = OffsetDateTime.ofInstant(Instant.ofEpochMilli(conx.getLastModified()), UTC_ZONE);
 			if(req.modified(lastMod)) {
 				req.responseLength(conx.getContentLengthLong());
-				req.responseType(bestMimeType(urlToFilename(url), conx.getContentType()));
+				req.responseType(bestMimeType(uriToFilename(url.toURI()), conx.getContentType()));
 				req.response(url.openStream());
 			}
 		}
@@ -6667,7 +6667,14 @@ public class UHTTPD {
 	}
 
 	public static String uriToFilename(URI uri) {
-		return Paths.get(uri.getPath()).getFileName().toString();
+		var path = uri.getPath();
+		while(path.endsWith("/"))
+			path = path.substring(1);
+		var idx = path.lastIndexOf('/');
+		if(idx == -1)
+			return path;
+		else
+			return path.substring(idx + 1);
 	}
 
 	public static RootContextBuilder server() {
